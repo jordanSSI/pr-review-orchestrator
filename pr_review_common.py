@@ -164,6 +164,19 @@ def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) 
               url
               title
               state
+              reviewRequests(first: 20) {
+                nodes {
+                  requestedReviewer {
+                    __typename
+                    ... on User {
+                      login
+                    }
+                    ... on Bot {
+                      login
+                    }
+                  }
+                }
+              }
               reviewThreads(first: 100) {
                 nodes {
                   id
@@ -337,6 +350,27 @@ def ensure_worktree(repo_root: str | Path, repo_name: str, pr_number: int, branc
     if not git_status_is_clean(target):
         raise ScriptError(f"newly created worktree is unexpectedly dirty: {target}")
     return {"status": "ready", "worktree": str(target), "created": True}
+
+
+def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str, worktree_path: str | Path) -> dict[str, Any]:
+    verify_repo_name(repo_root, repo_name)
+    target = Path(worktree_path).expanduser().resolve()
+    tracked = tracked_worktrees(repo_root)
+    existing = tracked.get(str(target))
+
+    if not existing:
+        raise ScriptError(f"worktree is not registered in repo {repo_root}: {target}")
+
+    checked_out_branch = existing.get("branch", "")
+    if not checked_out_branch.endswith(f"/{branch}"):
+        raise ScriptError(
+            f"worktree {target} is on {checked_out_branch or 'unknown branch'}, expected {branch!r}"
+        )
+
+    if not git_status_is_clean(target):
+        raise ScriptError(f"existing worktree is dirty: {target}")
+
+    return {"status": "ready", "worktree": str(target), "created": False, "managed": False}
 
 
 def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | Path) -> dict[str, Any]:

@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlparse
 from pr_review_common import (
     CODEX_HOME,
     ScriptError,
+    ensure_existing_worktree,
     ensure_worktree,
     fetch_review_threads,
     remove_worktree,
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     branch TEXT NOT NULL,
     base_branch TEXT,
     worktree_path TEXT NOT NULL,
+    worktree_managed INTEGER NOT NULL DEFAULT 1,
     thread_id TEXT NOT NULL,
     thread_title TEXT,
     status TEXT NOT NULL,
@@ -89,6 +91,7 @@ class TrackedPR:
     branch: str
     base_branch: str | None
     worktree_path: str
+    worktree_managed: int
     thread_id: str
     thread_title: str | None
     status: str
@@ -114,6 +117,15 @@ def connect_db() -> sqlite3.Connection:
     connection = sqlite3.connect(COORDINATOR_DB)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(tracked_prs)").fetchall()
+    }
+    if "worktree_managed" not in columns:
+        connection.execute(
+            "ALTER TABLE tracked_prs ADD COLUMN worktree_managed INTEGER NOT NULL DEFAULT 1"
+        )
+        connection.commit()
     return connection
 
 
@@ -292,6 +304,21 @@ def review_snapshot(repo_root: str, repo_name: str, pr_number: int) -> dict[str,
     latest_comment_at = None
     if unresolved:
         latest_comment_at = max(item["latest_comment_at"] or "" for item in unresolved) or None
+    review_requests = pull_request.get("reviewRequests", {}).get("nodes") or []
+    pending_copilot_review = any(
+        (node.get("requestedReviewer") or {}).get("login") in {
+            "copilot-pull-request-reviewer",
+            "github-copilot[bot]",
+            "copilot[bot]",
+        }
+        for node in review_requests
+    )
+    if unresolved:
+        status = "needs_review"
+    elif pending_copilot_review:
+        status = "pending_copilot_review"
+    else:
+        status = "awaiting_final_test"
     return {
         "pr": {
             "number": pull_request["number"],
@@ -299,9 +326,10 @@ def review_snapshot(repo_root: str, repo_name: str, pr_number: int) -> dict[str,
             "title": pull_request["title"],
             "state": pull_request["state"],
         },
-        "status": "awaiting_final_test" if not unresolved else "needs_review",
+        "status": status,
         "signature": signature,
         "latest_comment_at": latest_comment_at,
+        "pending_copilot_review": pending_copilot_review,
         "unresolved_threads": unresolved,
     }
 
@@ -442,6 +470,15 @@ def update_tracked_pr(key: str, **changes: Any) -> TrackedPR:
         connection.close()
 
 
+def set_run_state(key: str, status: str, summary: str, *, error: str | None = None) -> TrackedPR:
+    return update_tracked_pr(
+        key,
+        last_run_status=status,
+        last_run_summary=summary[:4000],
+        last_error=error,
+    )
+
+
 def list_tracked_prs(active_only: bool = False) -> list[TrackedPR]:
     connection = connect_db()
     try:
@@ -477,6 +514,7 @@ def register_tracking(
     pr_number: int,
     branch: str,
     worktree_root: str,
+    worktree_path: str | None,
     thread_id: str | None,
 ) -> dict[str, Any]:
     verify_gh_auth()
@@ -487,7 +525,12 @@ def register_tracking(
     )
     pr_info = json.loads(pr.stdout)
     thread = resolve_thread(repo_root, thread_id)
-    worktree = ensure_worktree(repo_root, detected_repo_name, pr_number, branch, worktree_root)
+    if worktree_path:
+        worktree = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
+        worktree_managed = 0
+    else:
+        worktree = ensure_worktree(repo_root, detected_repo_name, pr_number, branch, worktree_root)
+        worktree_managed = 1
     snapshot = review_snapshot(repo_root, detected_repo_name, pr_number)
 
     record = upsert_tracked_pr(
@@ -503,6 +546,7 @@ def register_tracking(
             "branch": pr_info["headRefName"],
             "base_branch": pr_info.get("baseRefName"),
             "worktree_path": worktree["worktree"],
+            "worktree_managed": worktree_managed,
             "thread_id": thread["id"],
             "thread_title": thread.get("title"),
             "status": snapshot["status"],
@@ -538,6 +582,7 @@ def handoff_pr(
     pr_body: str,
     draft: bool,
     worktree_root: str,
+    worktree_path: str | None,
     thread_id: str | None,
 ) -> dict[str, Any]:
     verify_gh_auth()
@@ -547,7 +592,12 @@ def handoff_pr(
     commit_result = commit_all_changes(repo_root, commit_message)
     push_result = push_branch(repo_root, branch)
     pr_result = create_or_reuse_pr(repo_root, branch, base, pr_title, pr_body, draft)
-    worktree_result = ensure_worktree(repo_root, detected_repo_name, pr_result["number"], branch, worktree_root)
+    if worktree_path:
+        worktree_result = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
+        worktree_managed = 0
+    else:
+        worktree_result = ensure_worktree(repo_root, detected_repo_name, pr_result["number"], branch, worktree_root)
+        worktree_managed = 1
     thread = resolve_thread(repo_root, thread_id)
     snapshot = review_snapshot(repo_root, detected_repo_name, pr_result["number"])
 
@@ -564,6 +614,7 @@ def handoff_pr(
             "branch": pr_result["headRefName"],
             "base_branch": pr_result.get("baseRefName"),
             "worktree_path": worktree_result["worktree"],
+            "worktree_managed": worktree_managed,
             "thread_id": thread["id"],
             "thread_title": thread.get("title"),
             "status": snapshot["status"],
@@ -603,6 +654,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "branch": record.branch,
         "base_branch": record.base_branch,
         "worktree_path": record.worktree_path,
+        "worktree_managed": bool(record.worktree_managed),
         "thread_id": record.thread_id,
         "thread_title": record.thread_title,
         "status": record.status,
@@ -620,6 +672,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
 
 
 def poll_record(record: TrackedPR, dry_run: bool) -> dict[str, Any]:
+    set_run_state(record.key, "running", "Fetching latest GitHub review state")
     snapshot = review_snapshot(record.repo_root, record.repo_name, record.pr_number)
     base_changes = {
         "pr_state": snapshot["pr"]["state"],
@@ -636,7 +689,7 @@ def poll_record(record: TrackedPR, dry_run: bool) -> dict[str, Any]:
     if snapshot["pr"]["state"] != "OPEN":
         cleanup_result = {"status": "skipped", "removed": False}
         worktree_path = Path(record.worktree_path)
-        if worktree_path.exists():
+        if record.worktree_managed and worktree_path.exists():
             cleanup_result = remove_worktree(record.repo_root, worktree_path)
         updated = update_tracked_pr(
             record.key,
@@ -652,12 +705,15 @@ def poll_record(record: TrackedPR, dry_run: bool) -> dict[str, Any]:
             "cleanup": cleanup_result,
         }
 
-    if snapshot["status"] == "awaiting_final_test":
+    if snapshot["status"] in {"awaiting_final_test", "pending_copilot_review"}:
+        summary = "No unresolved review threads"
+        if snapshot["status"] == "pending_copilot_review":
+            summary = "Awaiting Copilot review completion"
         updated = update_tracked_pr(
             record.key,
             **base_changes,
             last_run_status="idle",
-            last_run_summary="No unresolved review threads",
+            last_run_summary=summary,
         )
         return {
             "status": "idle",
@@ -684,8 +740,26 @@ def poll_record(record: TrackedPR, dry_run: bool) -> dict[str, Any]:
             "triggered": False,
         }
 
-    worktree = ensure_worktree(record.repo_root, record.repo_name, record.pr_number, record.branch, str(Path(record.worktree_path).parent.parent))
+    if record.worktree_managed:
+        set_run_state(record.key, "running", "Ensuring managed PR worktree is ready")
+        worktree = ensure_worktree(
+            record.repo_root,
+            record.repo_name,
+            record.pr_number,
+            record.branch,
+            str(Path(record.worktree_path).parent.parent),
+        )
+    else:
+        set_run_state(record.key, "running", "Validating existing PR worktree")
+        worktree = ensure_existing_worktree(
+            record.repo_root,
+            record.repo_name,
+            record.branch,
+            record.worktree_path,
+        )
+    set_run_state(record.key, "running", "Syncing worktree to the latest remote branch state")
     sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
+    set_run_state(record.key, "running", "Resuming the mapped Codex thread for review follow-up")
     codex_result = run_codex_resume(record, snapshot, dry_run)
     updated = update_tracked_pr(
         record.key,
@@ -733,6 +807,7 @@ def html_page(title: str, body: str) -> bytes:
 <head>
   <meta charset="utf-8">
   <title>{html.escape(title)}</title>
+  <meta http-equiv="refresh" content="3">
   <style>
     :root {{
       color-scheme: light;
@@ -762,6 +837,8 @@ def html_page(title: str, body: str) -> bytes:
     code {{ font: inherit; }}
     form {{ display: inline; }}
     .small {{ color: var(--muted); font-size: 12px; }}
+    .muted {{ color: var(--muted); }}
+    .stack {{ white-space: pre-wrap; max-width: 520px; overflow-wrap: anywhere; }}
   </style>
 </head>
 <body>
@@ -775,7 +852,7 @@ def html_page(title: str, body: str) -> bytes:
 def status_badge(status: str | None) -> str:
     value = html.escape(status or "unknown")
     cls = "pill"
-    if status in {"needs_review"}:
+    if status in {"needs_review", "pending_copilot_review", "running", "queued"}:
         cls = "pill warn"
     elif status in {"error", "closed"}:
         cls = "pill bad"
@@ -784,23 +861,66 @@ def status_badge(status: str | None) -> str:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     poll_lock = threading.Lock()
+    job_lock = threading.Lock()
+    active_jobs: set[str] = set()
+
+    @classmethod
+    def _run_job(cls, job_key: str, fn) -> None:
+        try:
+            with cls.poll_lock:
+                fn()
+        except Exception:
+            raise
+        finally:
+            with cls.job_lock:
+                cls.active_jobs.discard(job_key)
+
+    @classmethod
+    def enqueue_job(cls, job_key: str, fn) -> bool:
+        with cls.job_lock:
+            if job_key in cls.active_jobs:
+                return False
+            cls.active_jobs.add(job_key)
+        thread = threading.Thread(target=cls._run_job, args=(job_key, fn), daemon=True, name=f"dashboard-{job_key}")
+        thread.start()
+        return True
 
     def _send_html(self, content: bytes, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _redirect(self, location: str = "/") -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
-        self.end_headers()
+        self.send_header("Content-Length", "0")
+        try:
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         records = list_tracked_prs(active_only=False)
+        with self.job_lock:
+            running_jobs = sorted(self.active_jobs)
         rows = []
         for record in records:
+            run_status = record.last_run_status or ""
+            if f"poll-one:{record.key}" in running_jobs:
+                run_status = "running"
+            if "poll-all" in running_jobs and record.active:
+                run_status = "running"
             rows.append(
                 f"""
                 <tr>
@@ -808,7 +928,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                   <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
                   <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
                   <td><code>{html.escape(record.worktree_path)}</code></td>
-                  <td>{html.escape(record.last_run_status or "")}<div class="small">{html.escape(record.last_run_summary or "")}</div></td>
+                  <td>{status_badge(run_status)}<div class="small stack">{html.escape(record.last_run_summary or "")}</div></td>
                   <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
                   <td>
                     <form method="post" action="/poll-one?key={html.escape(record.key)}"><button>Run now</button></form>
@@ -817,10 +937,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 </tr>
                 """
             )
+        running_markup = ""
+        if running_jobs:
+            running_markup = f'<p class="small">Running: {html.escape(", ".join(running_jobs))}. Page auto-refreshes every 3 seconds.</p>'
+        else:
+            running_markup = '<p class="small">No active jobs. Page auto-refreshes every 3 seconds.</p>'
         body = f"""
         <header>
           <h1>PR Review Coordinator</h1>
           <p>Tracks active PRs and resumes the mapped Codex thread when GitHub review activity changes.</p>
+          {running_markup}
         </header>
         <main>
           <div class="actions">
@@ -850,15 +976,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         if parsed.path == "/poll":
-            with self.poll_lock:
-                poll_all(active_only=True, dry_run=False)
+            self.enqueue_job("poll-all", lambda: poll_all(active_only=True, dry_run=False))
             self._redirect("/")
             return
         if parsed.path == "/poll-one":
             key = params.get("key", [None])[0]
             if key:
-                with self.poll_lock:
-                    poll_record(get_tracked_pr(key), dry_run=False)
+                self.enqueue_job(f"poll-one:{key}", lambda: poll_record(get_tracked_pr(key), dry_run=False))
             self._redirect("/")
             return
         if parsed.path == "/untrack":
@@ -917,6 +1041,7 @@ def parse_args() -> argparse.ArgumentParser:
     handoff.add_argument("--draft", action="store_true")
     handoff.add_argument("--thread-id")
     handoff.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
+    handoff.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
     handoff.add_argument("--format", choices=("json", "text"), default="json")
 
     track = subparsers.add_parser("track", help="Register an existing PR against the current Codex thread.")
@@ -926,6 +1051,7 @@ def parse_args() -> argparse.ArgumentParser:
     track.add_argument("--branch", required=True)
     track.add_argument("--thread-id")
     track.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
+    track.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
     track.add_argument("--format", choices=("json", "text"), default="json")
 
     poll = subparsers.add_parser("poll-once", help="Poll tracked PRs and resume threads when review changed.")
@@ -963,6 +1089,7 @@ def main() -> None:
             pr_body=args.pr_body,
             draft=args.draft,
             worktree_root=args.worktree_root,
+            worktree_path=args.worktree_path,
             thread_id=args.thread_id,
         )
         emit(payload, args.format)
@@ -975,6 +1102,7 @@ def main() -> None:
             pr_number=args.pr,
             branch=args.branch,
             worktree_root=args.worktree_root,
+            worktree_path=args.worktree_path,
             thread_id=args.thread_id,
         )
         emit(payload, args.format)
@@ -996,7 +1124,7 @@ def main() -> None:
     if args.command == "untrack":
         record = get_tracked_pr(args.key)
         cleanup = None
-        if args.cleanup_worktree:
+        if args.cleanup_worktree and record.worktree_managed:
             cleanup = remove_worktree(record.repo_root, record.worktree_path)
         updated = update_tracked_pr(
             args.key,
