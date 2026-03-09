@@ -559,6 +559,22 @@ def busy_result(record: TrackedPR, summary: str, *, snapshot: dict[str, Any] | N
     }
 
 
+def untrack_record(key: str, *, cleanup_worktree: bool) -> dict[str, Any]:
+    record = get_tracked_pr(key)
+    cleanup = None
+    if cleanup_worktree and record.worktree_managed:
+        cleanup = remove_worktree(record.repo_root, record.worktree_path)
+    updated = update_tracked_pr(
+        key,
+        active=0,
+        status="untracked",
+        last_run_status="paused",
+        last_run_summary="Tracking disabled manually" if not cleanup_worktree else "Tracking disabled and managed worktree cleaned up",
+        last_error=None,
+    )
+    return {"status": "ready", "tracked_pr": tracked_pr_to_dict(updated), "cleanup": cleanup}
+
+
 def list_tracked_prs(active_only: bool = False) -> list[TrackedPR]:
     connection = connect_db()
     try:
@@ -1026,6 +1042,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                   <td>
                     <form method="post" action="/poll-one?key={html.escape(record.key)}"><button>Run now</button></form>
                     <form method="post" action="/untrack?key={html.escape(record.key)}"><button>Untrack</button></form>
+                    <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}"><button>Untrack + Cleanup</button></form>
                   </td>
                 </tr>
                 """
@@ -1081,7 +1098,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/untrack":
             key = params.get("key", [None])[0]
             if key:
-                update_tracked_pr(key, active=0, status="untracked", last_run_status="paused", last_run_summary="Tracking disabled from dashboard")
+                untrack_record(key, cleanup_worktree=False)
+            self._redirect("/")
+            return
+        if parsed.path == "/untrack-cleanup":
+            key = params.get("key", [None])[0]
+            if key:
+                untrack_record(key, cleanup_worktree=True)
             self._redirect("/")
             return
         self._send_html(html_page("Not found", "<main><p>Unknown action</p></main>"), status=404)
@@ -1215,18 +1238,7 @@ def main() -> None:
         return
 
     if args.command == "untrack":
-        record = get_tracked_pr(args.key)
-        cleanup = None
-        if args.cleanup_worktree and record.worktree_managed:
-            cleanup = remove_worktree(record.repo_root, record.worktree_path)
-        updated = update_tracked_pr(
-            args.key,
-            active=0,
-            status="untracked",
-            last_run_status="paused",
-            last_run_summary="Tracking disabled manually",
-        )
-        emit({"status": "ready", "tracked_pr": tracked_pr_to_dict(updated), "cleanup": cleanup}, args.format)
+        emit(untrack_record(args.key, cleanup_worktree=args.cleanup_worktree), args.format)
         return
 
     if args.command == "serve":
