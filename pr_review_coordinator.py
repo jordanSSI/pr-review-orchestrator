@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import html
 import json
+import errno
 import os
 import sqlite3
 import subprocess
@@ -28,6 +29,7 @@ from pr_review_common import (
     ensure_existing_worktree,
     ensure_worktree,
     fetch_review_threads,
+    git_status_is_clean,
     remove_worktree,
     repo_owner_and_name,
     run,
@@ -39,6 +41,7 @@ from pr_review_common import (
 
 PROJECT_DIR = Path(__file__).resolve().parent
 VAR_DIR = PROJECT_DIR / "var"
+LOCKS_DIR = VAR_DIR / "locks"
 CODEX_STATE_DB = CODEX_HOME / "state_5.sqlite"
 COORDINATOR_DB = VAR_DIR / "pr-review-coordinator.db"
 DEFAULT_POLL_SECONDS = 300
@@ -110,6 +113,55 @@ class TrackedPR:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def lock_path(key: str) -> Path:
+    return LOCKS_DIR / f"{key}.json"
+
+
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
+
+
+def read_lock(key: str) -> dict[str, Any] | None:
+    path = lock_path(key)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        return None
+    pid = data.get("pid")
+    if not isinstance(pid, int) or not pid_is_alive(pid):
+        path.unlink(missing_ok=True)
+        return None
+    return data
+
+
+def acquire_lock(record: TrackedPR) -> dict[str, Any] | None:
+    LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    existing = read_lock(record.key)
+    if existing:
+        return existing
+
+    payload = {
+        "pid": os.getpid(),
+        "key": record.key,
+        "thread_id": record.thread_id,
+        "worktree_path": record.worktree_path,
+        "started_at": now_ms(),
+    }
+    lock_path(record.key).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return None
+
+
+def release_lock(key: str) -> None:
+    lock_path(key).unlink(missing_ok=True)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -479,6 +531,34 @@ def set_run_state(key: str, status: str, summary: str, *, error: str | None = No
     )
 
 
+def busy_result(record: TrackedPR, summary: str, *, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    changes: dict[str, Any] = {
+        "last_run_status": "busy",
+        "last_run_summary": summary,
+        "last_error": None,
+    }
+    if snapshot is not None:
+        changes.update(
+            {
+                "status": snapshot["status"],
+                "pr_state": snapshot["pr"]["state"],
+                "pr_title": snapshot["pr"]["title"],
+                "pr_url": snapshot["pr"]["url"],
+                "last_review_signature": snapshot["signature"],
+                "last_review_status": snapshot["status"],
+                "last_review_comment_at": snapshot["latest_comment_at"],
+                "last_polled_at": now_ms(),
+            }
+        )
+    updated = update_tracked_pr(record.key, **changes)
+    return {
+        "status": "busy",
+        "tracked_pr": tracked_pr_to_dict(updated),
+        "review": snapshot,
+        "triggered": False,
+    }
+
+
 def list_tracked_prs(active_only: bool = False) -> list[TrackedPR]:
     connection = connect_db()
     try:
@@ -672,113 +752,126 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
 
 
 def poll_record(record: TrackedPR, dry_run: bool) -> dict[str, Any]:
+    existing_lock = acquire_lock(record)
+    if existing_lock:
+        started_at = format_timestamp(existing_lock.get("started_at"))
+        summary = f"Another orchestrator run is active for this PR"
+        if started_at:
+            summary += f" since {started_at}"
+        return busy_result(record, summary)
+
     set_run_state(record.key, "running", "Fetching latest GitHub review state")
-    snapshot = review_snapshot(record.repo_root, record.repo_name, record.pr_number)
-    base_changes = {
-        "pr_state": snapshot["pr"]["state"],
-        "pr_title": snapshot["pr"]["title"],
-        "pr_url": snapshot["pr"]["url"],
-        "last_review_signature": snapshot["signature"],
-        "last_review_status": snapshot["status"],
-        "last_review_comment_at": snapshot["latest_comment_at"],
-        "last_polled_at": now_ms(),
-        "status": snapshot["status"],
-        "last_error": None,
-    }
+    try:
+        snapshot = review_snapshot(record.repo_root, record.repo_name, record.pr_number)
+        base_changes = {
+            "pr_state": snapshot["pr"]["state"],
+            "pr_title": snapshot["pr"]["title"],
+            "pr_url": snapshot["pr"]["url"],
+            "last_review_signature": snapshot["signature"],
+            "last_review_status": snapshot["status"],
+            "last_review_comment_at": snapshot["latest_comment_at"],
+            "last_polled_at": now_ms(),
+            "status": snapshot["status"],
+        }
 
-    if snapshot["pr"]["state"] != "OPEN":
-        cleanup_result = {"status": "skipped", "removed": False}
+        if snapshot["pr"]["state"] != "OPEN":
+            cleanup_result = {"status": "skipped", "removed": False}
+            worktree_path = Path(record.worktree_path)
+            if record.worktree_managed and worktree_path.exists():
+                cleanup_result = remove_worktree(record.repo_root, worktree_path)
+            updated = update_tracked_pr(
+                record.key,
+                **base_changes,
+                active=0,
+                last_run_status="closed",
+                last_run_summary=f"PR is {snapshot['pr']['state']}; tracking disabled",
+            )
+            return {
+                "status": "closed",
+                "tracked_pr": tracked_pr_to_dict(updated),
+                "review": snapshot,
+                "cleanup": cleanup_result,
+            }
+
+        if snapshot["status"] in {"awaiting_final_test", "pending_copilot_review"}:
+            summary = "No unresolved review threads"
+            if snapshot["status"] == "pending_copilot_review":
+                summary = "Awaiting Copilot review completion"
+            updated = update_tracked_pr(
+                record.key,
+                **base_changes,
+                last_run_status="idle",
+                last_run_summary=summary,
+            )
+            return {
+                "status": "idle",
+                "tracked_pr": tracked_pr_to_dict(updated),
+                "review": snapshot,
+                "triggered": False,
+            }
+
+        if (
+            record.last_review_signature == snapshot["signature"]
+            and record.last_prompted_at
+            and record.last_run_status in {"ok", "dry_run"}
+        ):
+            updated = update_tracked_pr(
+                record.key,
+                **base_changes,
+                last_run_status="idle",
+                last_run_summary="No new review activity since the last follow-up run",
+            )
+            return {
+                "status": "idle",
+                "tracked_pr": tracked_pr_to_dict(updated),
+                "review": snapshot,
+                "triggered": False,
+            }
+
         worktree_path = Path(record.worktree_path)
-        if record.worktree_managed and worktree_path.exists():
-            cleanup_result = remove_worktree(record.repo_root, worktree_path)
+        if worktree_path.exists() and not git_status_is_clean(worktree_path):
+            return busy_result(record, f"Worktree has local changes; assuming another Codex run or manual work is in progress: {record.worktree_path}", snapshot=snapshot)
+
+        if record.worktree_managed:
+            set_run_state(record.key, "running", "Ensuring managed PR worktree is ready")
+            worktree = ensure_worktree(
+                record.repo_root,
+                record.repo_name,
+                record.pr_number,
+                record.branch,
+                str(Path(record.worktree_path).parent.parent),
+            )
+        else:
+            set_run_state(record.key, "running", "Validating existing PR worktree")
+            worktree = ensure_existing_worktree(
+                record.repo_root,
+                record.repo_name,
+                record.branch,
+                record.worktree_path,
+            )
+        set_run_state(record.key, "running", "Syncing worktree to the latest remote branch state")
+        sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
+        set_run_state(record.key, "running", "Resuming the mapped Codex thread for review follow-up")
+        codex_result = run_codex_resume(record, snapshot, dry_run)
         updated = update_tracked_pr(
             record.key,
             **base_changes,
-            active=0,
-            last_run_status="closed",
-            last_run_summary=f"PR is {snapshot['pr']['state']}; tracking disabled",
+            last_prompted_at=now_ms(),
+            last_run_status=codex_result["status"],
+            last_run_summary=(codex_result.get("last_message") or codex_result.get("stderr") or codex_result.get("stdout") or "")[:4000],
+            last_error=None if codex_result["status"] in {"ok", "dry_run"} else (codex_result.get("stderr") or "codex resume failed"),
         )
         return {
-            "status": "closed",
+            "status": codex_result["status"],
             "tracked_pr": tracked_pr_to_dict(updated),
             "review": snapshot,
-            "cleanup": cleanup_result,
+            "worktree": worktree,
+            "sync": sync_result,
+            "codex": codex_result,
+            "triggered": True,
         }
-
-    if snapshot["status"] in {"awaiting_final_test", "pending_copilot_review"}:
-        summary = "No unresolved review threads"
-        if snapshot["status"] == "pending_copilot_review":
-            summary = "Awaiting Copilot review completion"
-        updated = update_tracked_pr(
-            record.key,
-            **base_changes,
-            last_run_status="idle",
-            last_run_summary=summary,
-        )
-        return {
-            "status": "idle",
-            "tracked_pr": tracked_pr_to_dict(updated),
-            "review": snapshot,
-            "triggered": False,
-        }
-
-    if (
-        record.last_review_signature == snapshot["signature"]
-        and record.last_prompted_at
-        and record.last_run_status in {"ok", "dry_run"}
-    ):
-        updated = update_tracked_pr(
-            record.key,
-            **base_changes,
-            last_run_status="idle",
-            last_run_summary="No new review activity since the last follow-up run",
-        )
-        return {
-            "status": "idle",
-            "tracked_pr": tracked_pr_to_dict(updated),
-            "review": snapshot,
-            "triggered": False,
-        }
-
-    if record.worktree_managed:
-        set_run_state(record.key, "running", "Ensuring managed PR worktree is ready")
-        worktree = ensure_worktree(
-            record.repo_root,
-            record.repo_name,
-            record.pr_number,
-            record.branch,
-            str(Path(record.worktree_path).parent.parent),
-        )
-    else:
-        set_run_state(record.key, "running", "Validating existing PR worktree")
-        worktree = ensure_existing_worktree(
-            record.repo_root,
-            record.repo_name,
-            record.branch,
-            record.worktree_path,
-        )
-    set_run_state(record.key, "running", "Syncing worktree to the latest remote branch state")
-    sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
-    set_run_state(record.key, "running", "Resuming the mapped Codex thread for review follow-up")
-    codex_result = run_codex_resume(record, snapshot, dry_run)
-    updated = update_tracked_pr(
-        record.key,
-        **base_changes,
-        status="needs_review",
-        last_prompted_at=now_ms(),
-        last_run_status=codex_result["status"],
-        last_run_summary=(codex_result.get("last_message") or codex_result.get("stderr") or codex_result.get("stdout") or "")[:4000],
-        last_error=None if codex_result["status"] in {"ok", "dry_run"} else (codex_result.get("stderr") or "codex resume failed"),
-    )
-    return {
-        "status": codex_result["status"],
-        "tracked_pr": tracked_pr_to_dict(updated),
-        "review": snapshot,
-        "worktree": worktree,
-        "sync": sync_result,
-        "codex": codex_result,
-        "triggered": True,
-    }
+    finally:
+        release_lock(record.key)
 
 
 def poll_all(active_only: bool, dry_run: bool) -> dict[str, Any]:
@@ -852,7 +945,7 @@ def html_page(title: str, body: str) -> bytes:
 def status_badge(status: str | None) -> str:
     value = html.escape(status or "unknown")
     cls = "pill"
-    if status in {"needs_review", "pending_copilot_review", "running", "queued"}:
+    if status in {"needs_review", "pending_copilot_review", "running", "queued", "busy"}:
         cls = "pill warn"
     elif status in {"error", "closed"}:
         cls = "pill bad"
