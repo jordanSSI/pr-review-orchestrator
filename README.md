@@ -1,13 +1,13 @@
 # PR Review Coordinator
 
-PR Review Coordinator is a local tool for managing PR handoff, dedicated review worktrees, GitHub review polling, and Codex-thread-aware review follow-up.
+PR Review Coordinator is a local tool for managing PR handoff, dedicated review worktrees, GitHub polling, and Codex-thread-aware follow-up for review and CI work.
 
 It is designed to:
 - register a PR against the Codex thread that started the work
 - keep review follow-up isolated in a dedicated PR worktree
-- poll GitHub for new review activity
+- poll GitHub for new review activity and completed failing CI
 - resume the mapped Codex thread when follow-up is needed
-- surface status, locks, and progress through a local dashboard
+- surface persisted status, jobs, locks, and telemetry through a local dashboard
 
 ## What It Does
 
@@ -17,7 +17,7 @@ The coordinator maps:
 - a dedicated PR worktree
 - the Codex thread that started the work
 
-It then polls GitHub review activity and, when needed, resumes that same Codex thread with follow-up instructions targeted at the dedicated PR worktree.
+It then polls GitHub state and, when needed, resumes that same Codex thread with follow-up instructions targeted at the dedicated PR worktree.
 
 This is useful when:
 - you want to keep new feature work in your main checkout
@@ -98,9 +98,9 @@ pr-review-coordinator track \
   --branch feat/example-change
 ```
 
-### Watch review follow-up
+### Run the daemon and dashboard
 
-Run the dashboard and poller:
+Run both processes together for local development:
 
 ```bash
 pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
@@ -108,15 +108,22 @@ pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 
 Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
+For independent restarts:
+
+```bash
+pr-review-coordinator daemon --host 127.0.0.1 --port 8765 --poll-seconds 300
+pr-review-coordinator web --host 127.0.0.1 --port 8765
+```
+
 ## Operational Model
 
 1. Do initial work in a normal Codex thread for a repo.
 2. When the change is ready, run `pr-review-coordinator handoff ...` from that same thread.
 3. The handoff command captures `CODEX_THREAD_ID`, creates or reuses the PR, creates the dedicated PR worktree, and registers `repo + PR + branch + worktree + thread_id`.
-4. A separate poller or dashboard process checks GitHub review threads for each tracked PR.
-5. When unresolved review feedback changes, it runs `codex exec resume <thread_id> "<follow-up prompt>"`, which sends the work back into the same Codex thread you started with.
+4. The daemon polls GitHub for unresolved review feedback, Copilot review state, and completed failing CI.
+5. When actionable state changes, it runs `codex exec resume <thread_id> "<follow-up prompt>"`, which sends the work back into the same Codex thread you started with.
 6. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
-7. When review is clean, the PR stays tracked but idle so it is back with you for final testing. If new comments appear later, the same thread is resumed again.
+7. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If new comments or completed failures appear later, the same thread is resumed again.
 
 ## Agent Notes
 
@@ -124,10 +131,12 @@ Agents using this tool should follow these rules:
 - Prefer `handoff` for the first transition from local implementation to PR lifecycle.
 - Prefer `track` only when the PR already exists and should be attached to the current thread.
 - Use the `pr-review-coordinator` PATH command rather than a machine-specific local path.
+- Active PRs must not share the same Codex thread.
 - Treat the tracked worktree as the only location for automated review follow-up changes.
 - Do not manually edit the coordinator database or lock files.
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
+- `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
 ## Guidance For Other Repositories
 
@@ -138,7 +147,9 @@ Recommended wording:
 ```md
 ## Pull Request Lifecycle
 - Use the `pr-review-coordinator` PATH command for orchestrator actions; do not hard-code a machine-specific local filesystem path in instructions, comments, or PR descriptions.
-- Right after the first implementation pass is complete and the user approves PR handoff, put the work into the review cycle by running `pr-review-coordinator track` with the repo-specific `--repo-root`, `--repo-name`, `--pr`, `--branch`, `--thread-id`, and `--worktree-path` arguments.
+- Use `pr-review-coordinator handoff ...` as the preferred single-step path for branch, commit, PR, dedicated worktree, and tracking.
+- If handoff partially succeeds, switch the main checkout back to the base branch, create or confirm the PR worktree, then run `pr-review-coordinator track ...`.
+- The coordinator follows up on both GitHub review feedback and completed failing CI failures.
 ```
 
 Preferred conventions:
@@ -202,21 +213,34 @@ pr-review-coordinator status --all
 
 ### `serve`
 
-Runs the lightweight dashboard and background poller.
+Runs the daemon and web UI together for compatibility.
 
 ```bash
 pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 ```
 
+### `daemon`
+
+Runs polling, queued job execution, Codex follow-up, and telemetry logging.
+
+### `web`
+
+Serves the dashboard and enqueues requested actions into SQLite.
+
 ### `untrack`
 
-Stops tracking a PR record. Optional cleanup only removes managed worktrees.
+Stops tracking a PR record.
+
+- Managed worktrees can be removed when clean.
+- External tracked worktrees are removed only after the PR is merged or closed, the worktree is clean, and Git confirms the removal is safe.
+- Otherwise cleanup is downgraded to untrack-only and the reason is recorded.
 
 ## Status Meanings
 
 - `needs_review`: unresolved review feedback exists and follow-up work may be needed
+- `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
-- `awaiting_final_test`: no unresolved threads and no pending Copilot review request remain
+- `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain
 - `busy`: the coordinator intentionally skipped this PR because another run or local work appears to be in progress
 - `running`: a poll or follow-up job is currently active
 - `idle`: the last poll completed and no immediate action was taken
@@ -224,13 +248,14 @@ Stops tracking a PR record. Optional cleanup only removes managed worktrees.
 
 ## Locks And Safety
 
-The coordinator uses lock files to avoid interfering with active review-follow-up work.
+The coordinator uses persisted per-PR lock files and SQLite run state to avoid interfering with active review-follow-up work.
 
 Current behavior:
 - one persisted lock file is created per tracked PR while a run is active
 - if a lock is already active, the coordinator skips that PR as `busy`
 - if the tracked worktree has local changes, the coordinator treats it as `busy` rather than assuming it is safe to reset
-- dashboard actions are asynchronous from the browser point of view
+- dashboard actions are asynchronous from the browser point of view and flow through a SQLite job queue
+- jobs and terse telemetry are persisted so the web UI can survive restarts cleanly
 
 ## State Files
 
