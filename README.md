@@ -2,6 +2,22 @@
 
 This workflow keeps PR review follow-up attached to the original Codex thread instead of using Codex automations.
 
+## Install
+
+Install the launcher onto your shell `PATH`:
+
+```bash
+/Users/jordan/source/tools/pr-review-orchestrator/install.sh
+```
+
+By default this installs a symlink at `/usr/local/bin/pr-review-coordinator`.
+
+If you want a different target directory, set `PR_REVIEW_COORDINATOR_BIN_DIR` first:
+
+```bash
+PR_REVIEW_COORDINATOR_BIN_DIR="$HOME/bin" /Users/jordan/source/tools/pr-review-orchestrator/install.sh
+```
+
 ## Model
 
 1. Do initial work in a normal Codex thread for a repo.
@@ -17,7 +33,7 @@ This workflow keeps PR review follow-up attached to the original Codex thread in
 Create branch, commit, PR, worktree, and tracking:
 
 ```bash
-/Users/jordan/source/tools/pr-review-orchestrator/pr-review-coordinator handoff \
+pr-review-coordinator handoff \
   --repo-root /Users/jordan/source/starshipit-wms \
   --branch feat/example-change \
   --commit-message "Add example change" \
@@ -28,7 +44,7 @@ Create branch, commit, PR, worktree, and tracking:
 Register an already-open PR to the current thread:
 
 ```bash
-/Users/jordan/source/tools/pr-review-orchestrator/pr-review-coordinator track \
+pr-review-coordinator track \
   --repo-root /Users/jordan/source/starshipit-wms \
   --pr 123 \
   --branch feat/example-change
@@ -37,19 +53,19 @@ Register an already-open PR to the current thread:
 Run one non-destructive review poll:
 
 ```bash
-/Users/jordan/source/tools/pr-review-orchestrator/pr-review-coordinator poll-once --dry-run
+pr-review-coordinator poll-once --dry-run
 ```
 
 See tracked PRs:
 
 ```bash
-/Users/jordan/source/tools/pr-review-orchestrator/pr-review-coordinator status --all
+pr-review-coordinator status --all
 ```
 
 Run the lightweight dashboard and background poller:
 
 ```bash
-/Users/jordan/source/tools/pr-review-orchestrator/pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
+pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 ```
 
 Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
