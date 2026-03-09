@@ -968,6 +968,29 @@ def status_badge(status: str | None) -> str:
     return f'<span class="{cls}">{value}</span>'
 
 
+def render_record_row(record: TrackedPR, running_jobs: list[str]) -> str:
+    run_status = record.last_run_status or ""
+    if f"poll-one:{record.key}" in running_jobs:
+        run_status = "running"
+    if "poll-all" in running_jobs and record.active:
+        run_status = "running"
+    return f"""
+        <tr>
+          <td>{status_badge(record.status)}</td>
+          <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
+          <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
+          <td><code>{html.escape(record.worktree_path)}</code></td>
+          <td>{status_badge(run_status)}<div class="small stack">{html.escape(record.last_run_summary or "")}</div></td>
+          <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
+          <td>
+            <form method="post" action="/poll-one?key={html.escape(record.key)}"><button>Run now</button></form>
+            <form method="post" action="/untrack?key={html.escape(record.key)}"><button>Untrack</button></form>
+            <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}"><button>Untrack + Cleanup</button></form>
+          </td>
+        </tr>
+        """
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     poll_lock = threading.Lock()
     job_lock = threading.Lock()
@@ -1023,30 +1046,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         records = list_tracked_prs(active_only=False)
         with self.job_lock:
             running_jobs = sorted(self.active_jobs)
-        rows = []
-        for record in records:
-            run_status = record.last_run_status or ""
-            if f"poll-one:{record.key}" in running_jobs:
-                run_status = "running"
-            if "poll-all" in running_jobs and record.active:
-                run_status = "running"
-            rows.append(
-                f"""
-                <tr>
-                  <td>{status_badge(record.status)}</td>
-                  <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
-                  <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
-                  <td><code>{html.escape(record.worktree_path)}</code></td>
-                  <td>{status_badge(run_status)}<div class="small stack">{html.escape(record.last_run_summary or "")}</div></td>
-                  <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
-                  <td>
-                    <form method="post" action="/poll-one?key={html.escape(record.key)}"><button>Run now</button></form>
-                    <form method="post" action="/untrack?key={html.escape(record.key)}"><button>Untrack</button></form>
-                    <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}"><button>Untrack + Cleanup</button></form>
-                  </td>
-                </tr>
-                """
-            )
+        active_records = [record for record in records if record.active]
+        archived_records = [record for record in records if not record.active]
+        active_rows = [render_record_row(record, running_jobs) for record in active_records]
+        archived_rows = [render_record_row(record, running_jobs) for record in archived_records]
         running_markup = ""
         if running_jobs:
             running_markup = f'<p class="small">Running: {html.escape(", ".join(running_jobs))}. Page auto-refreshes every 3 seconds.</p>'
@@ -1062,6 +1065,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <div class="actions">
             <form method="post" action="/poll"><button>Poll all now</button></form>
           </div>
+          <h2>Active PRs</h2>
           <table>
             <thead>
               <tr>
@@ -1075,7 +1079,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
               </tr>
             </thead>
             <tbody>
-              {''.join(rows) or '<tr><td colspan="7">No tracked PRs</td></tr>'}
+              {''.join(active_rows) or '<tr><td colspan="7">No active tracked PRs</td></tr>'}
+            </tbody>
+          </table>
+          <h2 style="margin-top:20px;">Archived PRs</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>PR</th>
+                <th>Branch / Thread</th>
+                <th>Worktree</th>
+                <th>Last run</th>
+                <th>Last poll</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(archived_rows) or '<tr><td colspan="7">No archived tracked PRs</td></tr>'}
             </tbody>
           </table>
         </main>
