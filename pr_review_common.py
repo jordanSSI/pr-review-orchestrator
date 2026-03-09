@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for reusable PR review automation scripts."""
+"""Shared helpers for reusable PR review tooling."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-CODEX_HOME = Path.home() / ".codex"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 AUTOMATIONS_DIR = CODEX_HOME / "automations"
 AUTOMATIONS_DB = CODEX_HOME / "sqlite" / "codex-dev.db"
 DEFAULT_WORKTREE_ROOT = CODEX_HOME / "worktrees" / "pr-review"
@@ -29,6 +29,18 @@ COPILOT_LOGINS = {
 
 class ScriptError(RuntimeError):
     """Raised for expected script failures."""
+
+
+def project_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def codex_skills_dir() -> Path:
+    return CODEX_HOME / "skills"
+
+
+def pr_review_executor_skill_path() -> Path:
+    return codex_skills_dir() / "pr-review-executor" / "SKILL.md"
 
 
 def run(
@@ -154,6 +166,10 @@ def is_copilot_login(login: str | None) -> bool:
 
 
 def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
+    return fetch_pull_request_state(repo_root, repo_name, pr_number)
+
+
+def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     owner, repo = verify_repo_name(repo_root, repo_name)
     query = textwrap.dedent(
         """
@@ -200,6 +216,31 @@ def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) 
                   }
                 }
               }
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    statusCheckRollup {
+                      contexts(first: 100) {
+                        nodes {
+                          __typename
+                          ... on CheckRun {
+                            name
+                            status
+                            conclusion
+                            detailsUrl
+                          }
+                          ... on StatusContext {
+                            context
+                            state
+                            description
+                            targetUrl
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -210,6 +251,120 @@ def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) 
     if not pull_request:
         raise ScriptError(f"pull request #{pr_number} not found for {owner}/{repo}")
     return pull_request
+
+
+def serialize_unresolved_threads(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
+    unresolved: list[dict[str, Any]] = []
+    for thread in pull_request["reviewThreads"]["nodes"] or []:
+        if thread["isResolved"]:
+            continue
+        comments = thread["comments"]["nodes"] or []
+        latest_comment = comments[-1] if comments else None
+        unresolved.append(
+            {
+                "id": thread["id"],
+                "path": thread.get("path"),
+                "line": thread.get("line") or thread.get("originalLine"),
+                "isOutdated": bool(thread.get("isOutdated")),
+                "authors": [comment.get("author", {}).get("login") for comment in comments if comment.get("author")],
+                "latest_comment_id": latest_comment.get("id") if latest_comment else None,
+                "latest_comment_at": latest_comment.get("createdAt") if latest_comment else None,
+                "latest_comment_author": latest_comment.get("author", {}).get("login") if latest_comment else None,
+                "latest_comment_url": latest_comment.get("url") if latest_comment else None,
+                "latest_comment_body": (latest_comment.get("body") or "").strip() if latest_comment else None,
+            }
+        )
+    unresolved.sort(key=lambda item: ((item["path"] or ""), item["line"] or 0, item["id"]))
+    return unresolved
+
+
+def serialize_failing_checks(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
+    commits = pull_request.get("commits", {}).get("nodes") or []
+    if not commits:
+        return []
+    rollup = (commits[-1].get("commit") or {}).get("statusCheckRollup") or {}
+    contexts = rollup.get("contexts", {}).get("nodes") or []
+    failing: list[dict[str, Any]] = []
+    for node in contexts:
+        node_type = node.get("__typename")
+        if node_type == "CheckRun":
+            status = (node.get("status") or "").upper()
+            conclusion = (node.get("conclusion") or "").upper()
+            if status != "COMPLETED":
+                continue
+            if conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+                continue
+            failing.append(
+                {
+                    "type": "check_run",
+                    "name": node.get("name") or "Unnamed check",
+                    "status": status,
+                    "conclusion": conclusion or "UNKNOWN",
+                    "url": node.get("detailsUrl"),
+                    "summary": f"{node.get('name') or 'Unnamed check'} ({conclusion or 'UNKNOWN'})",
+                }
+            )
+            continue
+        if node_type == "StatusContext":
+            state = (node.get("state") or "").upper()
+            if state in {"SUCCESS", "EXPECTED", "PENDING"}:
+                continue
+            failing.append(
+                {
+                    "type": "status_context",
+                    "name": node.get("context") or "Unnamed status",
+                    "status": state,
+                    "conclusion": state,
+                    "url": node.get("targetUrl"),
+                    "summary": f"{node.get('context') or 'Unnamed status'} ({state})",
+                    "description": node.get("description"),
+                }
+            )
+    failing.sort(key=lambda item: (item["type"], item["name"]))
+    return failing
+
+
+def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
+    pull_request = fetch_pull_request_state(repo_root, repo_name, pr_number)
+    unresolved = serialize_unresolved_threads(pull_request)
+    failing_checks = serialize_failing_checks(pull_request)
+    latest_comment_at = None
+    if unresolved:
+        latest_comment_at = max(item["latest_comment_at"] or "" for item in unresolved) or None
+    review_requests = pull_request.get("reviewRequests", {}).get("nodes") or []
+    pending_copilot_review = any(
+        is_copilot_login((node.get("requestedReviewer") or {}).get("login"))
+        for node in review_requests
+    )
+    if unresolved:
+        status = "needs_review"
+    elif failing_checks:
+        status = "needs_ci_fix"
+    elif pending_copilot_review:
+        status = "pending_copilot_review"
+    else:
+        status = "awaiting_final_test"
+    signature_payload = {
+        "status": status,
+        "unresolved_threads": unresolved,
+        "failing_checks": failing_checks,
+        "pending_copilot_review": pending_copilot_review,
+    }
+    signature = json.dumps(signature_payload, sort_keys=True)
+    return {
+        "pr": {
+            "number": pull_request["number"],
+            "url": pull_request["url"],
+            "title": pull_request["title"],
+            "state": pull_request["state"],
+        },
+        "status": status,
+        "signature": signature,
+        "latest_comment_at": latest_comment_at,
+        "pending_copilot_review": pending_copilot_review,
+        "unresolved_threads": unresolved,
+        "failing_checks": failing_checks,
+    }
 
 
 def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
@@ -391,13 +546,11 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
 def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict[str, Any]:
     prompt = textwrap.dedent(
         f"""
-        Use the skill at /Users/jordan/.codex/skills/pr-review-executor/SKILL.md.
-
         You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
-        Handle all unresolved Copilot code review feedback on the current branch.
-        Apply only targeted fixes for Copilot feedback, run npm run typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer copilot-pull-request-reviewer, and resolve threads only after the fix is pushed.
+        Handle unresolved GitHub review feedback and completed failing CI checks on the current branch.
+        Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer copilot-pull-request-reviewer when more review is needed, and resolve threads only after the fix is pushed.
 
-        If there are no unresolved Copilot review comments when you inspect the PR, report that clearly and make no code changes.
+        If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.
         """
     ).strip()
 
@@ -409,9 +562,9 @@ def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict
             str(worktree),
             "--dangerously-bypass-approvals-and-sandbox",
             "--add-dir",
-            "/Users/jordan/source/tools",
+            str(project_dir()),
             "--add-dir",
-            "/Users/jordan/.codex/skills",
+            str(codex_skills_dir()),
             prompt,
         ],
         check=False,
@@ -517,7 +670,7 @@ def upsert_automation_record(
     memory_path = automation_path / "memory.md"
     if not memory_path.exists():
         memory_path.write_text(
-            "# PR Review Automation\n\nThis automation is managed by shared tooling in /Users/jordan/source/tools.\n",
+            f"# PR Review Automation\n\nThis automation is managed by shared tooling in {project_dir()}.\n",
             encoding="utf-8",
         )
 
