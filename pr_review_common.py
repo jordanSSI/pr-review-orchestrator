@@ -20,6 +20,7 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).exp
 AUTOMATIONS_DIR = CODEX_HOME / "automations"
 AUTOMATIONS_DB = CODEX_HOME / "sqlite" / "codex-dev.db"
 DEFAULT_WORKTREE_ROOT = CODEX_HOME / "worktrees" / "pr-review"
+DEFAULT_WORKTREE_LAYOUT = "nested"
 COPILOT_LOGINS = {
     "copilot-pull-request-reviewer[bot]",
     "github-copilot[bot]",
@@ -97,6 +98,12 @@ def parse_args_with_common(
         "--worktree-root",
         default=str(DEFAULT_WORKTREE_ROOT),
         help="Root directory under which PR-specific worktrees are created.",
+    )
+    parser.add_argument(
+        "--worktree-layout",
+        choices=("nested", "sibling"),
+        default=DEFAULT_WORKTREE_LAYOUT,
+        help="Layout used when creating managed PR worktrees.",
     )
     parser.add_argument(
         "--format",
@@ -425,8 +432,38 @@ def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def worktree_path(repo_name: str, pr_number: int, branch: str, worktree_root: str | Path) -> Path:
-    return Path(worktree_root) / slugify(repo_name) / f"pr-{pr_number}-{slugify(branch)}"
+def validate_managed_worktree_root(repo_root: str | Path, worktree_root: str | Path) -> Path:
+    repo = Path(repo_root).expanduser().resolve()
+    root = Path(worktree_root).expanduser().resolve()
+    if root == repo or repo in root.parents:
+        raise ScriptError(
+            f"managed PR worktrees must live outside the repository checkout: repo={repo} worktree_root={root}"
+        )
+    return root
+
+
+def validate_worktree_target(repo_root: str | Path, worktree: str | Path) -> Path:
+    repo = Path(repo_root).expanduser().resolve()
+    target = Path(worktree).expanduser().resolve()
+    if target == repo or repo in target.parents:
+        raise ScriptError(
+            f"managed PR worktrees must live outside the repository checkout: repo={repo} worktree={target}"
+        )
+    return target
+
+
+def worktree_path(
+    repo_name: str,
+    pr_number: int,
+    branch: str,
+    worktree_root: str | Path,
+    *,
+    layout: str = DEFAULT_WORKTREE_LAYOUT,
+) -> Path:
+    root = Path(worktree_root).expanduser().resolve()
+    if layout == "sibling":
+        return root / f"{slugify(repo_name)}-pr-{pr_number}"
+    return root / slugify(repo_name) / f"pr-{pr_number}-{slugify(branch)}"
 
 
 def tracked_worktrees(repo_root: str | Path) -> dict[str, dict[str, Any]]:
@@ -463,9 +500,21 @@ def git_status_is_clean(worktree: str | Path) -> bool:
     return result.stdout.strip() == ""
 
 
-def ensure_worktree(repo_root: str | Path, repo_name: str, pr_number: int, branch: str, worktree_root: str | Path) -> dict[str, Any]:
+def ensure_worktree(
+    repo_root: str | Path,
+    repo_name: str,
+    pr_number: int,
+    branch: str,
+    worktree_root: str | Path,
+    *,
+    layout: str = DEFAULT_WORKTREE_LAYOUT,
+) -> dict[str, Any]:
     verify_repo_name(repo_root, repo_name)
-    target = worktree_path(repo_name, pr_number, branch, worktree_root)
+    validated_root = validate_managed_worktree_root(repo_root, worktree_root)
+    target = validate_worktree_target(
+        repo_root,
+        worktree_path(repo_name, pr_number, branch, validated_root, layout=layout),
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
 
     run(["git", "-C", str(repo_root), "fetch", "origin", branch])
@@ -509,7 +558,7 @@ def ensure_worktree(repo_root: str | Path, repo_name: str, pr_number: int, branc
 
 def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str, worktree_path: str | Path) -> dict[str, Any]:
     verify_repo_name(repo_root, repo_name)
-    target = Path(worktree_path).expanduser().resolve()
+    target = validate_worktree_target(repo_root, worktree_path)
     tracked = tracked_worktrees(repo_root)
     existing = tracked.get(str(target))
 

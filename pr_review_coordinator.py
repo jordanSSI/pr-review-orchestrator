@@ -806,7 +806,17 @@ def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_sta
     return update_tracked_pr(record.key, **changes)
 
 
-def register_tracking(*, repo_root: str, repo_name: str | None, pr_number: int, branch: str, worktree_root: str, worktree_path: str | None, thread_id: str | None) -> dict[str, Any]:
+def register_tracking(
+    *,
+    repo_root: str,
+    repo_name: str | None,
+    pr_number: int,
+    branch: str,
+    worktree_root: str,
+    worktree_path: str | None,
+    thread_id: str | None,
+    worktree_layout: str,
+) -> dict[str, Any]:
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
     pr = run(
@@ -821,7 +831,14 @@ def register_tracking(*, repo_root: str, repo_name: str | None, pr_number: int, 
         worktree = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
         worktree_managed = 0
     else:
-        worktree = ensure_worktree(repo_root, detected_repo_name, pr_number, branch, worktree_root)
+        worktree = ensure_worktree(
+            repo_root,
+            detected_repo_name,
+            pr_number,
+            branch,
+            worktree_root,
+            layout=worktree_layout,
+        )
         worktree_managed = 1
     snapshot = pull_request_snapshot(repo_root, detected_repo_name, pr_number)
     record = upsert_tracked_pr(
@@ -865,7 +882,7 @@ def register_tracking(*, repo_root: str, repo_name: str | None, pr_number: int, 
     }
 
 
-def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None) -> dict[str, Any]:
+def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None, worktree_layout: str) -> dict[str, Any]:
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
     base = base_branch or repo_default_branch(repo_root)
@@ -881,7 +898,14 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
         worktree_result = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
         worktree_managed = 0
     else:
-        worktree_result = ensure_worktree(repo_root, detected_repo_name, pr_result["number"], branch, worktree_root)
+        worktree_result = ensure_worktree(
+            repo_root,
+            detected_repo_name,
+            pr_result["number"],
+            branch,
+            worktree_root,
+            layout=worktree_layout,
+        )
         worktree_managed = 1
     snapshot = pull_request_snapshot(repo_root, detected_repo_name, pr_result["number"])
     record = upsert_tracked_pr(
@@ -1679,6 +1703,7 @@ def parse_args() -> argparse.ArgumentParser:
     handoff.add_argument("--draft", action="store_true")
     handoff.add_argument("--thread-id")
     handoff.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
+    handoff.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
     handoff.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
     handoff.add_argument("--format", choices=("json", "text"), default="json")
 
@@ -1689,6 +1714,7 @@ def parse_args() -> argparse.ArgumentParser:
     track.add_argument("--branch", required=True)
     track.add_argument("--thread-id")
     track.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
+    track.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
     track.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
     track.add_argument("--format", choices=("json", "text"), default="json")
 
@@ -1739,6 +1765,7 @@ def main() -> None:
                 worktree_root=args.worktree_root,
                 worktree_path=args.worktree_path,
                 thread_id=args.thread_id,
+                worktree_layout=args.worktree_layout,
             ),
             args.format,
         )
@@ -1754,6 +1781,7 @@ def main() -> None:
                 worktree_root=args.worktree_root,
                 worktree_path=args.worktree_path,
                 thread_id=args.thread_id,
+                worktree_layout=args.worktree_layout,
             ),
             args.format,
         )

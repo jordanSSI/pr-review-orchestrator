@@ -87,6 +87,45 @@ class PullRequestSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "awaiting_final_test")
 
 
+class WorktreePathTests(unittest.TestCase):
+    def test_nested_layout_keeps_repo_subdirectory_shape(self):
+        path = pr_review_common.worktree_path(
+            "starshipit-wms",
+            418,
+            "feat/putaway-split-lines-and-serial-scan",
+            "/Users/jordan/source/worktrees",
+            layout="nested",
+        )
+        self.assertEqual(
+            path,
+            Path("/Users/jordan/source/worktrees/starshipit-wms/pr-418-feat-putaway-split-lines-and-serial-scan"),
+        )
+
+    def test_sibling_layout_uses_repo_and_pr_number_only(self):
+        path = pr_review_common.worktree_path(
+            "starshipit-wms",
+            418,
+            "feat/putaway-split-lines-and-serial-scan",
+            "/Users/jordan/source",
+            layout="sibling",
+        )
+        self.assertEqual(path, Path("/Users/jordan/source/starshipit-wms-pr-418"))
+
+    def test_rejects_managed_worktree_root_inside_repo(self):
+        with self.assertRaises(pr_review_common.ScriptError):
+            pr_review_common.validate_managed_worktree_root(
+                "/Users/jordan/source/starshipit-wms",
+                "/Users/jordan/source/starshipit-wms",
+            )
+
+    def test_rejects_managed_worktree_target_inside_repo(self):
+        with self.assertRaises(pr_review_common.ScriptError):
+            pr_review_common.validate_worktree_target(
+                "/Users/jordan/source/starshipit-wms",
+                "/Users/jordan/source/starshipit-wms/pr-418-feat-putaway-split-lines-and-serial-scan",
+            )
+
+
 class ThreadPolicyTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -154,6 +193,103 @@ class ThreadPolicyTests(unittest.TestCase):
     def test_allows_reuse_after_prior_pr_is_inactive(self):
         self.add_record(key="repo-pr-1", thread_id="thread-1", active=False)
         pr_review_coordinator.assert_thread_available("thread-1", "repo-pr-2")
+
+
+class RegisterTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+
+        self.original_verify_gh_auth = pr_review_coordinator.verify_gh_auth
+        self.original_ensure_repo_name = pr_review_coordinator.ensure_repo_name
+        self.original_run = pr_review_coordinator.run
+        self.original_resolve_thread = pr_review_coordinator.resolve_thread
+        self.original_assert_thread_available = pr_review_coordinator.assert_thread_available
+        self.original_ensure_worktree = pr_review_coordinator.ensure_worktree
+        self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
+        self.original_record_event = pr_review_coordinator.record_event
+
+    def tearDown(self):
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.verify_gh_auth = self.original_verify_gh_auth
+        pr_review_coordinator.ensure_repo_name = self.original_ensure_repo_name
+        pr_review_coordinator.run = self.original_run
+        pr_review_coordinator.resolve_thread = self.original_resolve_thread
+        pr_review_coordinator.assert_thread_available = self.original_assert_thread_available
+        pr_review_coordinator.ensure_worktree = self.original_ensure_worktree
+        pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
+        pr_review_coordinator.record_event = self.original_record_event
+        self.temp_dir.cleanup()
+
+    def test_register_tracking_stores_sibling_managed_worktree(self):
+        captured: dict[str, object] = {}
+
+        pr_review_coordinator.verify_gh_auth = lambda: None
+        pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("Starshipit-Product", "starshipit-wms")
+        pr_review_coordinator.run = lambda cmd, cwd=None: type(
+            "Result",
+            (),
+            {
+                "stdout": '{"number": 418, "url": "https://example.com/pr/418", "title": "PR 418", "headRefName": "feat/putaway-split-lines-and-serial-scan", "baseRefName": "master", "state": "OPEN"}'
+            },
+        )()
+        pr_review_coordinator.resolve_thread = lambda repo_root, thread_id: {"id": "thread-418", "title": "PR 418 thread"}
+        pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+
+        def fake_ensure_worktree(repo_root, repo_name, pr_number, branch, worktree_root, *, layout):
+            captured["repo_root"] = repo_root
+            captured["repo_name"] = repo_name
+            captured["pr_number"] = pr_number
+            captured["branch"] = branch
+            captured["worktree_root"] = worktree_root
+            captured["layout"] = layout
+            return {
+                "status": "ready",
+                "worktree": "/Users/jordan/source/starshipit-wms-pr-418",
+                "created": True,
+            }
+
+        pr_review_coordinator.ensure_worktree = fake_ensure_worktree
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "needs_review",
+            "pr": {
+                "number": 418,
+                "url": "https://example.com/pr/418",
+                "title": "PR 418",
+                "state": "OPEN",
+            },
+            "signature": "sig",
+            "latest_comment_at": None,
+            "pending_copilot_review": True,
+            "unresolved_threads": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+
+        result = pr_review_coordinator.register_tracking(
+            repo_root="/Users/jordan/source/starshipit-wms",
+            repo_name="starshipit-wms",
+            pr_number=418,
+            branch="feat/putaway-split-lines-and-serial-scan",
+            worktree_root="/Users/jordan/source",
+            worktree_path=None,
+            thread_id="thread-418",
+            worktree_layout="sibling",
+        )
+
+        self.assertEqual(captured["layout"], "sibling")
+        self.assertEqual(result["tracked_pr"]["worktree_path"], "/Users/jordan/source/starshipit-wms-pr-418")
+        self.assertEqual(result["tracked_pr"]["worktree_managed"], True)
 
 
 if __name__ == "__main__":
