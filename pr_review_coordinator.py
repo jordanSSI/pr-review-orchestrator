@@ -45,6 +45,7 @@ LOCKS_DIR = VAR_DIR / "locks"
 CODEX_STATE_DB = CODEX_HOME / "state_5.sqlite"
 COORDINATOR_DB = VAR_DIR / "pr-review-coordinator.db"
 DEFAULT_POLL_SECONDS = 300
+DEFAULT_WORKER_COUNT = 4
 ACTIVE_STATUSES = {"needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "needs_review": 0,
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     status TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
     last_review_signature TEXT,
+    last_handled_signature TEXT,
     last_review_status TEXT,
     last_review_comment_at TEXT,
     pending_copilot_review INTEGER NOT NULL DEFAULT 0,
@@ -158,6 +160,7 @@ class TrackedPR:
     status: str
     active: int
     last_review_signature: str | None
+    last_handled_signature: str | None
     last_review_status: str | None
     last_review_comment_at: str | None
     pending_copilot_review: int
@@ -222,6 +225,7 @@ def connect_db() -> sqlite3.Connection:
         {
             "worktree_managed": "INTEGER NOT NULL DEFAULT 1",
             "pending_copilot_review": "INTEGER NOT NULL DEFAULT 0",
+            "last_handled_signature": "TEXT",
             "unresolved_thread_count": "INTEGER NOT NULL DEFAULT 0",
             "failing_check_count": "INTEGER NOT NULL DEFAULT 0",
             "unresolved_threads_json": "TEXT",
@@ -280,6 +284,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "status": record.status,
         "active": bool(record.active),
         "pending_copilot_review": bool(record.pending_copilot_review),
+        "last_handled_signature": record.last_handled_signature,
         "unresolved_thread_count": record.unresolved_thread_count,
         "failing_check_count": record.failing_check_count,
         "ci_summary": record.ci_summary,
@@ -593,6 +598,13 @@ def state_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def execution_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "last_handled_signature": snapshot["signature"],
+        "last_prompted_at": now_ms(),
+    }
+
+
 def assert_thread_available(thread_id: str, key: str) -> None:
     connection = connect_db()
     try:
@@ -748,13 +760,41 @@ def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by:
         connection.close()
 
 
+def job_priority(action: str) -> int:
+    if action in {"untrack", "untrack-cleanup"}:
+        return 0
+    if action in {"poll-one", "poll-all"}:
+        return 1
+    if action == "run-one":
+        return 2
+    return 99
+
+
 def claim_next_job() -> Job | None:
     connection = connect_db()
     try:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            "SELECT * FROM jobs WHERE status = 'queued' ORDER BY requested_at ASC, id ASC LIMIT 1"
+            """
+            SELECT *
+            FROM jobs
+            WHERE status = 'queued'
+            ORDER BY
+                CASE action
+                    WHEN 'untrack' THEN 0
+                    WHEN 'untrack-cleanup' THEN 0
+                    WHEN 'poll-one' THEN 1
+                    WHEN 'poll-all' THEN 1
+                    WHEN 'run-one' THEN 2
+                    ELSE 99
+                END ASC,
+                requested_at ASC,
+                id ASC
+            LIMIT 1
+            """
         ).fetchone()
         if not row:
+            connection.commit()
             return None
         job = row_to_job(row)
         updated = connection.execute(
@@ -767,6 +807,51 @@ def claim_next_job() -> Job | None:
         return get_job(job.id)
     finally:
         connection.close()
+
+
+def decode_job_payload(job: Job) -> dict[str, Any]:
+    if not job.payload_json:
+        return {}
+    try:
+        data = json.loads(job.payload_json)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def list_pending_jobs() -> list[Job]:
+    connection = connect_db()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status IN ('queued', 'running')
+            ORDER BY
+                CASE action
+                    WHEN 'untrack' THEN 0
+                    WHEN 'untrack-cleanup' THEN 0
+                    WHEN 'poll-one' THEN 1
+                    WHEN 'poll-all' THEN 1
+                    WHEN 'run-one' THEN 2
+                    ELSE 99
+                END ASC,
+                requested_at ASC,
+                id ASC
+            """
+        ).fetchall()
+        return [row_to_job(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def pending_jobs_by_pr() -> dict[str, list[Job]]:
+    jobs_by_pr: dict[str, list[Job]] = {}
+    for job in list_pending_jobs():
+        if not job.tracked_pr_key:
+            continue
+        jobs_by_pr.setdefault(job.tracked_pr_key, []).append(job)
+    return jobs_by_pr
 
 
 def finish_job(job_id: int, status: str, summary: str, *, error: str | None = None) -> Job:
@@ -804,6 +889,44 @@ def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_sta
     elif job_id is not None:
         changes["current_job_id"] = job_id
     return update_tracked_pr(record.key, **changes)
+
+
+def update_execution_state(
+    key: str,
+    *,
+    run_state: str | None = None,
+    run_reason: str | None = None,
+    current_job_id: int | None = None,
+    last_run_status: str | None = None,
+    last_run_summary: str | None = None,
+    last_run_started_at: int | None = None,
+    last_run_finished_at: int | None = None,
+    last_error: str | None = None,
+    last_handled_signature: str | None = None,
+    last_prompted_at: int | None = None,
+) -> TrackedPR:
+    changes: dict[str, Any] = {}
+    if run_state is not None:
+        changes["run_state"] = run_state
+    if run_reason is not None:
+        changes["run_reason"] = run_reason
+    if current_job_id is not None:
+        changes["current_job_id"] = current_job_id
+    if last_run_status is not None:
+        changes["last_run_status"] = last_run_status
+    if last_run_summary is not None:
+        changes["last_run_summary"] = last_run_summary[:4000]
+    if last_run_started_at is not None:
+        changes["last_run_started_at"] = last_run_started_at
+    if last_run_finished_at is not None:
+        changes["last_run_finished_at"] = last_run_finished_at
+    if last_error is not None or last_error is None:
+        changes["last_error"] = last_error[:4000] if last_error else None
+    if last_handled_signature is not None:
+        changes["last_handled_signature"] = last_handled_signature
+    if last_prompted_at is not None:
+        changes["last_prompted_at"] = last_prompted_at
+    return update_tracked_pr(key, **changes)
 
 
 def register_tracking(
@@ -863,6 +986,7 @@ def register_tracking(
             "current_job_id": None,
             "lock_started_at": None,
             "lock_owner_pid": None,
+            "last_handled_signature": None,
             "last_prompted_at": None,
             "last_run_started_at": None,
             "last_run_finished_at": now_ms(),
@@ -930,6 +1054,7 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
             "current_job_id": None,
             "lock_started_at": None,
             "lock_owner_pid": None,
+            "last_handled_signature": None,
             "last_prompted_at": None,
             "last_run_started_at": None,
             "last_run_finished_at": now_ms(),
@@ -1062,7 +1187,7 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
     if force_run:
         return True, "Manual run requested"
     if (
-        record.last_review_signature == snapshot["signature"]
+        record.last_handled_signature == snapshot["signature"]
         and record.last_prompted_at
         and record.last_run_status in {"ok", "dry_run"}
     ):
@@ -1140,6 +1265,83 @@ def cleanup_external_worktree(record: TrackedPR) -> dict[str, Any]:
 
 
 def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int | None) -> dict[str, Any]:
+    record_event("info", "poll_started", f"Polling PR #{record.pr_number}", tracked_pr_key=record.key, details={"job_id": job_id})
+    update_tracked_pr(
+        record.key,
+        last_run_status="running",
+        last_run_summary="Fetching latest GitHub PR state",
+        last_error=None,
+    )
+    snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+    previous_status = record.status
+    if previous_status != snapshot["status"]:
+        record_event(
+            "info",
+            "state_transition",
+            f"PR state changed from {previous_status} to {snapshot['status']}",
+            tracked_pr_key=record.key,
+            details={"from": previous_status, "to": snapshot["status"]},
+        )
+
+    if snapshot["pr"]["state"] != "OPEN":
+        cleanup = maybe_cleanup_closed_pr(record) if record.worktree_managed else {"status": "skipped", "removed": False, "reason": "external worktree retained until explicit cleanup"}
+        updated = update_tracked_pr(
+            record.key,
+            active=0,
+            last_run_finished_at=now_ms(),
+            last_run_status="closed",
+            last_run_summary=f"PR is {snapshot['pr']['state']}; tracking archived",
+            last_error=None,
+            **state_payload(snapshot),
+        )
+        record_event("info", "pr_closed", f"Archived tracking for {snapshot['pr']['state']} PR", tracked_pr_key=record.key, details=cleanup)
+        return {"status": "closed", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "cleanup": cleanup}
+
+    should_run, reason = should_trigger_follow_up(record, snapshot, force_run=force_run)
+    if not should_run:
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="idle",
+            last_run_summary=reason,
+            last_error=None,
+            **state_payload(snapshot),
+        )
+        record_event("info", "poll_idle", reason, tracked_pr_key=record.key)
+        return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
+
+    if dry_run:
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="dry_run",
+            last_run_summary="Would queue follow-up execution",
+            last_error=None,
+            **state_payload(snapshot),
+        )
+        return {"status": "dry_run", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True}
+
+    enqueue_result = enqueue_job(
+        "run-one",
+        tracked_pr_key=record.key,
+        requested_by="poller",
+        payload={"force_run": force_run, "signature": snapshot["signature"]},
+    )
+    job = enqueue_result["job"]
+    summary = "Follow-up run already queued" if enqueue_result["duplicate"] else f"Queued follow-up job #{job['id']}"
+    updated = update_tracked_pr(
+        record.key,
+        last_run_finished_at=now_ms(),
+        last_run_status="queued",
+        last_run_summary=summary,
+        last_error=None,
+        **state_payload(snapshot),
+    )
+    record_event("info", "follow_up_queued", summary, tracked_pr_key=record.key, details={"job_id": job["id"], "duplicate": enqueue_result["duplicate"]})
+    return {"status": "queued", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True, "job": job}
+
+
+def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int) -> dict[str, Any]:
     existing_lock = acquire_lock(record, job_id)
     if existing_lock:
         started_at = format_timestamp(existing_lock.get("started_at"))
@@ -1148,8 +1350,6 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             summary += f" since {started_at}"
         updated = update_tracked_pr(
             record.key,
-            run_state=None,
-            run_reason=None,
             current_job_id=None,
             last_run_finished_at=now_ms(),
             last_run_status="busy",
@@ -1159,29 +1359,8 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
         record_event("info", "busy", summary, tracked_pr_key=record.key)
         return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "triggered": False}
 
-    record_event("info", "poll_started", f"Polling PR #{record.pr_number}", tracked_pr_key=record.key, details={"job_id": job_id})
-    update_tracked_pr(
-        record.key,
-        run_state="running",
-        run_reason="poll",
-        current_job_id=job_id,
-        last_run_started_at=now_ms(),
-        last_run_status="running",
-        last_run_summary="Fetching latest GitHub PR state",
-        last_error=None,
-    )
     try:
         snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
-        previous_status = record.status
-        if previous_status != snapshot["status"]:
-            record_event(
-                "info",
-                "state_transition",
-                f"PR state changed from {previous_status} to {snapshot['status']}",
-                tracked_pr_key=record.key,
-                details={"from": previous_status, "to": snapshot["status"]},
-            )
-
         if snapshot["pr"]["state"] != "OPEN":
             cleanup = maybe_cleanup_closed_pr(record) if record.worktree_managed else {"status": "skipped", "removed": False, "reason": "external worktree retained until explicit cleanup"}
             updated = update_tracked_pr(
@@ -1196,7 +1375,6 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
                 last_error=None,
                 **state_payload(snapshot),
             )
-            record_event("info", "pr_closed", f"Archived tracking for {snapshot['pr']['state']} PR", tracked_pr_key=record.key, details=cleanup)
             return {"status": "closed", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "cleanup": cleanup}
 
         should_run, reason = should_trigger_follow_up(record, snapshot, force_run=force_run)
@@ -1210,7 +1388,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
                 run_reason=None,
                 finished=True,
             )
-            record_event("info", "poll_idle", reason, tracked_pr_key=record.key)
+            record_event("info", "run_skipped", reason, tracked_pr_key=record.key, details={"job_id": job_id})
             return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
 
         worktree_path = Path(record.worktree_path)
@@ -1253,9 +1431,10 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             run_summary=(codex_result.get("last_message") or codex_result.get("stderr") or codex_result.get("stdout") or reason)[:4000],
             error=None if codex_result["status"] in {"ok", "dry_run"} else (codex_result.get("stderr") or "codex resume failed"),
             run_reason=None,
-            prompted=True,
             finished=True,
         )
+        if codex_result["status"] in {"ok", "dry_run"}:
+            updated = update_tracked_pr(record.key, **execution_payload(snapshot))
         level = "info" if codex_result["status"] in {"ok", "dry_run"} else "error"
         record_event(level, "codex_finished", f"Codex follow-up finished with status {codex_result['status']}", tracked_pr_key=record.key, details={"job_id": job_id})
         return {
@@ -1276,21 +1455,7 @@ def poll_all(active_only: bool, dry_run: bool) -> dict[str, Any]:
     records.sort(key=priority_key)
     results = []
     for record in records:
-        try:
-            results.append(poll_record(record, dry_run=dry_run, force_run=False, job_id=None))
-        except Exception as exc:  # noqa: BLE001
-            updated = update_tracked_pr(
-                record.key,
-                run_state=None,
-                run_reason=None,
-                current_job_id=None,
-                last_run_finished_at=now_ms(),
-                last_run_status="error",
-                last_run_summary=str(exc),
-                last_error=str(exc),
-            )
-            record_event("error", "poll_failed", str(exc), tracked_pr_key=record.key)
-            results.append({"status": "error", "tracked_pr": tracked_pr_to_dict(updated), "error": str(exc)})
+        results.append(enqueue_job("poll-one", tracked_pr_key=record.key, requested_by="poll-all"))
     return {"status": "ready", "results": results, "count": len(results)}
 
 
@@ -1301,36 +1466,19 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
             records = list_tracked_prs(active_only=True)
             records.sort(key=priority_key)
             results = []
-            failures = 0
             for record in records:
-                try:
-                    results.append(poll_record(record, dry_run=dry_run, force_run=False, job_id=job.id))
-                except Exception as exc:  # noqa: BLE001
-                    failures += 1
-                    update_tracked_pr(
-                        record.key,
-                        run_state=None,
-                        run_reason=None,
-                        current_job_id=None,
-                        last_run_finished_at=now_ms(),
-                        last_run_status="error",
-                        last_run_summary=str(exc),
-                        last_error=str(exc),
-                    )
-                    record_event("error", "poll_failed", str(exc), tracked_pr_key=record.key, details={"job_id": job.id})
-                    results.append({"status": "error", "tracked_pr": tracked_pr_to_dict(get_tracked_pr(record.key)), "error": str(exc)})
-            summary = f"Polled {len(results)} tracked PRs"
-            if failures:
-                summary += f"; {failures} failed"
-            finish_job(job.id, "succeeded" if failures == 0 else "failed", summary)
+                results.append(enqueue_job("poll-one", tracked_pr_key=record.key, requested_by="poll-all"))
+            summary = f"Queued {len(results)} PR poll job(s)"
+            finish_job(job.id, "succeeded", summary)
             record_event("info", "job_finished", f"Finished job {job.action}", details={"job_id": job.id, "count": len(results)})
             return {"status": "ready", "results": results}
 
         record = get_tracked_pr(job.tracked_pr_key or "")
+        payload = decode_job_payload(job)
         if job.action == "poll-one":
-            result = poll_record(record, dry_run=dry_run, force_run=False, job_id=job.id)
+            result = poll_record(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
         elif job.action == "run-one":
-            result = poll_record(record, dry_run=dry_run, force_run=True, job_id=job.id)
+            result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
         elif job.action == "untrack":
             result = handle_untrack(record, cleanup_worktree=False)
         elif job.action == "untrack-cleanup":
@@ -1362,20 +1510,40 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
 
 def run_daemon(host: str, port: int, poll_seconds: int) -> None:
     cleanup_stale_runtime_state()
-    record_event("info", "daemon_started", "Daemon started", details={"host": host, "port": port, "poll_seconds": poll_seconds})
+    worker_count = max(2, int(os.environ.get("PR_REVIEW_COORDINATOR_WORKERS", str(DEFAULT_WORKER_COUNT))))
+    record_event("info", "daemon_started", "Daemon started", details={"host": host, "port": port, "poll_seconds": poll_seconds, "worker_count": worker_count})
+    stop_event = threading.Event()
+
+    def worker_loop(worker_id: int) -> None:
+        while not stop_event.is_set():
+            job = claim_next_job()
+            if job:
+                try:
+                    process_job(job)
+                except Exception:
+                    pass
+                continue
+            time.sleep(0.2)
+
+    workers = [
+        threading.Thread(target=worker_loop, name=f"pr-review-worker-{index + 1}", args=(index + 1,), daemon=True)
+        for index in range(worker_count)
+    ]
+    for worker in workers:
+        worker.start()
+
     next_poll_at = time.monotonic()
     try:
         while True:
-            job = claim_next_job()
-            if job:
-                process_job(job)
-                continue
             if time.monotonic() >= next_poll_at:
                 enqueue_job("poll-all", requested_by="daemon")
                 next_poll_at = time.monotonic() + poll_seconds
                 continue
             time.sleep(1)
     except KeyboardInterrupt:
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=1)
         record_event("info", "daemon_stopped", "Daemon stopped")
 
 
@@ -1389,7 +1557,18 @@ def status_badge(status: str | None) -> str:
     return f'<span class="{cls}">{value}</span>'
 
 
-def render_record_row(record: TrackedPR) -> str:
+def describe_pending_jobs(record: TrackedPR, jobs: list[Job]) -> str:
+    if not jobs:
+        return ""
+    top = min(jobs, key=lambda job: (job_priority(job.action), job.requested_at, job.id))
+    verb = "running" if top.status == "running" else "queued"
+    label = top.action.replace("-", " ")
+    suffix = "" if len(jobs) == 1 else f" (+{len(jobs) - 1} more)"
+    return f"{label} {verb}{suffix}"
+
+
+def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) -> str:
+    pending_jobs = pending_jobs or []
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
@@ -1397,20 +1576,24 @@ def render_record_row(record: TrackedPR) -> str:
         details.append(f"{record.failing_check_count} failing check(s)")
     if record.ci_summary:
         details.append(record.ci_summary)
+    pending_text = describe_pending_jobs(record, pending_jobs)
+    if pending_text:
+        details.append(f"pending: {pending_text}")
     detail_text = " | ".join(details)
+    actions_disabled = "disabled" if pending_jobs else ""
     return f"""
-        <tr>
+        <tr data-pr-key="{html.escape(record.key)}">
           <td>{status_badge(record.status)}</td>
           <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
           <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
-          <td><code>{html.escape(record.worktree_path)}</code><div class="small">{html.escape(detail_text)}</div></td>
-          <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack">{html.escape(record.last_run_summary or "")}</div></td>
+          <td><code>{html.escape(record.worktree_path)}</code><div class="small" data-role="detail-text">{html.escape(detail_text)}</div></td>
+          <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div></td>
           <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
           <td>
-            <form method="post" action="/run-one?key={html.escape(record.key)}"><button>Run now</button></form>
-            <form method="post" action="/poll-one?key={html.escape(record.key)}"><button>Poll</button></form>
-            <form method="post" action="/untrack?key={html.escape(record.key)}"><button>Untrack</button></form>
-            <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}"><button>Untrack + Cleanup</button></form>
+            <form method="post" action="/run-one?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'run now queued')"><button {actions_disabled}>Run now</button></form>
+            <form method="post" action="/poll-one?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'poll queued')"><button {actions_disabled}>Poll</button></form>
+            <form method="post" action="/untrack?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'untrack queued')"><button {actions_disabled}>Untrack</button></form>
+            <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'untrack cleanup queued')"><button {actions_disabled}>Untrack + Cleanup</button></form>
           </td>
         </tr>
         """
@@ -1465,7 +1648,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             records = [record for record in records if not record.active]
         if status_filter != "all":
             records = [record for record in records if record.status == status_filter]
-        rows = [render_record_row(record) for record in sort_records(records, sort_key)]
+        pending_jobs = pending_jobs_by_pr()
+        rows = [render_record_row(record, pending_jobs.get(record.key, [])) for record in sort_records(records, sort_key)]
         jobs = list_recent_jobs(15)
         events = list_recent_events(20)
 
@@ -1474,6 +1658,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <h1>PR Review Coordinator</h1>
           <p>Web UI reads tracked state and enqueues daemon jobs. Refreshes every 5 seconds.</p>
         </header>
+        <script>
+          function queueAction(form, label) {{
+            const row = form.closest('tr');
+            if (!row) return true;
+            for (const button of row.querySelectorAll('button')) {{
+              button.disabled = true;
+            }}
+            const summary = row.querySelector('[data-role="run-summary"]');
+            if (summary) {{
+              summary.textContent = label;
+            }}
+            const detail = row.querySelector('[data-role="detail-text"]');
+            if (detail && !detail.textContent.includes(label)) {{
+              detail.textContent = detail.textContent ? `${{detail.textContent}} | pending: ${{label}}` : `pending: ${{label}}`;
+            }}
+            return true;
+          }}
+        </script>
         <main>
           <div class="actions">
             <form method="post" action="/poll"><button>Poll all now</button></form>
@@ -1489,7 +1691,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <label>Status
               <select name="status">
                 <option value="all" {"selected" if status_filter == "all" else ""}>All</option>
-                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "awaiting_final_test", "busy", "error", "untracked"])}
+                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
               </select>
             </label>
             <label>Sort
@@ -1569,7 +1771,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/run-one":
             key = params.get("key", [None])[0]
             if key:
-                enqueue_job("run-one", tracked_pr_key=key, requested_by="web")
+                enqueue_job("run-one", tracked_pr_key=key, requested_by="web", payload={"force_run": True})
             self._redirect("/")
             return
         if parsed.path == "/untrack":

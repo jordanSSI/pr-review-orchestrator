@@ -17,12 +17,12 @@ The coordinator maps:
 - a dedicated PR worktree
 - the Codex thread that started the work
 
-It then polls GitHub state and, when needed, resumes that same Codex thread with follow-up instructions targeted at the dedicated PR worktree.
+It polls GitHub state, records the latest snapshot for each tracked PR, and queues follow-up work when needed. Execution stays targeted at the dedicated PR worktree.
 
 This is useful when:
 - you want to keep new feature work in your main checkout
 - you want PR review follow-up isolated in a dedicated worktree
-- you want repeated Copilot review loops to stay attached to the original Codex thread
+- you want repeated PR review loops to stay attached to the original Codex thread
 
 ## Requirements
 
@@ -120,10 +120,11 @@ pr-review-coordinator web --host 127.0.0.1 --port 8765
 1. Do initial work in a normal Codex thread for a repo.
 2. When the change is ready, run `pr-review-coordinator handoff ...` from that same thread.
 3. The handoff command captures `CODEX_THREAD_ID`, creates or reuses the PR, creates the dedicated PR worktree, and registers `repo + PR + branch + worktree + thread_id`.
-4. The daemon polls GitHub for unresolved review feedback, Copilot review state, and completed failing CI.
-5. When actionable state changes, it runs `codex exec resume <thread_id> "<follow-up prompt>"`, which sends the work back into the same Codex thread you started with.
-6. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
-7. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If new comments or completed failures appear later, the same thread is resumed again.
+4. The daemon queues lightweight per-PR poll jobs that fetch unresolved review feedback, Copilot review state, and completed failing CI.
+5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
+6. Follow-up execution runs `codex exec resume <thread_id> "<follow-up prompt>"`, which sends the work back into the same Codex thread you started with.
+7. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
+8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If new comments or completed failures appear later, the same thread is resumed again.
 
 ## Agent Notes
 
@@ -136,6 +137,7 @@ Agents using this tool should follow these rules:
 - Do not manually edit the coordinator database or lock files.
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
+- Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
 ## Guidance For Other Repositories
@@ -201,7 +203,7 @@ Runs one review poll tick.
 pr-review-coordinator poll-once --dry-run
 ```
 
-Use `--dry-run` to inspect what would happen without resuming Codex.
+Use `--dry-run` to inspect what would happen without queuing or resuming Codex.
 
 ### `status`
 
@@ -221,7 +223,7 @@ pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 
 ### `daemon`
 
-Runs polling, queued job execution, Codex follow-up, and telemetry logging.
+Runs the job workers, periodic polling scheduler, Codex follow-up execution, and telemetry logging.
 
 ### `web`
 
@@ -237,24 +239,27 @@ Stops tracking a PR record.
 
 ## Status Meanings
 
-- `needs_review`: unresolved review feedback exists and follow-up work may be needed
+- `needs_review`: unresolved GitHub review feedback exists and follow-up work may be needed
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
 - `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain
 - `busy`: the coordinator intentionally skipped this PR because another run or local work appears to be in progress
-- `running`: a poll or follow-up job is currently active
-- `idle`: the last poll completed and no immediate action was taken
+- `running`: a follow-up job is currently active for this PR
+- `queued`: the latest poll queued follow-up work, or a user action is waiting in the queue
+- `idle`: the last poll completed and no immediate execution was needed
 - `error`: the last run failed and needs inspection
 
 ## Locks And Safety
 
-The coordinator uses persisted per-PR lock files and SQLite run state to avoid interfering with active review-follow-up work.
+The coordinator uses persisted per-PR lock files and SQLite queue state to avoid interfering with active review-follow-up work.
 
 Current behavior:
-- one persisted lock file is created per tracked PR while a run is active
+- one persisted lock file is created per tracked PR while follow-up execution is active
 - if a lock is already active, the coordinator skips that PR as `busy`
 - if the tracked worktree has local changes, the coordinator treats it as `busy` rather than assuming it is safe to reset
-- dashboard actions are asynchronous from the browser point of view and flow through a SQLite job queue
+- dashboard actions are asynchronous from the browser point of view and flow through a prioritized SQLite job queue
+- polling is decoupled from Codex execution: poll jobs update state and enqueue `run-one` instead of running Codex inline
+- control actions like `untrack` are higher priority than execution jobs
 - jobs and terse telemetry are persisted so the web UI can survive restarts cleanly
 
 ## State Files

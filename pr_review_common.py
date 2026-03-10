@@ -377,8 +377,8 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
 def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
     threads = pull_request["reviewThreads"]["nodes"] or []
     copilot_threads: list[dict[str, Any]] = []
+    unresolved_threads: list[dict[str, Any]] = []
     unresolved_copilot_threads: list[dict[str, Any]] = []
-    unresolved_non_copilot_threads: list[dict[str, Any]] = []
 
     for thread in threads:
         comments = thread["comments"]["nodes"] or []
@@ -407,12 +407,12 @@ def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
         is_copilot_thread = any(is_copilot_login(login) for login in comment_logins)
         if is_copilot_thread:
             copilot_threads.append(summary)
-            if not thread["isResolved"]:
+        if not thread["isResolved"]:
+            unresolved_threads.append(summary)
+            if is_copilot_thread:
                 unresolved_copilot_threads.append(summary)
-        elif not thread["isResolved"]:
-            unresolved_non_copilot_threads.append(summary)
 
-    status = "clean" if not unresolved_copilot_threads else "needs_work"
+    status = "clean" if not unresolved_threads else "needs_work"
     return {
         "status": status,
         "pr": {
@@ -424,11 +424,11 @@ def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
         "totals": {
             "threads": len(threads),
             "copilot_threads": len(copilot_threads),
+            "unresolved_threads": len(unresolved_threads),
             "unresolved_copilot_threads": len(unresolved_copilot_threads),
-            "unresolved_non_copilot_threads": len(unresolved_non_copilot_threads),
         },
+        "unresolved_threads": unresolved_threads,
         "unresolved_copilot_threads": unresolved_copilot_threads,
-        "unresolved_non_copilot_threads": unresolved_non_copilot_threads,
     }
 
 

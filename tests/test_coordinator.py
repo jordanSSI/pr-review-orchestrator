@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,7 @@ import pr_review_common
 import pr_review_coordinator
 
 
-def make_pull_request(*, unresolved=False, pending_copilot=False, failing_check=False):
+def make_pull_request(*, unresolved=False, pending_copilot=False, failing_check=False, review_author="github-copilot[bot]"):
     review_requests = []
     if pending_copilot:
         review_requests.append({"requestedReviewer": {"login": "copilot-pull-request-reviewer[bot]"}})
@@ -24,7 +25,7 @@ def make_pull_request(*, unresolved=False, pending_copilot=False, failing_check=
                     "nodes": [
                         {
                             "id": "comment-1",
-                            "author": {"login": "github-copilot[bot]"},
+                            "author": {"login": review_author},
                             "body": "Please handle this edge case.",
                             "createdAt": "2026-03-09T00:00:00Z",
                             "url": "https://example.com/comment-1",
@@ -68,6 +69,10 @@ class PullRequestSnapshotTests(unittest.TestCase):
 
     def test_unresolved_review_threads_only(self):
         snapshot = self.snapshot(make_pull_request(unresolved=True))
+        self.assertEqual(snapshot["status"], "needs_review")
+
+    def test_non_copilot_unresolved_review_threads_also_trigger_work(self):
+        snapshot = self.snapshot(make_pull_request(unresolved=True, review_author="reviewer"))
         self.assertEqual(snapshot["status"], "needs_review")
 
     def test_pending_copilot_without_comments(self):
@@ -162,6 +167,7 @@ class ThreadPolicyTests(unittest.TestCase):
                 "status": "awaiting_final_test",
                 "active": 1 if active else 0,
                 "last_review_signature": None,
+                "last_handled_signature": None,
                 "last_review_status": "awaiting_final_test",
                 "last_review_comment_at": None,
                 "pending_copilot_review": 0,
@@ -290,6 +296,137 @@ class RegisterTrackingTests(unittest.TestCase):
         self.assertEqual(captured["layout"], "sibling")
         self.assertEqual(result["tracked_pr"]["worktree_path"], "/Users/jordan/source/starshipit-wms-pr-418")
         self.assertEqual(result["tracked_pr"]["worktree_managed"], True)
+
+
+class QueueBehaviorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        self.original_record_event = pr_review_coordinator.record_event
+        self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
+        self.original_run_follow_up = pr_review_coordinator.run_follow_up
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+
+        for key, number in (("repo-pr-1", 1), ("repo-pr-2", 2)):
+            pr_review_coordinator.upsert_tracked_pr(
+                {
+                    "key": key,
+                    "repo_root": "/tmp/repo",
+                    "repo_owner": "owner",
+                    "repo_name": "repo",
+                    "pr_number": number,
+                    "pr_url": f"https://example.com/pr/{number}",
+                    "pr_title": f"PR {number}",
+                    "pr_state": "OPEN",
+                    "branch": f"branch-{number}",
+                    "base_branch": "main",
+                    "worktree_path": f"/tmp/worktree-{number}",
+                    "worktree_managed": 1,
+                    "thread_id": f"thread-{number}",
+                    "thread_title": f"Thread {number}",
+                    "status": "awaiting_final_test",
+                    "active": 1,
+                    "last_review_signature": None,
+                    "last_handled_signature": None,
+                    "last_review_status": "awaiting_final_test",
+                    "last_review_comment_at": None,
+                    "pending_copilot_review": 0,
+                    "unresolved_thread_count": 0,
+                    "failing_check_count": 0,
+                    "unresolved_threads_json": "[]",
+                    "failing_checks_json": "[]",
+                    "ci_summary": None,
+                    "run_state": None,
+                    "run_reason": None,
+                    "current_job_id": None,
+                    "lock_started_at": None,
+                    "lock_owner_pid": None,
+                    "last_polled_at": None,
+                    "last_prompted_at": None,
+                    "last_run_started_at": None,
+                    "last_run_finished_at": None,
+                    "last_run_status": "registered",
+                    "last_run_summary": "registered",
+                    "last_error": None,
+                }
+            )
+
+    def tearDown(self):
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.record_event = self.original_record_event
+        pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
+        pr_review_coordinator.run_follow_up = self.original_run_follow_up
+        self.temp_dir.cleanup()
+
+    def snapshot(self, status="needs_review", signature="sig-1"):
+        return {
+            "status": status,
+            "pr": {
+                "number": 1,
+                "url": "https://example.com/pr/1",
+                "title": "PR 1",
+                "state": "OPEN",
+            },
+            "signature": signature,
+            "latest_comment_at": "2026-03-09T00:00:00Z",
+            "pending_copilot_review": False,
+            "unresolved_threads": [{"id": "thread-1"}] if status == "needs_review" else [],
+            "failing_checks": [],
+        }
+
+    def test_poll_record_queues_follow_up_instead_of_running_it_inline(self):
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot()
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=101)
+
+        self.assertEqual(result["status"], "queued")
+        pending = pr_review_coordinator.list_pending_jobs()
+        self.assertEqual([job.action for job in pending], ["run-one"])
+        self.assertEqual(json.loads(pending[0].payload_json)["signature"], "sig-1")
+
+    def test_poll_all_job_fans_out_per_pr_poll_jobs(self):
+        job_info = pr_review_coordinator.enqueue_job("poll-all", requested_by="test")
+        result = pr_review_coordinator.process_job(pr_review_coordinator.get_job(job_info["job"]["id"]))
+
+        self.assertEqual(result["status"], "ready")
+        pending = pr_review_coordinator.list_pending_jobs()
+        self.assertEqual([job.action for job in pending], ["poll-one", "poll-one"])
+
+    def test_claim_next_job_prioritizes_untrack(self):
+        pr_review_coordinator.enqueue_job("run-one", tracked_pr_key="repo-pr-1", requested_by="test")
+        pr_review_coordinator.enqueue_job("untrack", tracked_pr_key="repo-pr-2", requested_by="test")
+
+        claimed = pr_review_coordinator.claim_next_job()
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.action, "untrack")
+        self.assertEqual(claimed.tracked_pr_key, "repo-pr-2")
+
+    def test_process_run_one_uses_execution_path(self):
+        pr_review_coordinator.enqueue_job("run-one", tracked_pr_key="repo-pr-1", requested_by="test", payload={"force_run": True})
+        claimed = pr_review_coordinator.claim_next_job()
+        captured = {}
+
+        def fake_run_follow_up(record, *, dry_run, force_run, job_id):
+            captured["record"] = record.key
+            captured["dry_run"] = dry_run
+            captured["force_run"] = force_run
+            captured["job_id"] = job_id
+            return {"status": "ok"}
+
+        pr_review_coordinator.run_follow_up = fake_run_follow_up
+
+        pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(captured, {"record": "repo-pr-1", "dry_run": False, "force_run": True, "job_id": claimed.id})
 
 
 if __name__ == "__main__":
