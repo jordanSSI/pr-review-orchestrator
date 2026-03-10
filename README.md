@@ -6,6 +6,7 @@ It is designed to:
 - register a PR against the Codex thread that started the work
 - keep review follow-up isolated in a dedicated PR worktree
 - poll GitHub for new review activity and completed failing CI
+- consider actionable top-level PR comments as steering input
 - resume the mapped Codex thread when follow-up is needed
 - surface persisted status, jobs, locks, and telemetry through a local dashboard
 
@@ -138,6 +139,7 @@ Agents using this tool should follow these rules:
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
+- Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
 ## Guidance For Other Repositories
@@ -239,7 +241,7 @@ Stops tracking a PR record.
 
 ## Status Meanings
 
-- `needs_review`: unresolved GitHub review feedback exists and follow-up work may be needed
+- `needs_review`: unresolved GitHub review feedback or actionable top-level PR comments exist and follow-up work may be needed
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
 - `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain

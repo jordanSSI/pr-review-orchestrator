@@ -7,7 +7,14 @@ import pr_review_common
 import pr_review_coordinator
 
 
-def make_pull_request(*, unresolved=False, pending_copilot=False, failing_check=False, review_author="github-copilot[bot]"):
+def make_pull_request(
+    *,
+    unresolved=False,
+    pending_copilot=False,
+    failing_check=False,
+    review_author="github-copilot[bot]",
+    pr_comments=None,
+):
     review_requests = []
     if pending_copilot:
         review_requests.append({"requestedReviewer": {"login": "copilot-pull-request-reviewer[bot]"}})
@@ -54,6 +61,7 @@ def make_pull_request(*, unresolved=False, pending_copilot=False, failing_check=
         "state": "OPEN",
         "reviewRequests": {"nodes": review_requests},
         "reviewThreads": {"nodes": review_threads},
+        "comments": {"nodes": pr_comments or []},
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": contexts}}}}]},
     }
 
@@ -90,6 +98,50 @@ class PullRequestSnapshotTests(unittest.TestCase):
     def test_clean_green_pr(self):
         snapshot = self.snapshot(make_pull_request())
         self.assertEqual(snapshot["status"], "awaiting_final_test")
+
+    def test_top_level_pr_comment_triggers_needs_review(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "jordanSSI"},
+                        "body": "Please resolve merge conflicts with master.",
+                        "createdAt": "2026-03-09T01:00:00Z",
+                        "updatedAt": "2026-03-09T01:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
+
+    def test_handled_marker_comment_suppresses_prior_pr_comment(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "jordanSSI"},
+                        "body": "Please resolve merge conflicts with master.",
+                        "createdAt": "2026-03-09T01:00:00Z",
+                        "updatedAt": "2026-03-09T01:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    },
+                    {
+                        "id": "issue-comment-2",
+                        "author": {"login": "jordanSSI"},
+                        "body": "Merged master and resolved conflicts. <!-- pr-review-coordinator:handled-comment issue-comment-1 -->",
+                        "createdAt": "2026-03-09T02:00:00Z",
+                        "updatedAt": "2026-03-09T02:00:00Z",
+                        "url": "https://example.com/comment-2",
+                    },
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertEqual(snapshot["actionable_pr_comments"], [])
 
 
 class WorktreePathTests(unittest.TestCase):
@@ -172,8 +224,10 @@ class ThreadPolicyTests(unittest.TestCase):
                 "last_review_comment_at": None,
                 "pending_copilot_review": 0,
                 "unresolved_thread_count": 0,
+                "actionable_comment_count": 0,
                 "failing_check_count": 0,
                 "unresolved_threads_json": "[]",
+                "actionable_comments_json": "[]",
                 "failing_checks_json": "[]",
                 "ci_summary": None,
                 "run_state": None,
@@ -275,9 +329,11 @@ class RegisterTrackingTests(unittest.TestCase):
             "latest_comment_at": None,
             "pending_copilot_review": True,
             "unresolved_threads": [],
+            "actionable_pr_comments": [],
             "failing_checks": [],
             "ci_summary": None,
             "unresolved_thread_count": 0,
+            "actionable_comment_count": 0,
             "failing_check_count": 0,
         }
         pr_review_coordinator.record_event = lambda *args, **kwargs: None
@@ -337,8 +393,10 @@ class QueueBehaviorTests(unittest.TestCase):
                     "last_review_comment_at": None,
                     "pending_copilot_review": 0,
                     "unresolved_thread_count": 0,
+                    "actionable_comment_count": 0,
                     "failing_check_count": 0,
                     "unresolved_threads_json": "[]",
+                    "actionable_comments_json": "[]",
                     "failing_checks_json": "[]",
                     "ci_summary": None,
                     "run_state": None,
@@ -378,6 +436,7 @@ class QueueBehaviorTests(unittest.TestCase):
             "latest_comment_at": "2026-03-09T00:00:00Z",
             "pending_copilot_review": False,
             "unresolved_threads": [{"id": "thread-1"}] if status == "needs_review" else [],
+            "actionable_pr_comments": [],
             "failing_checks": [],
         }
 

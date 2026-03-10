@@ -85,8 +85,10 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     last_review_comment_at TEXT,
     pending_copilot_review INTEGER NOT NULL DEFAULT 0,
     unresolved_thread_count INTEGER NOT NULL DEFAULT 0,
+    actionable_comment_count INTEGER NOT NULL DEFAULT 0,
     failing_check_count INTEGER NOT NULL DEFAULT 0,
     unresolved_threads_json TEXT,
+    actionable_comments_json TEXT,
     failing_checks_json TEXT,
     ci_summary TEXT,
     run_state TEXT,
@@ -165,8 +167,10 @@ class TrackedPR:
     last_review_comment_at: str | None
     pending_copilot_review: int
     unresolved_thread_count: int
+    actionable_comment_count: int
     failing_check_count: int
     unresolved_threads_json: str | None
+    actionable_comments_json: str | None
     failing_checks_json: str | None
     ci_summary: str | None
     run_state: str | None
@@ -227,8 +231,10 @@ def connect_db() -> sqlite3.Connection:
             "pending_copilot_review": "INTEGER NOT NULL DEFAULT 0",
             "last_handled_signature": "TEXT",
             "unresolved_thread_count": "INTEGER NOT NULL DEFAULT 0",
+            "actionable_comment_count": "INTEGER NOT NULL DEFAULT 0",
             "failing_check_count": "INTEGER NOT NULL DEFAULT 0",
             "unresolved_threads_json": "TEXT",
+            "actionable_comments_json": "TEXT",
             "failing_checks_json": "TEXT",
             "ci_summary": "TEXT",
             "run_state": "TEXT",
@@ -286,6 +292,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "pending_copilot_review": bool(record.pending_copilot_review),
         "last_handled_signature": record.last_handled_signature,
         "unresolved_thread_count": record.unresolved_thread_count,
+        "actionable_comment_count": record.actionable_comment_count,
         "failing_check_count": record.failing_check_count,
         "ci_summary": record.ci_summary,
         "run_state": record.run_state,
@@ -590,8 +597,10 @@ def state_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
         "last_review_comment_at": snapshot["latest_comment_at"],
         "pending_copilot_review": 1 if snapshot["pending_copilot_review"] else 0,
         "unresolved_thread_count": len(snapshot["unresolved_threads"]),
+        "actionable_comment_count": len(snapshot.get("actionable_pr_comments", [])),
         "failing_check_count": len(snapshot["failing_checks"]),
         "unresolved_threads_json": json_dumps(snapshot["unresolved_threads"]),
+        "actionable_comments_json": json_dumps(snapshot.get("actionable_pr_comments", [])),
         "failing_checks_json": json_dumps(snapshot["failing_checks"]),
         "ci_summary": summarize_failing_checks(snapshot["failing_checks"]) or None,
         "last_polled_at": now_ms(),
@@ -1096,6 +1105,21 @@ def summarize_threads(unresolved_threads: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def summarize_pr_comments(actionable_comments: list[dict[str, Any]]) -> str:
+    if not actionable_comments:
+        return "No actionable top-level PR comments remain."
+    lines: list[str] = []
+    for comment in actionable_comments[:12]:
+        body = (comment.get("body") or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(body) > 240:
+            body = body[:237] + "..."
+        author = comment.get("author") or "unknown"
+        lines.append(f"- {comment.get('id') or '<unknown>'} [{author}] {body}")
+    if len(actionable_comments) > 12:
+        lines.append(f"- ... {len(actionable_comments) - 12} more actionable PR comments")
+    return "\n".join(lines)
+
+
 def summarize_ci_failures(failing_checks: list[dict[str, Any]]) -> str:
     if not failing_checks:
         return "No completed failing CI checks remain."
@@ -1130,10 +1154,14 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Commit and push scoped follow-up changes when needed.
         Request reviewer `copilot-pull-request-reviewer` after every push when further review is needed.
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
+        If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
 
         Current unresolved review threads:
         {summarize_threads(snapshot["unresolved_threads"])}
+
+        Current actionable top-level PR comments:
+        {summarize_pr_comments(snapshot.get("actionable_pr_comments", []))}
 
         Current completed failing CI checks/statuses:
         {summarize_ci_failures(snapshot["failing_checks"])}
@@ -1572,6 +1600,8 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) 
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
+    if record.actionable_comment_count:
+        details.append(f"{record.actionable_comment_count} PR comment(s)")
     if record.failing_check_count:
         details.append(f"{record.failing_check_count} failing check(s)")
     if record.ci_summary:

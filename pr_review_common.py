@@ -26,6 +26,7 @@ COPILOT_LOGINS = {
     "github-copilot[bot]",
     "copilot[bot]",
 }
+HANDLED_PR_COMMENT_MARKER = "pr-review-coordinator:handled-comment"
 
 
 class ScriptError(RuntimeError):
@@ -223,6 +224,18 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
                   }
                 }
               }
+              comments(first: 100) {
+                nodes {
+                  id
+                  author {
+                    login
+                  }
+                  body
+                  createdAt
+                  updatedAt
+                  url
+                }
+              }
               commits(last: 1) {
                 nodes {
                   commit {
@@ -285,6 +298,51 @@ def serialize_unresolved_threads(pull_request: dict[str, Any]) -> list[dict[str,
     return unresolved
 
 
+def extract_handled_pr_comment_ids(body: str | None) -> set[str]:
+    if not body:
+        return set()
+    matches = re.findall(rf"{re.escape(HANDLED_PR_COMMENT_MARKER)}\s+([A-Za-z0-9_=:-]+)", body)
+    return {match.strip() for match in matches if match.strip()}
+
+
+def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
+    comments = pull_request.get("comments", {}).get("nodes") or []
+    handled_ids: set[str] = set()
+    comment_summaries: list[dict[str, Any]] = []
+    for comment in comments:
+        body = (comment.get("body") or "").strip()
+        handled_ids.update(extract_handled_pr_comment_ids(body))
+        comment_summaries.append(
+            {
+                "id": comment.get("id"),
+                "author": (comment.get("author") or {}).get("login"),
+                "body": body,
+                "createdAt": comment.get("createdAt"),
+                "updatedAt": comment.get("updatedAt"),
+                "url": comment.get("url"),
+                "is_handler_comment": HANDLED_PR_COMMENT_MARKER in body,
+            }
+        )
+
+    actionable = [
+        {
+            "id": comment["id"],
+            "author": comment["author"],
+            "body": comment["body"],
+            "createdAt": comment["createdAt"],
+            "updatedAt": comment["updatedAt"],
+            "url": comment["url"],
+        }
+        for comment in comment_summaries
+        if comment["id"]
+        and comment["body"]
+        and not comment["is_handler_comment"]
+        and comment["id"] not in handled_ids
+    ]
+    actionable.sort(key=lambda item: ((item["updatedAt"] or item["createdAt"] or ""), item["id"]))
+    return actionable
+
+
 def serialize_failing_checks(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
     commits = pull_request.get("commits", {}).get("nodes") or []
     if not commits:
@@ -334,16 +392,19 @@ def serialize_failing_checks(pull_request: dict[str, Any]) -> list[dict[str, Any
 def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     pull_request = fetch_pull_request_state(repo_root, repo_name, pr_number)
     unresolved = serialize_unresolved_threads(pull_request)
+    actionable_pr_comments = serialize_actionable_pr_comments(pull_request)
     failing_checks = serialize_failing_checks(pull_request)
     latest_comment_at = None
-    if unresolved:
-        latest_comment_at = max(item["latest_comment_at"] or "" for item in unresolved) or None
+    latest_comment_candidates = [item["latest_comment_at"] or "" for item in unresolved]
+    latest_comment_candidates.extend(item["updatedAt"] or item["createdAt"] or "" for item in actionable_pr_comments)
+    if latest_comment_candidates:
+        latest_comment_at = max(latest_comment_candidates) or None
     review_requests = pull_request.get("reviewRequests", {}).get("nodes") or []
     pending_copilot_review = any(
         is_copilot_login((node.get("requestedReviewer") or {}).get("login"))
         for node in review_requests
     )
-    if unresolved:
+    if unresolved or actionable_pr_comments:
         status = "needs_review"
     elif failing_checks:
         status = "needs_ci_fix"
@@ -354,6 +415,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
     signature_payload = {
         "status": status,
         "unresolved_threads": unresolved,
+        "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,
         "pending_copilot_review": pending_copilot_review,
     }
@@ -370,6 +432,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "latest_comment_at": latest_comment_at,
         "pending_copilot_review": pending_copilot_review,
         "unresolved_threads": unresolved,
+        "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,
     }
 
@@ -596,8 +659,9 @@ def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict
     prompt = textwrap.dedent(
         f"""
         You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
-        Handle unresolved GitHub review feedback and completed failing CI checks on the current branch.
+        Handle unresolved GitHub review feedback, actionable top-level PR comments, and completed failing CI checks on the current branch.
         Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer copilot-pull-request-reviewer when more review is needed, and resolve threads only after the fix is pushed.
+        If you addressed a top-level PR comment, reply on the PR after pushing with a short note that includes `<!-- {HANDLED_PR_COMMENT_MARKER} COMMENT_ID -->` for each handled comment ID.
 
         If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.
         """
