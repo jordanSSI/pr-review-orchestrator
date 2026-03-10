@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,7 @@ COPILOT_LOGINS = {
     "copilot-pull-request-reviewer[bot]",
     "github-copilot[bot]",
     "copilot[bot]",
+    "chatgpt-codex-connector[bot]",
 }
 HANDLED_PR_COMMENT_MARKER = "pr-review-coordinator:handled-comment"
 
@@ -43,6 +45,34 @@ def codex_skills_dir() -> Path:
 
 def pr_review_executor_skill_path() -> Path:
     return codex_skills_dir() / "pr-review-executor" / "SKILL.md"
+
+
+def resolve_codex_executable() -> str:
+    override = os.environ.get("CODEX_BIN", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise ScriptError(f"CODEX_BIN is set but not executable: {override}")
+
+    from_path = shutil.which("codex")
+    if from_path:
+        return from_path
+
+    fallback_candidates = [
+        Path("/Applications/Codex.app/Contents/Resources/codex"),
+        Path.home() / ".local/bin/codex",
+        Path("/usr/local/bin/codex"),
+        Path("/opt/homebrew/bin/codex"),
+    ]
+    for candidate in fallback_candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    raise ScriptError(
+        "unable to find `codex` executable. Set CODEX_BIN to an absolute executable path "
+        "or add codex to PATH."
+    )
 
 
 def run(
@@ -170,7 +200,7 @@ def is_copilot_login(login: str | None) -> bool:
     if not login:
         return False
     normalized = login.lower()
-    return normalized in COPILOT_LOGINS or "copilot" in normalized
+    return normalized in COPILOT_LOGINS or "copilot" in normalized or "codex-connector" in normalized
 
 
 def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
@@ -656,11 +686,12 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
 
 
 def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict[str, Any]:
+    codex_bin = resolve_codex_executable()
     prompt = textwrap.dedent(
         f"""
         You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
         Handle unresolved GitHub review feedback, actionable top-level PR comments, and completed failing CI checks on the current branch.
-        Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer copilot-pull-request-reviewer when more review is needed, and resolve threads only after the fix is pushed.
+        Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer chatgpt-codex-connector (or copilot-pull-request-reviewer where required) when more review is needed, and resolve threads only after the fix is pushed.
         If you addressed a top-level PR comment, reply on the PR after pushing with a short note that includes `<!-- {HANDLED_PR_COMMENT_MARKER} COMMENT_ID -->` for each handled comment ID.
 
         If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.
@@ -669,7 +700,7 @@ def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict
 
     result = run(
         [
-            "codex",
+            codex_bin,
             "exec",
             "--cd",
             str(worktree),

@@ -32,6 +32,7 @@ from pr_review_common import (
     pull_request_snapshot,
     remove_worktree,
     repo_owner_and_name,
+    resolve_codex_executable,
     run,
     slugify,
     sync_worktree_to_remote,
@@ -1152,7 +1153,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Pull the latest PR branch state into that worktree before making changes.
         Run relevant validation for the touched files, including repo typecheck if available.
         Commit and push scoped follow-up changes when needed.
-        Request reviewer `copilot-pull-request-reviewer` after every push when further review is needed.
+        Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
         If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
@@ -1172,6 +1173,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
 
 
 def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    codex_bin = resolve_codex_executable()
     prompt = resume_prompt(record, snapshot)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
@@ -1180,7 +1182,7 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool)
     try:
         result = subprocess.run(
             [
-                "codex",
+                codex_bin,
                 "exec",
                 "resume",
                 record.thread_id,

@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pr_review_common
 import pr_review_coordinator
@@ -11,13 +13,14 @@ def make_pull_request(
     *,
     unresolved=False,
     pending_copilot=False,
+    pending_reviewer_login="copilot-pull-request-reviewer[bot]",
     failing_check=False,
     review_author="github-copilot[bot]",
     pr_comments=None,
 ):
     review_requests = []
     if pending_copilot:
-        review_requests.append({"requestedReviewer": {"login": "copilot-pull-request-reviewer[bot]"}})
+        review_requests.append({"requestedReviewer": {"login": pending_reviewer_login}})
     review_threads = []
     if unresolved:
         review_threads.append(
@@ -87,6 +90,15 @@ class PullRequestSnapshotTests(unittest.TestCase):
         snapshot = self.snapshot(make_pull_request(pending_copilot=True))
         self.assertEqual(snapshot["status"], "pending_copilot_review")
 
+    def test_pending_codex_connector_without_comments(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pending_copilot=True,
+                pending_reviewer_login="chatgpt-codex-connector[bot]",
+            )
+        )
+        self.assertEqual(snapshot["status"], "pending_copilot_review")
+
     def test_completed_failing_ci_only(self):
         snapshot = self.snapshot(make_pull_request(failing_check=True))
         self.assertEqual(snapshot["status"], "needs_ci_fix")
@@ -142,6 +154,24 @@ class PullRequestSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["status"], "awaiting_final_test")
         self.assertEqual(snapshot["actionable_pr_comments"], [])
+
+
+class CodexBinaryResolutionTests(unittest.TestCase):
+    def test_prefers_codex_bin_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_codex = Path(tmp) / "codex"
+            fake_codex.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+            with mock.patch.dict(os.environ, {"CODEX_BIN": str(fake_codex)}, clear=False):
+                self.assertEqual(pr_review_common.resolve_codex_executable(), str(fake_codex))
+
+    def test_falls_back_when_codex_not_on_path(self):
+        with mock.patch.dict(os.environ, {"CODEX_BIN": ""}, clear=False):
+            with mock.patch("pr_review_common.shutil.which", return_value=None):
+                with mock.patch("pr_review_common.Path.is_file", return_value=True):
+                    with mock.patch("pr_review_common.os.access", return_value=True):
+                        resolved = pr_review_common.resolve_codex_executable()
+        self.assertTrue(resolved.endswith("codex"))
 
 
 class WorktreePathTests(unittest.TestCase):
