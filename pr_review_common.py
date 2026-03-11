@@ -75,6 +75,44 @@ def resolve_codex_executable() -> str:
     )
 
 
+def resolve_cursor_executable() -> str:
+    """Resolve the standalone `agent` CLI (Cursor agent). Used when provider is cursor."""
+    override = os.environ.get("AGENT_BIN", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise ScriptError(f"AGENT_BIN is set but not executable: {override}")
+
+    from_path = shutil.which("agent")
+    if from_path:
+        return from_path
+
+    fallback_candidates = [
+        Path.home() / ".local/bin/agent",
+        Path("/usr/local/bin/agent"),
+        Path("/opt/homebrew/bin/agent"),
+    ]
+    for candidate in fallback_candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    raise ScriptError(
+        "unable to find `agent` executable. Set AGENT_BIN to an absolute executable path "
+        "or add agent to PATH (e.g. install via https://cursor.com/install)."
+    )
+
+
+def resolve_provider_executable(provider: str) -> str:
+    """Resolve the agent executable for the given provider (e.g. 'codex' or 'cursor')."""
+    normalized = (provider or "codex").strip().lower()
+    if normalized == "codex":
+        return resolve_codex_executable()
+    if normalized == "cursor":
+        return resolve_cursor_executable()
+    raise ScriptError(f"unknown provider: {provider!r}. Use 'codex' or 'cursor'.")
+
+
 def run(
     cmd: list[str],
     *,

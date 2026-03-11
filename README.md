@@ -1,14 +1,16 @@
 # PR Review Coordinator
 
-PR Review Coordinator is a local tool for managing PR handoff, dedicated review worktrees, GitHub polling, and Codex-thread-aware follow-up for review and CI work.
+PR Review Coordinator is a local tool for managing PR handoff, dedicated review worktrees, GitHub polling, and agent-thread-aware follow-up for review and CI work.
 
 It is designed to:
-- register a PR against the Codex thread that started the work
+- register a PR against the agent thread that started the work (Codex) or a synthetic thread (Cursor)
 - keep review follow-up isolated in a dedicated PR worktree
 - poll GitHub for new review activity and completed failing CI
 - consider actionable top-level PR comments as steering input
-- resume the mapped Codex thread when follow-up is needed
+- resume the mapped agent (Codex or Cursor) when follow-up is needed
 - surface persisted status, jobs, locks, and telemetry through a local dashboard
+
+**Agent provider:** Use `--provider codex` (default) or `--provider cursor` on `handoff` and `track`. When not provided, the provider defaults to **codex**.
 
 ## What It Does
 
@@ -30,14 +32,15 @@ This is useful when:
 You need:
 - `git`
 - `gh`
-- `codex`
 - GitHub auth configured for `gh`
-- a Codex environment that records thread state locally
+- an agent provider:
+  - **codex** (default): `codex` on PATH and Codex thread state in `~/.codex/state_5.sqlite`
+  - **cursor**: standalone `agent` on PATH (install via https://cursor.com/install); use `--provider cursor` on `handoff` / `track`
 
 Expected runtime environment:
 - the coordinator is run from its own repository
 - tracked repos are local git clones
-- Codex thread metadata is available in `~/.codex/state_5.sqlite`
+- for Codex: thread metadata is read from `~/.codex/state_5.sqlite`
 - the coordinator can create or reuse git worktrees
 
 ## Install
@@ -75,9 +78,9 @@ Use `handoff` when your local coding pass is done and you want the coordinator t
 - push the branch
 - create or reuse the PR
 - create or reuse the dedicated PR worktree
-- register the PR against the current Codex thread
+- register the PR against the current agent thread (Codex by default; use `--provider cursor` for Cursor)
 
-Example:
+Example (defaults to Codex):
 
 ```bash
 pr-review-coordinator handoff \
@@ -90,7 +93,7 @@ pr-review-coordinator handoff \
 
 ### Register an existing PR
 
-Use `track` when the PR and worktree already exist and you only need to attach them to the current Codex thread:
+Use `track` when the PR and worktree already exist and you only need to attach them to the current agent thread (Codex by default; use `--provider cursor` for Cursor):
 
 ```bash
 pr-review-coordinator track \
@@ -123,7 +126,7 @@ pr-review-coordinator web --host 127.0.0.1 --port 8765
 3. The handoff command captures `CODEX_THREAD_ID`, creates or reuses the PR, creates the dedicated PR worktree, and registers `repo + PR + branch + worktree + thread_id`.
 4. The daemon queues lightweight per-PR poll jobs that fetch unresolved review feedback, Copilot review state, and completed failing CI.
 5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
-6. Follow-up execution runs `codex exec resume <thread_id> "<follow-up prompt>"`, which sends the work back into the same Codex thread you started with.
+6. Follow-up execution runs the configured agent (default: `codex exec resume <thread_id> "<follow-up prompt>"`; with `--provider cursor` it runs the standalone `agent -p "..." --output-format text` in the PR worktree), sending the work back into the same context you started with.
 7. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
 8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If new comments or completed failures appear later, the same thread is resumed again.
 
@@ -184,13 +187,14 @@ Common options:
 - `--repo-name`: optional explicit repo name; otherwise inferred from `origin`
 - `--branch`: PR branch name
 - `--base-branch`: optional PR base branch
-- `--thread-id`: optional explicit Codex thread id
+- `--thread-id`: optional explicit Codex thread id (Codex only; ignored when `--provider cursor`)
+- `--provider`: agent for follow-up: `codex` (default) or `cursor`; when not provided, defaults to **codex**
 - `--worktree-root`: root directory for managed worktrees
 - `--worktree-path`: use an existing registered git worktree instead of creating one
 
 ### `track`
 
-Registers an already-open PR and worktree against the current Codex thread.
+Registers an already-open PR and worktree against the current agent thread (Codex by default). Use `--provider cursor` to use Cursor for follow-up; when `--provider` is not provided, it defaults to **codex**.
 
 ```bash
 pr-review-coordinator track \
@@ -207,7 +211,7 @@ Runs one review poll tick.
 pr-review-coordinator poll-once --dry-run
 ```
 
-Use `--dry-run` to inspect what would happen without queuing or resuming Codex.
+Use `--dry-run` to inspect what would happen without queuing or resuming the agent (Codex or Cursor).
 
 ### `status`
 
@@ -227,7 +231,7 @@ pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 
 ### `daemon`
 
-Runs the job workers, periodic polling scheduler, Codex follow-up execution, and telemetry logging.
+Runs the job workers, periodic polling scheduler, agent follow-up execution (Codex or Cursor per tracked PR’s provider), and telemetry logging.
 
 ### `web`
 
@@ -278,8 +282,9 @@ External state read by the coordinator:
 
 ## Notes
 
-- Thread identity is taken from `CODEX_THREAD_ID` when available.
-- If `CODEX_THREAD_ID` is missing, tracking falls back to the most recent unarchived Codex thread for that repo path.
-- Tracking state is stored in `./var/pr-review-coordinator.db` inside this repo.
-- Codex thread metadata is read from `~/.codex/state_5.sqlite`.
-- Worktrees are created under `~/.codex/worktrees/pr-review/<repo>/pr-<number>-<branch>`.
+- **Provider default:** If `--provider` is not provided on `handoff` or `track`, it defaults to **codex**.
+- For Codex: thread identity is taken from `CODEX_THREAD_ID` when available; if missing, tracking falls back to the most recent unarchived Codex thread for that repo path.
+- For Cursor: the coordinator uses a synthetic thread id; no Codex state is read.
+- Tracking state (including per-PR provider) is stored in `./var/pr-review-coordinator.db` inside this repo.
+- Codex thread metadata is read from `~/.codex/state_5.sqlite` only when the tracked PR uses provider `codex`.
+- Worktrees are created under `~/.codex/worktrees/pr-review/<repo>/pr-<number>-<branch>` by default.

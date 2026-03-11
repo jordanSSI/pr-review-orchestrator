@@ -33,6 +33,7 @@ from pr_review_common import (
     remove_worktree,
     repo_owner_and_name,
     resolve_codex_executable,
+    resolve_provider_executable,
     run,
     slugify,
     sync_worktree_to_remote,
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     last_run_status TEXT,
     last_run_summary TEXT,
     last_error TEXT,
+    provider TEXT NOT NULL DEFAULT 'codex',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -186,6 +188,7 @@ class TrackedPR:
     last_run_status: str | None
     last_run_summary: str | None
     last_error: str | None
+    provider: str
     created_at: int
     updated_at: int
 
@@ -245,6 +248,7 @@ def connect_db() -> sqlite3.Connection:
             "lock_owner_pid": "INTEGER",
             "last_run_started_at": "INTEGER",
             "last_run_finished_at": "INTEGER",
+            "provider": "TEXT NOT NULL DEFAULT 'codex'",
         },
     )
     connection.commit()
@@ -308,6 +312,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "last_run_status": record.last_run_status,
         "last_run_summary": record.last_run_summary,
         "last_error": record.last_error,
+        "provider": record.provider,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
     }
@@ -475,7 +480,12 @@ def latest_thread_for_repo(repo_root: str) -> dict[str, Any] | None:
         connection.close()
 
 
-def resolve_thread(repo_root: str, explicit_thread_id: str | None) -> dict[str, Any]:
+def resolve_thread(repo_root: str, explicit_thread_id: str | None, provider: str = "codex") -> dict[str, Any]:
+    normalized_provider = (provider or "codex").strip().lower()
+    if normalized_provider == "cursor":
+        synthetic_id = explicit_thread_id or f"cursor-{repo_root}-{int(time.time() * 1000)}"
+        return {"id": synthetic_id, "cwd": repo_root, "title": "Cursor", "archived": 0, "git_branch": None, "git_origin_url": None}
+
     thread_id = explicit_thread_id or os.environ.get("CODEX_THREAD_ID")
     thread = lookup_thread(thread_id) if thread_id else None
     if thread:
@@ -949,6 +959,7 @@ def register_tracking(
     worktree_path: str | None,
     thread_id: str | None,
     worktree_layout: str,
+    provider: str = "codex",
 ) -> dict[str, Any]:
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
@@ -957,7 +968,7 @@ def register_tracking(
         cwd=repo_root,
     )
     pr_info = json.loads(pr.stdout)
-    thread = resolve_thread(repo_root, thread_id)
+    thread = resolve_thread(repo_root, thread_id, provider=provider)
     key = tracked_pr_key(detected_repo_name, pr_number)
     assert_thread_available(thread["id"], key)
     if worktree_path:
@@ -1003,6 +1014,7 @@ def register_tracking(
             "last_run_status": "registered",
             "last_run_summary": "PR tracking registered",
             "last_error": None,
+            "provider": (provider or "codex").strip().lower(),
             **state_payload(snapshot),
         }
     )
@@ -1016,7 +1028,7 @@ def register_tracking(
     }
 
 
-def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None, worktree_layout: str) -> dict[str, Any]:
+def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None, worktree_layout: str, provider: str = "codex") -> dict[str, Any]:
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
     base = base_branch or repo_default_branch(repo_root)
@@ -1025,7 +1037,7 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
     push_result = push_branch(repo_root, branch)
     pr_result = create_or_reuse_pr(repo_root, branch, base, pr_title, pr_body, draft)
     repo_reset = switch_repo_to_base_branch(repo_root, base, branch)
-    thread = resolve_thread(repo_root, thread_id)
+    thread = resolve_thread(repo_root, thread_id, provider=provider)
     key = tracked_pr_key(detected_repo_name, pr_result["number"])
     assert_thread_available(thread["id"], key)
     if worktree_path:
@@ -1071,6 +1083,7 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
             "last_run_status": "registered",
             "last_run_summary": "PR handoff completed and tracking registered",
             "last_error": None,
+            "provider": (provider or "codex").strip().lower(),
             **state_payload(snapshot),
         }
     )
@@ -1205,6 +1218,35 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool)
         }
     finally:
         Path(output_path).unlink(missing_ok=True)
+
+
+def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    agent_bin = resolve_provider_executable("cursor")
+    prompt = resume_prompt(record, snapshot)
+    if dry_run:
+        return {"status": "dry_run", "prompt_preview": prompt}
+    result = subprocess.run(
+        [agent_bin, "--trust", "-p", prompt, "--output-format", "text"],
+        cwd=record.worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    last_message = (result.stdout or result.stderr or "").strip()[:4000]
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "exit_code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "last_message": last_message,
+    }
+
+
+def run_agent_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    provider = (record.provider or "codex").strip().lower()
+    if provider == "cursor":
+        return run_cursor_resume(record, snapshot, dry_run)
+    return run_codex_resume(record, snapshot, dry_run)
 
 
 def priority_key(record: TrackedPR) -> tuple[int, str, int]:
@@ -1451,29 +1493,30 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
 
         refresh_record_state(record, snapshot, run_status="running", run_summary="Syncing worktree to latest remote branch state", run_reason="sync", job_id=job_id)
         sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
-        refresh_record_state(record, snapshot, run_status="running", run_summary="Resuming mapped Codex thread", run_reason="codex", job_id=job_id)
-        record_event("info", "codex_resume", "Launching Codex follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run})
-        codex_result = run_codex_resume(record, snapshot, dry_run)
+        provider = (record.provider or "codex").strip().lower()
+        refresh_record_state(record, snapshot, run_status="running", run_summary=f"Resuming {provider} agent", run_reason=provider, job_id=job_id)
+        record_event("info", "agent_resume", f"Launching {provider} follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run, "provider": provider})
+        agent_result = run_agent_resume(record, snapshot, dry_run)
         updated = refresh_record_state(
             record,
             snapshot,
-            run_status=codex_result["status"],
-            run_summary=(codex_result.get("last_message") or codex_result.get("stderr") or codex_result.get("stdout") or reason)[:4000],
-            error=None if codex_result["status"] in {"ok", "dry_run"} else (codex_result.get("stderr") or "codex resume failed"),
+            run_status=agent_result["status"],
+            run_summary=(agent_result.get("last_message") or agent_result.get("stderr") or agent_result.get("stdout") or reason)[:4000],
+            error=None if agent_result["status"] in {"ok", "dry_run"} else (agent_result.get("stderr") or "agent resume failed"),
             run_reason=None,
             finished=True,
         )
-        if codex_result["status"] in {"ok", "dry_run"}:
+        if agent_result["status"] in {"ok", "dry_run"}:
             updated = update_tracked_pr(record.key, **execution_payload(snapshot))
-        level = "info" if codex_result["status"] in {"ok", "dry_run"} else "error"
-        record_event(level, "codex_finished", f"Codex follow-up finished with status {codex_result['status']}", tracked_pr_key=record.key, details={"job_id": job_id})
+        level = "info" if agent_result["status"] in {"ok", "dry_run"} else "error"
+        record_event(level, "agent_finished", f"Agent follow-up finished with status {agent_result['status']}", tracked_pr_key=record.key, details={"job_id": job_id, "provider": provider})
         return {
-            "status": codex_result["status"],
+            "status": agent_result["status"],
             "tracked_pr": tracked_pr_to_dict(updated),
             "review": snapshot,
             "worktree": worktree,
             "sync": sync_result,
-            "codex": codex_result,
+            "agent": agent_result,
             "triggered": True,
         }
     finally:
@@ -1618,6 +1661,7 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) 
           <td>{status_badge(record.status)}</td>
           <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
           <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
+          <td><code>{html.escape(record.provider or "codex")}</code></td>
           <td><code>{html.escape(record.worktree_path)}</code><div class="small" data-role="detail-text">{html.escape(detail_text)}</div></td>
           <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div></td>
           <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
@@ -1742,6 +1786,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <th>Status</th>
                 <th>PR</th>
                 <th>Branch / Thread</th>
+                <th>Provider</th>
                 <th>Worktree / CI</th>
                 <th>Run state</th>
                 <th>Last poll</th>
@@ -1749,7 +1794,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
               </tr>
             </thead>
             <tbody>
-              {''.join(rows) or '<tr><td colspan="7">No matching tracked PRs</td></tr>'}
+              {''.join(rows) or '<tr><td colspan="8">No matching tracked PRs</td></tr>'}
             </tbody>
           </table>
           <h2>Recent Jobs</h2>
@@ -1936,17 +1981,19 @@ def parse_args() -> argparse.ArgumentParser:
     handoff.add_argument("--pr-body", default="")
     handoff.add_argument("--draft", action="store_true")
     handoff.add_argument("--thread-id")
+    handoff.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
     handoff.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
     handoff.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
     handoff.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
     handoff.add_argument("--format", choices=("json", "text"), default="json")
 
-    track = subparsers.add_parser("track", help="Register an existing PR against the current Codex thread.")
+    track = subparsers.add_parser("track", help="Register an existing PR against the current agent thread (codex) or a synthetic thread (cursor).")
     track.add_argument("--repo-root", required=True)
     track.add_argument("--repo-name")
     track.add_argument("--pr", required=True, type=int)
     track.add_argument("--branch", required=True)
     track.add_argument("--thread-id")
+    track.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
     track.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
     track.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
     track.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
@@ -2000,6 +2047,7 @@ def main() -> None:
                 worktree_path=args.worktree_path,
                 thread_id=args.thread_id,
                 worktree_layout=args.worktree_layout,
+                provider=getattr(args, "provider", "codex"),
             ),
             args.format,
         )
@@ -2016,6 +2064,7 @@ def main() -> None:
                 worktree_path=args.worktree_path,
                 thread_id=args.thread_id,
                 worktree_layout=args.worktree_layout,
+                provider=getattr(args, "provider", "codex"),
             ),
             args.format,
         )

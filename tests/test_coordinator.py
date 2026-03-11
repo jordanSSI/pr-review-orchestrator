@@ -272,6 +272,7 @@ class ThreadPolicyTests(unittest.TestCase):
                 "last_run_status": "registered",
                 "last_run_summary": "registered",
                 "last_error": None,
+                "provider": "codex",
             }
         )
 
@@ -330,7 +331,7 @@ class RegisterTrackingTests(unittest.TestCase):
                 "stdout": '{"number": 418, "url": "https://example.com/pr/418", "title": "PR 418", "headRefName": "feat/putaway-split-lines-and-serial-scan", "baseRefName": "master", "state": "OPEN"}'
             },
         )()
-        pr_review_coordinator.resolve_thread = lambda repo_root, thread_id: {"id": "thread-418", "title": "PR 418 thread"}
+        pr_review_coordinator.resolve_thread = lambda repo_root, thread_id, provider=None: {"id": "thread-418", "title": "PR 418 thread"}
         pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
 
         def fake_ensure_worktree(repo_root, repo_name, pr_number, branch, worktree_root, *, layout):
@@ -441,6 +442,7 @@ class QueueBehaviorTests(unittest.TestCase):
                     "last_run_status": "registered",
                     "last_run_summary": "registered",
                     "last_error": None,
+                    "provider": "codex",
                 }
             )
 
