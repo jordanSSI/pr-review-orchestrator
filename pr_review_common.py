@@ -631,6 +631,28 @@ def git_status_is_clean(worktree: str | Path) -> bool:
     return result.stdout.strip() == ""
 
 
+def ensure_worktree_node_modules_symlink(worktree_path: str | Path, repo_root: str | Path) -> bool:
+    """If the worktree has package.json but no node_modules, symlink node_modules from repo_root.
+    Returns True if a symlink was created, False otherwise.
+    """
+    worktree = Path(worktree_path).resolve()
+    repo = Path(repo_root).resolve()
+    package_json = worktree / "package.json"
+    worktree_node_modules = worktree / "node_modules"
+    repo_node_modules = repo / "node_modules"
+    if not package_json.is_file():
+        return False
+    if worktree_node_modules.exists():
+        return False
+    if not repo_node_modules.is_dir():
+        return False
+    try:
+        worktree_node_modules.symlink_to(repo_node_modules)
+        return True
+    except OSError:
+        return False
+
+
 def ensure_worktree(
     repo_root: str | Path,
     repo_name: str,
@@ -656,6 +678,7 @@ def ensure_worktree(
     if existing:
         if not git_status_is_clean(target):
             raise ScriptError(f"existing worktree is dirty: {target}")
+        ensure_worktree_node_modules_symlink(target, repo_root)
         return {"status": "ready", "worktree": str(target), "created": False}
 
     if target.exists() and not any(target.iterdir()):
@@ -684,6 +707,7 @@ def ensure_worktree(
     )
     if not git_status_is_clean(target):
         raise ScriptError(f"newly created worktree is unexpectedly dirty: {target}")
+    ensure_worktree_node_modules_symlink(target, repo_root)
     return {"status": "ready", "worktree": str(target), "created": True}
 
 
@@ -705,6 +729,7 @@ def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str,
     if not git_status_is_clean(target):
         raise ScriptError(f"existing worktree is dirty: {target}")
 
+    ensure_worktree_node_modules_symlink(target, repo_root)
     return {"status": "ready", "worktree": str(target), "created": False, "managed": False}
 
 

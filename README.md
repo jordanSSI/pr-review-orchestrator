@@ -288,3 +288,4 @@ External state read by the coordinator:
 - Tracking state (including per-PR provider) is stored in `./var/pr-review-coordinator.db` inside this repo.
 - Codex thread metadata is read from `~/.codex/state_5.sqlite` only when the tracked PR uses provider `codex`.
 - Worktrees are created under `~/.codex/worktrees/pr-review/<repo>/pr-<number>-<branch>` by default.
+- For Node.js repos: when creating or ensuring a worktree, if the worktree has `package.json` but no `node_modules`, the coordinator symlinks `node_modules` from the main repo so tests and installs can run without a full `npm install` in each worktree. Ensure the main repo has `node_modules` (e.g. run `npm install` there) before handoff or track.

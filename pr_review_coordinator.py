@@ -1165,7 +1165,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Address GitHub review feedback, completed failing CI checks, or both, with minimal targeted fixes.
         Pull the latest PR branch state into that worktree before making changes.
         Run relevant validation for the touched files, including repo typecheck if available.
-        Commit and push scoped follow-up changes when needed.
+        Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
         Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
         If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
