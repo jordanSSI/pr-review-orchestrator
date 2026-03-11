@@ -1226,7 +1226,7 @@ def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool
     if dry_run:
         return {"status": "dry_run", "prompt_preview": prompt}
     result = subprocess.run(
-        [agent_bin, "--trust", "-p", prompt, "--output-format", "text"],
+        [agent_bin, "--trust", "--yolo", "-p", prompt, "--output-format", "text"],
         cwd=record.worktree_path,
         check=False,
         capture_output=True,
