@@ -142,9 +142,11 @@ Agents using this tool should follow these rules:
 - Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
-## Guidance For Other Repositories
+## Guidance For Installed Agents
 
-If another repository wants to use this tool, its own `AGENTS.md` should reference the PATH command, not a machine-specific filesystem path.
+When this tool is installed for personal agent workflows, put shared usage guidance in `~/.codex/AGENTS.md` so it applies across repositories and does not pollute project-specific `AGENTS.md` files.
+
+If a specific repository still needs custom overrides, keep those minimal and repo-specific only.
 
 Recommended wording:
 
