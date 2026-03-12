@@ -483,6 +483,38 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual([job.action for job in pending], ["run-one"])
         self.assertEqual(json.loads(pending[0].payload_json)["signature"], "sig-1")
 
+    def test_clean_pr_after_agent_run_becomes_awaiting_final_review(self):
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
+            status="awaiting_final_test",
+            signature="sig-clean",
+        )
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            last_prompted_at=1,
+            last_handled_signature="sig-needs-review",
+            last_run_status="ok",
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=102)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_review")
+        self.assertEqual(result["tracked_pr"]["last_run_summary"], "PR is awaiting final review")
+
+    def test_clean_pr_without_agent_run_stays_awaiting_final_test(self):
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
+            status="awaiting_final_test",
+            signature="sig-clean",
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=103)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_test")
+        self.assertEqual(result["tracked_pr"]["last_run_summary"], "PR is not currently actionable")
+
     def test_poll_all_job_fans_out_per_pr_poll_jobs(self):
         job_info = pr_review_coordinator.enqueue_job("poll-all", requested_by="test")
         result = pr_review_coordinator.process_job(pr_review_coordinator.get_job(job_info["job"]["id"]))

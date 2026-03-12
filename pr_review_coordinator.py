@@ -53,13 +53,14 @@ PRIORITY_ORDER = {
     "needs_review": 0,
     "needs_ci_fix": 1,
     "pending_copilot_review": 2,
-    "awaiting_final_test": 3,
-    "busy": 4,
-    "running": 5,
-    "idle": 6,
-    "untracked": 7,
-    "closed": 8,
-    "error": 9,
+    "awaiting_final_review": 3,
+    "awaiting_final_test": 4,
+    "busy": 5,
+    "running": 6,
+    "idle": 7,
+    "untracked": 8,
+    "closed": 9,
+    "error": 10,
 }
 
 
@@ -597,9 +598,15 @@ def summarize_failing_checks(failing_checks: list[dict[str, Any]]) -> str:
     return "; ".join(item.get("summary") or item.get("name") or "Unknown failing check" for item in failing_checks[:5])
 
 
-def state_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+def tracked_status_for_snapshot(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> str:
+    if snapshot["status"] == "awaiting_final_test" and last_prompted_at:
+        return "awaiting_final_review"
+    return snapshot["status"]
+
+
+def state_payload(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> dict[str, Any]:
     return {
-        "status": snapshot["status"],
+        "status": tracked_status_for_snapshot(snapshot, last_prompted_at=last_prompted_at),
         "pr_state": snapshot["pr"]["state"],
         "pr_title": snapshot["pr"]["title"],
         "pr_url": snapshot["pr"]["url"],
@@ -892,7 +899,8 @@ def finish_job(job_id: int, status: str, summary: str, *, error: str | None = No
 
 
 def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_status: str | None = None, run_summary: str | None = None, error: str | None = None, run_reason: str | None = None, prompted: bool = False, finished: bool = False, job_id: int | None = None) -> TrackedPR:
-    changes = state_payload(snapshot)
+    prompted_at = now_ms() if prompted else record.last_prompted_at
+    changes = state_payload(snapshot, last_prompted_at=prompted_at)
     if run_status is not None:
         changes["last_run_status"] = run_status
     if run_summary is not None:
@@ -901,7 +909,7 @@ def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_sta
     if run_reason is not None:
         changes["run_reason"] = run_reason
     if prompted:
-        changes["last_prompted_at"] = now_ms()
+        changes["last_prompted_at"] = prompted_at
     if finished:
         changes["last_run_finished_at"] = now_ms()
         changes["run_state"] = None
@@ -1255,6 +1263,8 @@ def priority_key(record: TrackedPR) -> tuple[int, str, int]:
 
 def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, force_run: bool) -> tuple[bool, str]:
     if snapshot["status"] not in ACTIVE_STATUSES:
+        if snapshot["status"] == "awaiting_final_test" and record.last_prompted_at:
+            return False, "PR is awaiting final review"
         return False, "PR is not currently actionable"
     if force_run:
         return True, "Manual run requested"
@@ -1364,7 +1374,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             last_run_status="closed",
             last_run_summary=f"PR is {snapshot['pr']['state']}; tracking archived",
             last_error=None,
-            **state_payload(snapshot),
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
         )
         record_event("info", "pr_closed", f"Archived tracking for {snapshot['pr']['state']} PR", tracked_pr_key=record.key, details=cleanup)
         return {"status": "closed", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "cleanup": cleanup}
@@ -1377,7 +1387,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             last_run_status="idle",
             last_run_summary=reason,
             last_error=None,
-            **state_payload(snapshot),
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
         )
         record_event("info", "poll_idle", reason, tracked_pr_key=record.key)
         return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
@@ -1389,7 +1399,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             last_run_status="dry_run",
             last_run_summary="Would queue follow-up execution",
             last_error=None,
-            **state_payload(snapshot),
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
         )
         return {"status": "dry_run", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True}
 
@@ -1407,7 +1417,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
         last_run_status="queued",
         last_run_summary=summary,
         last_error=None,
-        **state_payload(snapshot),
+        **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
     )
     record_event("info", "follow_up_queued", summary, tracked_pr_key=record.key, details={"job_id": job["id"], "duplicate": enqueue_result["duplicate"]})
     return {"status": "queued", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True, "job": job}
@@ -1445,7 +1455,7 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
                 last_run_status="closed",
                 last_run_summary=f"PR is {snapshot['pr']['state']}; tracking archived",
                 last_error=None,
-                **state_payload(snapshot),
+                **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
             )
             return {"status": "closed", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "cleanup": cleanup}
 
@@ -1767,7 +1777,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <label>Status
               <select name="status">
                 <option value="all" {"selected" if status_filter == "all" else ""}>All</option>
-                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
+                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "awaiting_final_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
               </select>
             </label>
             <label>Sort

@@ -128,7 +128,7 @@ pr-review-coordinator web --host 127.0.0.1 --port 8765
 5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
 6. Follow-up execution runs the configured agent (default: `codex exec resume <thread_id> "<follow-up prompt>"`; with `--provider cursor` it runs the standalone `agent -p "..." --output-format text` in the PR worktree), sending the work back into the same context you started with.
 7. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
-8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If new comments or completed failures appear later, the same thread is resumed again.
+8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If the orchestrator has already run follow-up on that PR, it reports `awaiting_final_review` to make that handoff explicit. If new comments or completed failures appear later, the same thread is resumed again.
 
 ## Agent Notes
 
@@ -141,6 +141,7 @@ Agents using this tool should follow these rules:
 - Do not manually edit the coordinator database or lock files.
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
+- If the coordinator reports `awaiting_final_review`, the PR is clean and the orchestrator has already completed its follow-up pass; use that as the human handoff point instead of inspecting PR body text.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
 - Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
@@ -250,7 +251,8 @@ Stops tracking a PR record.
 - `needs_review`: unresolved GitHub review feedback or actionable top-level PR comments exist and follow-up work may be needed
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
-- `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain
+- `awaiting_final_review`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain after the orchestrator has already run follow-up for this PR
+- `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain, but the orchestrator has not yet run follow-up for this PR
 - `busy`: the coordinator intentionally skipped this PR because another run or local work appears to be in progress
 - `running`: a follow-up job is currently active for this PR
 - `queued`: the latest poll queued follow-up work, or a user action is waiting in the queue
