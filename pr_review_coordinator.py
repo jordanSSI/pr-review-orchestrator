@@ -21,7 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from pr_review_common import (
     CODEX_HOME,
@@ -48,6 +48,7 @@ CODEX_STATE_DB = CODEX_HOME / "state_5.sqlite"
 COORDINATOR_DB = VAR_DIR / "pr-review-coordinator.db"
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_WORKER_COUNT = 4
+NEW_CODEX_THREAD_SENTINEL = "__new_codex_thread__"
 ACTIVE_STATUSES = {"needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "needs_review": 0,
@@ -481,6 +482,46 @@ def latest_thread_for_repo(repo_root: str) -> dict[str, Any] | None:
         connection.close()
 
 
+def create_codex_thread(repo_root: str) -> dict[str, Any]:
+    prompt = (
+        "Start a fresh PR review coordination thread for this repository. "
+        "Do not modify files or run write operations. Reply with READY."
+    )
+    result = run(
+        [
+            resolve_codex_executable(),
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "-C",
+            repo_root,
+            prompt,
+        ],
+        cwd=repo_root,
+    )
+    thread_id = None
+    for line in (result.stdout or "").splitlines():
+        raw = line.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "thread.started" and event.get("thread_id"):
+            thread_id = str(event["thread_id"])
+            break
+    if not thread_id:
+        raise ScriptError("unable to create a fresh Codex thread")
+    for _ in range(20):
+        thread = lookup_thread(thread_id)
+        if thread:
+            return thread
+        time.sleep(0.1)
+    return {"id": thread_id, "cwd": repo_root, "title": "Fresh Codex thread", "archived": 0, "git_branch": None, "git_origin_url": None}
+
+
 def resolve_thread(repo_root: str, explicit_thread_id: str | None, provider: str = "codex") -> dict[str, Any]:
     normalized_provider = (provider or "codex").strip().lower()
     if normalized_provider == "cursor":
@@ -577,6 +618,176 @@ def create_or_reuse_pr(repo_root: str, branch: str, base_branch: str, title: str
     if not pr:
         raise ScriptError(f"created PR but could not resolve metadata for {pr_url}")
     return {"status": "ready", "created": True, **pr}
+
+
+def canonical_repo_root(path: str | Path) -> str | None:
+    candidate = Path(path).expanduser()
+    if not candidate.exists():
+        return None
+    try:
+        root = run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"]).stdout.strip()
+    except ScriptError:
+        return None
+    return str(Path(root).resolve())
+
+
+def list_recent_project_candidates(limit: int = 24) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def remember(raw_path: str | None, *, source: str, thread_title: str | None = None) -> None:
+        if not raw_path:
+            return
+        repo_root = canonical_repo_root(raw_path)
+        if not repo_root:
+            return
+        existing = candidates.get(repo_root)
+        if existing:
+            if existing["source"] != "tracked" and source == "tracked":
+                existing["source"] = "tracked"
+            if not existing.get("thread_title") and thread_title:
+                existing["thread_title"] = thread_title
+            return
+        try:
+            owner, repo_name = repo_owner_and_name(repo_root)
+        except ScriptError:
+            return
+        candidates[repo_root] = {
+            "repo_root": repo_root,
+            "repo_owner": owner,
+            "repo_name": repo_name,
+            "source": source,
+            "thread_title": thread_title,
+        }
+
+    for record in list_tracked_prs(active_only=False):
+        remember(record.repo_root, source="tracked", thread_title=record.thread_title)
+
+    if CODEX_STATE_DB.exists():
+        connection = sqlite3.connect(CODEX_STATE_DB)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT cwd, title
+                FROM threads
+                WHERE archived = 0
+                ORDER BY updated_at DESC
+                LIMIT 200
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        for row in rows:
+            remember(row["cwd"], source="recent_thread", thread_title=row["title"])
+
+    items = list(candidates.values())
+    items.sort(key=lambda item: (0 if item["source"] == "tracked" else 1, item["repo_name"].lower(), item["repo_root"].lower()))
+    return items[:limit]
+
+
+def list_recent_threads_for_repo(repo_root: str, limit: int = 12, *, current_key: str | None = None) -> list[dict[str, Any]]:
+    if not CODEX_STATE_DB.exists():
+        return []
+    active_thread_usage = {}
+    for record in list_tracked_prs(active_only=True):
+        if record.repo_root != repo_root:
+            continue
+        active_thread_usage[record.thread_id] = {
+            "key": record.key,
+            "label": f"{record.repo_name} #{record.pr_number}",
+        }
+    connection = sqlite3.connect(CODEX_STATE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, title, updated_at
+            FROM threads
+            WHERE archived = 0 AND cwd = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (repo_root, limit),
+        ).fetchall()
+    finally:
+        connection.close()
+    threads = []
+    for row in rows:
+        usage = active_thread_usage.get(row["id"])
+        conflict = bool(usage and usage["key"] != current_key)
+        threads.append(
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "updated_at": row["updated_at"],
+                "in_use_by": usage["label"] if usage else None,
+                "conflict": conflict,
+            }
+        )
+    return threads
+
+
+def list_open_pull_requests_for_repo(repo_root: str, repo_name: str | None = None) -> dict[str, Any]:
+    owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
+    result = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,url,title,headRefName,baseRefName,isDraft,state",
+        ],
+        cwd=repo_root,
+    )
+    existing_records = {
+        record.key: record
+        for record in list_tracked_prs(active_only=False)
+        if record.repo_name == detected_repo_name
+    }
+    prs = []
+    for item in json.loads(result.stdout or "[]"):
+        number = int(item["number"])
+        key = tracked_pr_key(detected_repo_name, number)
+        record = existing_records.get(key)
+        prs.append(
+            {
+                "number": number,
+                "url": item["url"],
+                "title": item["title"],
+                "headRefName": item["headRefName"],
+                "baseRefName": item.get("baseRefName"),
+                "isDraft": bool(item.get("isDraft")),
+                "state": item.get("state") or "OPEN",
+                "tracked": bool(record),
+                "tracked_status": record.status if record else None,
+                "tracked_active": bool(record.active) if record else False,
+                "tracked_key": record.key if record else key,
+                "tracked_thread_id": record.thread_id if record else None,
+                "tracked_thread_title": record.thread_title if record else None,
+                "tracked_provider": record.provider if record else None,
+            }
+        )
+    prs.sort(key=lambda item: (1 if item["tracked"] else 0, -item["number"]))
+    return {"repo_root": repo_root, "repo_owner": owner, "repo_name": detected_repo_name, "prs": prs}
+
+
+def resolve_selected_thread(repo_root: str, provider: str, requested_thread_id: str | None, *, prefer_latest_when_empty: bool = False) -> dict[str, Any]:
+    explicit_thread_id = (requested_thread_id or "").strip() or None
+    normalized_provider = (provider or "codex").strip().lower()
+    if explicit_thread_id == NEW_CODEX_THREAD_SENTINEL:
+        if normalized_provider != "codex":
+            raise ScriptError("fresh thread creation is only supported for Codex")
+        return create_codex_thread(repo_root)
+    if not explicit_thread_id and prefer_latest_when_empty and normalized_provider == "codex":
+        latest = latest_thread_for_repo(repo_root)
+        if latest:
+            return latest
+        raise ScriptError(f"unable to determine latest Codex thread id for {repo_root}")
+    return resolve_thread(repo_root, explicit_thread_id, provider=provider)
 
 
 def switch_repo_to_base_branch(repo_root: str, base_branch: str, feature_branch: str) -> dict[str, Any]:
@@ -753,9 +964,9 @@ def get_job(job_id: int) -> Job:
 
 
 def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by: str = "cli", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if action not in {"poll-all", "poll-one", "run-one", "untrack", "untrack-cleanup"}:
+    if action not in {"poll-all", "poll-one", "run-one", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"}:
         raise ScriptError(f"unsupported job action: {action}")
-    if action in {"poll-one", "run-one", "untrack", "untrack-cleanup"} and not tracked_pr_key:
+    if action in {"poll-one", "run-one", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
         raise ScriptError(f"job action {action!r} requires a tracked PR key")
     connection = connect_db()
     try:
@@ -790,10 +1001,12 @@ def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by:
 def job_priority(action: str) -> int:
     if action in {"untrack", "untrack-cleanup"}:
         return 0
-    if action in {"poll-one", "poll-all"}:
+    if action in {"track-existing", "retarget-thread"}:
         return 1
-    if action == "run-one":
+    if action in {"poll-one", "poll-all"}:
         return 2
+    if action == "run-one":
+        return 3
     return 99
 
 
@@ -810,9 +1023,11 @@ def claim_next_job() -> Job | None:
                 CASE action
                     WHEN 'untrack' THEN 0
                     WHEN 'untrack-cleanup' THEN 0
-                    WHEN 'poll-one' THEN 1
-                    WHEN 'poll-all' THEN 1
-                    WHEN 'run-one' THEN 2
+                    WHEN 'track-existing' THEN 1
+                    WHEN 'retarget-thread' THEN 1
+                    WHEN 'poll-one' THEN 2
+                    WHEN 'poll-all' THEN 2
+                    WHEN 'run-one' THEN 3
                     ELSE 99
                 END ASC,
                 requested_at ASC,
@@ -858,9 +1073,11 @@ def list_pending_jobs() -> list[Job]:
                 CASE action
                     WHEN 'untrack' THEN 0
                     WHEN 'untrack-cleanup' THEN 0
-                    WHEN 'poll-one' THEN 1
-                    WHEN 'poll-all' THEN 1
-                    WHEN 'run-one' THEN 2
+                    WHEN 'track-existing' THEN 1
+                    WHEN 'retarget-thread' THEN 1
+                    WHEN 'poll-one' THEN 2
+                    WHEN 'poll-all' THEN 2
+                    WHEN 'run-one' THEN 3
                     ELSE 99
                 END ASC,
                 requested_at ASC,
@@ -1542,6 +1759,61 @@ def poll_all(active_only: bool, dry_run: bool) -> dict[str, Any]:
     return {"status": "ready", "results": results, "count": len(results)}
 
 
+def track_existing_pr_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    repo_root = str(payload.get("repo_root") or "").strip()
+    branch = str(payload.get("branch") or "").strip()
+    repo_name = str(payload.get("repo_name") or "").strip() or None
+    worktree_root = str(payload.get("worktree_root") or (CODEX_HOME / "worktrees" / "pr-review"))
+    worktree_layout = str(payload.get("worktree_layout") or "nested")
+    worktree_path = str(payload.get("worktree_path") or "").strip() or None
+    thread_id = str(payload.get("thread_id") or "").strip() or None
+    provider = str(payload.get("provider") or "codex").strip().lower()
+    pr_number = payload.get("pr_number")
+    if not repo_root or not branch or pr_number in {None, ""}:
+        raise ScriptError("track-existing job requires repo_root, pr_number, and branch")
+    try:
+        pr_number_value = int(pr_number)
+    except (TypeError, ValueError) as exc:
+        raise ScriptError(f"invalid pr_number for track-existing job: {pr_number!r}") from exc
+    if thread_id == NEW_CODEX_THREAD_SENTINEL:
+        thread_id = resolve_selected_thread(repo_root, provider, thread_id)["id"]
+    return register_tracking(
+        repo_root=repo_root,
+        repo_name=repo_name,
+        pr_number=pr_number_value,
+        branch=branch,
+        worktree_root=worktree_root,
+        worktree_path=worktree_path,
+        thread_id=thread_id,
+        worktree_layout=worktree_layout,
+        provider=provider,
+    )
+
+
+def retarget_tracked_pr_thread(record: TrackedPR, *, provider: str, requested_thread_id: str | None) -> dict[str, Any]:
+    normalized_provider = (provider or record.provider or "codex").strip().lower()
+    thread = resolve_selected_thread(record.repo_root, normalized_provider, requested_thread_id)
+    assert_thread_available(thread["id"], record.key)
+    updated = update_tracked_pr(
+        record.key,
+        thread_id=thread["id"],
+        thread_title=thread.get("title"),
+        provider=normalized_provider,
+        last_run_finished_at=now_ms(),
+        last_run_status="ready",
+        last_run_summary=f"Thread updated to {thread['id']}",
+        last_error=None,
+    )
+    record_event(
+        "info",
+        "thread_retargeted",
+        f"Updated thread for PR #{record.pr_number}",
+        tracked_pr_key=record.key,
+        details={"thread_id": thread["id"], "provider": normalized_provider},
+    )
+    return {"status": "ready", "tracked_pr": tracked_pr_to_dict(updated), "thread": thread}
+
+
 def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
     record_event("info", "job_started", f"Started job {job.action}", tracked_pr_key=job.tracked_pr_key, details={"job_id": job.id})
     try:
@@ -1556,18 +1828,27 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
             record_event("info", "job_finished", f"Finished job {job.action}", details={"job_id": job.id, "count": len(results)})
             return {"status": "ready", "results": results}
 
-        record = get_tracked_pr(job.tracked_pr_key or "")
         payload = decode_job_payload(job)
-        if job.action == "poll-one":
-            result = poll_record(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
-        elif job.action == "run-one":
-            result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
-        elif job.action == "untrack":
-            result = handle_untrack(record, cleanup_worktree=False)
-        elif job.action == "untrack-cleanup":
-            result = handle_untrack(record, cleanup_worktree=True)
+        if job.action == "track-existing":
+            result = track_existing_pr_from_payload(payload)
         else:
-            raise ScriptError(f"unsupported job action: {job.action}")
+            record = get_tracked_pr(job.tracked_pr_key or "")
+            if job.action == "poll-one":
+                result = poll_record(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
+            elif job.action == "run-one":
+                result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
+            elif job.action == "retarget-thread":
+                result = retarget_tracked_pr_thread(
+                    record,
+                    provider=str(payload.get("provider") or record.provider or "codex"),
+                    requested_thread_id=str(payload.get("thread_id") or "").strip() or None,
+                )
+            elif job.action == "untrack":
+                result = handle_untrack(record, cleanup_worktree=False)
+            elif job.action == "untrack-cleanup":
+                result = handle_untrack(record, cleanup_worktree=True)
+            else:
+                raise ScriptError(f"unsupported job action: {job.action}")
         finish_job(job.id, "succeeded", result.get("status", "ready"))
         record_event("info", "job_finished", f"Finished job {job.action}", tracked_pr_key=job.tracked_pr_key, details={"job_id": job.id})
         return result
@@ -1650,8 +1931,9 @@ def describe_pending_jobs(record: TrackedPR, jobs: list[Job]) -> str:
     return f"{label} {verb}{suffix}"
 
 
-def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) -> str:
+def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, recent_threads: list[dict[str, Any]] | None = None) -> str:
     pending_jobs = pending_jobs or []
+    recent_threads = recent_threads or []
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
@@ -1666,11 +1948,43 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) 
         details.append(f"pending: {pending_text}")
     detail_text = " | ".join(details)
     actions_disabled = "disabled" if pending_jobs else ""
+    thread_controls = ""
+    if record.provider == "codex":
+        datalist_id = f"thread-options-{slugify(record.key)}"
+        options = "".join(
+            f'<option value="{html.escape(thread["id"])}" label="{html.escape((thread.get("title") or "Untitled thread") + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
+            for thread in recent_threads
+        )
+        options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
+        recent_summary = " | ".join(
+            f'{thread["id"][:8]} {thread.get("title") or "Untitled"}{" (in use by " + thread["in_use_by"] + ")" if thread.get("in_use_by") else ""}'
+            for thread in recent_threads[:4]
+        )
+        thread_controls = f"""
+          <div class="thread-controls">
+            <div class="small">{html.escape(record.thread_title or "")}</div>
+            <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'thread update queued')">
+              <input type="text" name="thread_id" list="{datalist_id}" value="{html.escape(record.thread_id)}" placeholder="Thread id">
+              <datalist id="{datalist_id}">{options}</datalist>
+              <button {actions_disabled}>Set thread</button>
+            </form>
+            <form method="post" action="/renew-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'latest thread queued')">
+              <button {actions_disabled}>Use latest</button>
+            </form>
+            <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'fresh thread queued')">
+              <input type="hidden" name="thread_id" value="{NEW_CODEX_THREAD_SENTINEL}">
+              <button {actions_disabled}>New thread</button>
+            </form>
+            <div class="small">{html.escape(recent_summary)}</div>
+          </div>
+        """
+    else:
+        thread_controls = f'<div class="small">{html.escape(record.thread_title or "")}</div>'
     return f"""
         <tr data-pr-key="{html.escape(record.key)}">
           <td>{status_badge(record.status)}</td>
           <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
-          <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div></td>
+          <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div>{thread_controls}</td>
           <td><code>{html.escape(record.provider or "codex")}</code></td>
           <td><code>{html.escape(record.worktree_path)}</code><div class="small" data-role="detail-text">{html.escape(detail_text)}</div></td>
           <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div></td>
@@ -1683,6 +1997,140 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None) 
           </td>
         </tr>
         """
+
+
+def render_project_import_section(
+    project_candidates: list[dict[str, Any]],
+    selected_project_root: str,
+    selected_provider: str,
+    browse_result: dict[str, Any] | None,
+    recent_threads: list[dict[str, Any]] | None,
+    browse_error: str | None,
+    notice: str | None,
+) -> str:
+    recent_threads = recent_threads or []
+    project_options = "".join(
+        f'<option value="{html.escape(item["repo_root"])}">{html.escape(item["repo_name"])} - {html.escape(item["repo_root"])}</option>'
+        for item in project_candidates
+    )
+    notice_markup = f'<div class="flash">{html.escape(notice)}</div>' if notice else ""
+    error_markup = f'<div class="flash error">{html.escape(browse_error)}</div>' if browse_error else ""
+
+    browser_markup = ""
+    if browse_result:
+        rows = []
+        selectable_count = 0
+        datalist_id = f"project-thread-options-{slugify(browse_result['repo_name'])}"
+        thread_options = "".join(
+            f'<option value="{html.escape(thread["id"])}" label="{html.escape((thread.get("title") or "Untitled thread") + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
+            for thread in recent_threads
+        )
+        if selected_provider == "codex":
+            thread_options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
+        thread_hint = "Blank = latest repo thread at queue time."
+        if selected_provider == "codex":
+            thread_hint += " Codex requires distinct active threads per PR."
+        for pr in browse_result["prs"]:
+            number = pr["number"]
+            tracked_status_markup = (
+                f'{status_badge(pr["tracked_status"])}<div class="small">{html.escape("active" if pr["tracked_active"] else "archived")}</div>'
+                if pr["tracked"]
+                else '<span class="small">Not tracked</span>'
+            )
+            selectable_count += 1
+            checkbox = (
+                f'<input type="checkbox" name="selected_pr" value="{number}" {"checked" if not pr["tracked"] else ""}>'
+                f'<input type="hidden" name="branch_{number}" value="{html.escape(pr["headRefName"])}">'
+                f'<input type="hidden" name="existing_thread_id_{number}" value="{html.escape(pr.get("tracked_thread_id") or "")}">'
+            )
+            thread_input = '<span class="small">Provider does not use Codex threads</span>'
+            if selected_provider == "codex":
+                existing_thread_id = pr.get("tracked_thread_id") or ""
+                placeholder = "Current thread" if existing_thread_id else "Latest repo thread"
+                hint = "Keep the current value to reuse the tracked thread." if existing_thread_id else thread_hint
+                thread_input = (
+                    f'<input type="text" name="thread_id_{number}" list="{datalist_id}" value="{html.escape(existing_thread_id)}" placeholder="{html.escape(placeholder)}">'
+                    f'<label class="small inline-option"><input type="checkbox" name="new_thread_{number}" value="1"> Fresh thread</label>'
+                    f'<div class="small">{html.escape(hint)}</div>'
+                )
+            draft_badge = '<span class="pill warn">draft</span>' if pr["isDraft"] else ""
+            rows.append(
+                f"""
+                <tr>
+                  <td>{checkbox}</td>
+                  <td><a href="{html.escape(pr['url'])}">#{number}</a> {draft_badge}<div class="small">{html.escape(pr['title'])}</div></td>
+                  <td><code>{html.escape(pr['headRefName'])}</code><div class="small">base: {html.escape(pr.get('baseRefName') or '')}</div></td>
+                  <td>{thread_input}</td>
+                  <td>{tracked_status_markup}</td>
+                </tr>
+                """
+            )
+        browser_markup = f"""
+        <div class="panel">
+          <div class="toolbar">
+            <div>
+              <h2>Open PRs for {html.escape(browse_result['repo_name'])}</h2>
+              <p>{html.escape(browse_result['repo_root'])}</p>
+            </div>
+          </div>
+          <form method="post" action="/track-open" class="bulk-track" onsubmit="return queueBulkTrack(this)">
+            <input type="hidden" name="project_root" value="{html.escape(browse_result['repo_root'])}">
+            <input type="hidden" name="repo_name" value="{html.escape(browse_result['repo_name'])}">
+            <div class="toolbar">
+              <label>Provider
+                <select name="provider">
+                  <option value="codex" {"selected" if selected_provider == "codex" else ""}>codex</option>
+                  <option value="cursor" {"selected" if selected_provider == "cursor" else ""}>cursor</option>
+                </select>
+              </label>
+              <div class="button-row">
+                <button type="button" onclick="toggleProjectPRs(this.form, true)">Select all visible</button>
+                <button type="button" onclick="toggleProjectPRs(this.form, false)">Clear</button>
+                <button type="submit" {"disabled" if selectable_count == 0 else ""}>Queue selected PRs</button>
+              </div>
+            </div>
+            <datalist id="{datalist_id}">{thread_options}</datalist>
+            <p class="small">Selections queue managed worktree tracking updates. Untracked PRs default to the latest unarchived repo thread, tracked PRs keep their existing thread unless you change it, and Fresh thread creates a new Codex thread.</p>
+            <table>
+              <thead>
+                <tr>
+                  <th>Add</th>
+                  <th>PR</th>
+                  <th>Branch</th>
+                  <th>Codex thread</th>
+                  <th>Tracking</th>
+                </tr>
+              </thead>
+              <tbody>
+                {''.join(rows) or '<tr><td colspan="5">No open PRs found</td></tr>'}
+              </tbody>
+            </table>
+          </form>
+        </div>
+        """
+
+    return f"""
+      <div class="panel">
+        <h2>Track Open PRs</h2>
+        <form method="get" class="filters">
+          <label>Project repo
+            <input type="text" name="project_root" list="project-roots" value="{html.escape(selected_project_root)}" placeholder="/Users/jordan/source/example-repo">
+            <datalist id="project-roots">{project_options}</datalist>
+          </label>
+          <label>Provider
+            <select name="provider">
+              <option value="codex" {"selected" if selected_provider == "codex" else ""}>codex</option>
+              <option value="cursor" {"selected" if selected_provider == "cursor" else ""}>cursor</option>
+            </select>
+          </label>
+          <button type="submit">Load active PRs</button>
+        </form>
+        <p>Suggestions come from tracked repos and recent Codex threads. Pick a local repo checkout, then queue its open PRs into the orchestrator.</p>
+        {notice_markup}
+        {error_markup}
+      </div>
+      {browser_markup}
+    """
 
 
 def sort_records(records: list[TrackedPR], sort_key: str) -> list[TrackedPR]:
@@ -1715,6 +2163,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _request_params(self) -> dict[str, list[str]]:
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        content_length = int(self.headers.get("Content-Length") or 0)
+        if content_length:
+            body = self.rfile.read(content_length).decode("utf-8")
+            body_params = parse_qs(body)
+            for key, values in body_params.items():
+                params.setdefault(key, []).extend(values)
+        return params
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/favicon.ico":
@@ -1726,6 +2185,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         scope = params.get("scope", ["active"])[0]
         status_filter = params.get("status", ["all"])[0]
         sort_key = params.get("sort", ["updated"])[0]
+        selected_project_root = params.get("project_root", [""])[0].strip()
+        selected_provider = params.get("provider", ["codex"])[0].strip().lower() or "codex"
+        notice = params.get("notice", [""])[0].strip() or None
+        project_candidates = list_recent_project_candidates()
+        browse_result: dict[str, Any] | None = None
+        browse_threads: list[dict[str, Any]] = []
+        browse_error: str | None = None
+        if selected_project_root:
+            resolved_root = canonical_repo_root(selected_project_root)
+            if not resolved_root:
+                browse_error = f"Not a local git checkout: {selected_project_root}"
+            else:
+                selected_project_root = resolved_root
+                try:
+                    browse_result = list_open_pull_requests_for_repo(selected_project_root)
+                    browse_threads = list_recent_threads_for_repo(selected_project_root)
+                except ScriptError as exc:
+                    browse_error = str(exc)
+            if selected_project_root and all(item["repo_root"] != selected_project_root for item in project_candidates):
+                extra_candidate = {
+                    "repo_root": selected_project_root,
+                    "repo_name": Path(selected_project_root).name,
+                    "repo_owner": "",
+                    "source": "manual",
+                    "thread_title": None,
+                }
+                project_candidates = [extra_candidate, *project_candidates]
 
         records = list_tracked_prs(active_only=False)
         if scope == "active":
@@ -1735,16 +2221,115 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if status_filter != "all":
             records = [record for record in records if record.status == status_filter]
         pending_jobs = pending_jobs_by_pr()
-        rows = [render_record_row(record, pending_jobs.get(record.key, [])) for record in sort_records(records, sort_key)]
+        thread_candidates_by_repo = {
+            repo_root: list_recent_threads_for_repo(repo_root)
+            for repo_root in {record.repo_root for record in records if record.provider == "codex"}
+        }
+        rows = [
+            render_record_row(record, pending_jobs.get(record.key, []), thread_candidates_by_repo.get(record.repo_root, []))
+            for record in sort_records(records, sort_key)
+        ]
         jobs = list_recent_jobs(15)
         events = list_recent_events(20)
 
         body = f"""
         <header>
           <h1>PR Review Coordinator</h1>
-          <p>Web UI reads tracked state and enqueues daemon jobs. Refreshes every 5 seconds.</p>
+          <p>Web UI reads tracked state and enqueues daemon jobs. Auto-refresh runs every 5 seconds when the page is idle.</p>
+          <div class="toolbar refresh-controls">
+            <div class="small" id="refresh-status">Auto-refresh in 5s.</div>
+            <div class="button-row">
+              <button type="button" id="refresh-toggle" onclick="toggleRefreshPause()">Pause auto-refresh</button>
+              <button type="button" onclick="refreshNow()">Refresh now</button>
+            </div>
+          </div>
         </header>
         <script>
+          const REFRESH_INTERVAL_SECONDS = 5;
+          const REFRESH_PAUSE_KEY = 'pr-review-coordinator.refresh-paused';
+          let refreshPausedManually = false;
+          let refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
+          let baselineFingerprint = '';
+
+          function formFingerprint() {{
+            const forms = Array.from(document.querySelectorAll('form'));
+            return JSON.stringify(forms.map((form) => {{
+              const elements = Array.from(form.querySelectorAll('input, select, textarea'));
+              return {{
+                action: form.getAttribute('action') || '',
+                method: form.getAttribute('method') || 'get',
+                values: elements.map((element) => {{
+                  const key = element.name || element.id || element.type || element.tagName;
+                  const value = element.type === 'checkbox' || element.type === 'radio' ? String(element.checked) : element.value;
+                  return [key, element.type || element.tagName, value];
+                }}),
+              }};
+            }}));
+          }}
+
+          function refreshPauseReason() {{
+            if (refreshPausedManually) {{
+              return 'manual';
+            }}
+            const active = document.activeElement;
+            if (active && active.matches && active.matches('input:not([type="hidden"]), select, textarea')) {{
+              return 'editing';
+            }}
+            if (formFingerprint() !== baselineFingerprint) {{
+              return 'dirty';
+            }}
+            return null;
+          }}
+
+          function updateRefreshControls() {{
+            const reason = refreshPauseReason();
+            const status = document.getElementById('refresh-status');
+            const toggle = document.getElementById('refresh-toggle');
+            if (status) {{
+              if (reason === 'manual') {{
+                status.textContent = 'Auto-refresh paused.';
+              }} else if (reason) {{
+                status.textContent = 'Auto-refresh paused while you edit.';
+              }} else {{
+                status.textContent = `Auto-refresh in ${{refreshSecondsRemaining}}s.`;
+              }}
+            }}
+            if (toggle) {{
+              toggle.textContent = refreshPausedManually ? 'Resume auto-refresh' : 'Pause auto-refresh';
+            }}
+          }}
+
+          function resetRefreshCountdown() {{
+            refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
+            updateRefreshControls();
+          }}
+
+          function toggleRefreshPause() {{
+            refreshPausedManually = !refreshPausedManually;
+            sessionStorage.setItem(REFRESH_PAUSE_KEY, refreshPausedManually ? '1' : '0');
+            resetRefreshCountdown();
+          }}
+
+          function refreshNow() {{
+            baselineFingerprint = formFingerprint();
+            window.location.reload();
+          }}
+
+          function tickRefresh() {{
+            const reason = refreshPauseReason();
+            if (reason) {{
+              refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
+              updateRefreshControls();
+              return;
+            }}
+            refreshSecondsRemaining -= 1;
+            if (refreshSecondsRemaining <= 0) {{
+              window.location.reload();
+              return;
+            }}
+            updateRefreshControls();
+          }}
+
           function queueAction(form, label) {{
             const row = form.closest('tr');
             if (!row) return true;
@@ -1761,12 +2346,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }}
             return true;
           }}
+          function toggleProjectPRs(form, checked) {{
+            for (const input of form.querySelectorAll('input[name=\"selected_pr\"]')) {{
+              if (!input.disabled) {{
+                input.checked = checked;
+              }}
+            }}
+          }}
+          function queueBulkTrack(form) {{
+            const selected = form.querySelectorAll('input[name=\"selected_pr\"]:checked');
+            if (!selected.length) {{
+              return false;
+            }}
+            for (const button of form.querySelectorAll('button')) {{
+              button.disabled = true;
+            }}
+            return true;
+          }}
+          document.addEventListener('DOMContentLoaded', () => {{
+            refreshPausedManually = sessionStorage.getItem(REFRESH_PAUSE_KEY) === '1';
+            baselineFingerprint = formFingerprint();
+            updateRefreshControls();
+            window.setInterval(tickRefresh, 1000);
+            document.addEventListener('input', resetRefreshCountdown, true);
+            document.addEventListener('change', resetRefreshCountdown, true);
+            document.addEventListener('focusin', resetRefreshCountdown, true);
+            document.addEventListener('focusout', () => window.setTimeout(updateRefreshControls, 0), true);
+            for (const form of document.querySelectorAll('form')) {{
+              form.addEventListener('submit', () => {{
+                baselineFingerprint = formFingerprint();
+              }});
+            }}
+          }});
         </script>
         <main>
+          {render_project_import_section(project_candidates, selected_project_root, selected_provider, browse_result, browse_threads, browse_error, notice)}
           <div class="actions">
             <form method="post" action="/poll"><button>Poll all now</button></form>
           </div>
           <form method="get" class="filters">
+            <input type="hidden" name="project_root" value="{html.escape(selected_project_root)}">
+            <input type="hidden" name="provider" value="{html.escape(selected_provider)}">
             <label>Scope
               <select name="scope">
                 <option value="active" {"selected" if scope == "active" else ""}>Active</option>
@@ -1844,7 +2464,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
+        params = self._request_params()
         if parsed.path == "/poll":
             enqueue_job("poll-all", requested_by="web")
             self._redirect("/")
@@ -1872,6 +2492,110 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if key:
                 enqueue_job("untrack-cleanup", tracked_pr_key=key, requested_by="web")
             self._redirect("/")
+            return
+        if parsed.path == "/track-open":
+            repo_root = (params.get("project_root", [""])[0] or "").strip()
+            repo_name = (params.get("repo_name", [""])[0] or "").strip() or None
+            provider = (params.get("provider", ["codex"])[0] or "codex").strip().lower() or "codex"
+            queued = 0
+            resolved_threads: dict[int, dict[str, Any]] = {}
+            thread_collisions: dict[str, list[int]] = {}
+            for value in params.get("selected_pr", []):
+                try:
+                    pr_number = int(value)
+                except ValueError:
+                    continue
+                branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
+                if not repo_root or not branch:
+                    continue
+                requested_new_thread = bool(params.get(f"new_thread_{pr_number}", []))
+                existing_thread_id = (params.get(f"existing_thread_id_{pr_number}", [""])[0] or "").strip() or None
+                requested_thread_id = (params.get(f"thread_id_{pr_number}", [""])[0] or "").strip() or None
+                if provider == "codex":
+                    if requested_thread_id == NEW_CODEX_THREAD_SENTINEL:
+                        requested_new_thread = True
+                    if requested_new_thread:
+                        resolved_threads[pr_number] = {"id": NEW_CODEX_THREAD_SENTINEL, "title": "Fresh Codex thread"}
+                        continue
+                    if not requested_thread_id and existing_thread_id:
+                        requested_thread_id = existing_thread_id
+                    try:
+                        thread = resolve_selected_thread(repo_root, provider, requested_thread_id, prefer_latest_when_empty=True)
+                        key = tracked_pr_key(repo_name or ensure_repo_name(repo_root, None)[1], pr_number)
+                        assert_thread_available(thread["id"], key)
+                        resolved_threads[pr_number] = thread
+                        thread_collisions.setdefault(thread["id"], []).append(pr_number)
+                    except ScriptError as exc:
+                        query = {"project_root": repo_root, "provider": provider, "notice": str(exc)}
+                        self._redirect(f"/?{urlencode(query)}")
+                        return
+            duplicate_threads = {thread_id: numbers for thread_id, numbers in thread_collisions.items() if len(numbers) > 1}
+            if duplicate_threads:
+                collision_summary = ", ".join(
+                    f"{thread_id[:8]} for PRs {', '.join(str(number) for number in numbers)}"
+                    for thread_id, numbers in duplicate_threads.items()
+                )
+                query = {
+                    "project_root": repo_root,
+                    "provider": provider,
+                    "notice": f"Codex thread ids must be distinct per active PR: {collision_summary}",
+                }
+                self._redirect(f"/?{urlencode(query)}")
+                return
+            detected_repo_name = repo_name or ensure_repo_name(repo_root, None)[1]
+            for value in params.get("selected_pr", []):
+                try:
+                    pr_number = int(value)
+                except ValueError:
+                    continue
+                branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
+                if not repo_root or not branch:
+                    continue
+                key = tracked_pr_key(detected_repo_name, pr_number)
+                enqueue_job(
+                    "track-existing",
+                    tracked_pr_key=key,
+                    requested_by="web",
+                    payload={
+                        "repo_root": repo_root,
+                        "repo_name": detected_repo_name,
+                        "pr_number": pr_number,
+                        "branch": branch,
+                        "provider": provider,
+                        "thread_id": (resolved_threads.get(pr_number) or {}).get("id"),
+                    },
+                )
+                queued += 1
+            query = {"project_root": repo_root, "provider": provider}
+            query["notice"] = f"Queued {queued} PR import job(s)." if queued else "No PRs selected."
+            self._redirect(f"/?{urlencode(query)}")
+            return
+        if parsed.path in {"/retarget-thread", "/renew-thread"}:
+            notice = "No PR selected."
+            key = params.get("key", [None])[0]
+            if key:
+                record = get_tracked_pr(key)
+                notice = "Queued thread update."
+                thread_id = None if parsed.path == "/renew-thread" else ((params.get("thread_id", [""])[0] or "").strip() or None)
+                if record.provider == "codex":
+                    if thread_id == NEW_CODEX_THREAD_SENTINEL:
+                        notice = "Queued fresh Codex thread creation."
+                    else:
+                        try:
+                            thread = resolve_selected_thread(record.repo_root, record.provider, thread_id, prefer_latest_when_empty=True)
+                            assert_thread_available(thread["id"], record.key)
+                        except ScriptError as exc:
+                            self._redirect(f"/?{urlencode({'notice': str(exc)})}")
+                            return
+                        thread_id = thread["id"]
+                        notice = f"Queued thread update to {thread['id'][:8]}."
+                enqueue_job(
+                    "retarget-thread",
+                    tracked_pr_key=key,
+                    requested_by="web",
+                    payload={"thread_id": thread_id, "provider": record.provider},
+                )
+            self._redirect(f"/?{urlencode({'notice': notice})}")
             return
         self._send_html(html_page("Not found", "<main><p>Unknown action</p></main>"), status=404)
 
@@ -1908,7 +2632,6 @@ def html_page(title: str, body: str) -> bytes:
 <head>
   <meta charset="utf-8">
   <title>{html.escape(title)}</title>
-  <meta http-equiv="refresh" content="5">
   <style>
     :root {{
       color-scheme: light;
@@ -1926,8 +2649,10 @@ def html_page(title: str, body: str) -> bytes:
     h1, h2 {{ margin: 0 0 12px; }}
     p {{ margin: 6px 0 0; color: var(--muted); }}
     main {{ padding: 0 28px 28px; }}
-    .actions, .filters {{ display: flex; gap: 12px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
-    button, select {{ border: 1px solid var(--line); background: var(--card); padding: 8px 12px; border-radius: 8px; cursor: pointer; font: inherit; }}
+    .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 12px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
+    button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 8px 12px; border-radius: 8px; cursor: pointer; font: inherit; }}
+    input[type="text"] {{ min-width: 360px; cursor: text; }}
+    input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; }}
     table {{ width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 18px; }}
     th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }}
     th {{ background: #ebe3d4; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
@@ -1937,9 +2662,17 @@ def html_page(title: str, body: str) -> bytes:
     .bad {{ background: #f7d8d5; color: var(--bad); }}
     .small {{ color: var(--muted); font-size: 12px; }}
     .stack {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+    .panel {{ background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 0 0 18px; }}
+    .flash {{ margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; background: #d7edea; color: var(--accent); }}
+    .flash.error {{ background: #f7d8d5; color: var(--bad); }}
+    .bulk-track {{ display: block; }}
+    .refresh-controls {{ justify-content: space-between; margin: 12px 0 0; }}
+    .thread-controls {{ display: grid; gap: 8px; margin-top: 8px; }}
+    .thread-controls form {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
     code {{ font: inherit; }}
     form {{ display: inline; }}
     label {{ display: flex; flex-direction: column; gap: 6px; }}
+    label.inline-option {{ display: inline-flex; flex-direction: row; align-items: center; gap: 6px; }}
   </style>
 </head>
 <body>

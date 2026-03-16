@@ -238,6 +238,9 @@ Runs the job workers, periodic polling scheduler, agent follow-up execution (Cod
 
 Serves the dashboard and enqueues requested actions into SQLite.
 
+- The dashboard can browse open PRs for a local repo checkout and queue selected PRs into tracking without using the CLI directly.
+- Project suggestions are sourced from tracked repos and recent Codex threads; selecting PRs from the browser queues `track`-style work that creates managed PR worktrees as needed.
+
 ### `untrack`
 
 Stops tracking a PR record.
