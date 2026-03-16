@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -213,6 +214,119 @@ class WorktreePathTests(unittest.TestCase):
             )
 
 
+class OpenPullRequestListingTests(unittest.TestCase):
+    def test_list_open_pull_requests_marks_existing_tracked_prs(self):
+        original_ensure_repo_name = pr_review_coordinator.ensure_repo_name
+        original_run = pr_review_coordinator.run
+        original_list_tracked_prs = pr_review_coordinator.list_tracked_prs
+        tracked = mock.Mock()
+        tracked.key = "repo-pr-42"
+        tracked.repo_name = "repo"
+        tracked.status = "needs_review"
+        tracked.active = 1
+        try:
+            pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
+            pr_review_coordinator.run = lambda *args, **kwargs: mock.Mock(
+                stdout=json.dumps(
+                    [
+                        {
+                            "number": 43,
+                            "url": "https://example.com/pr/43",
+                            "title": "PR 43",
+                            "headRefName": "branch-43",
+                            "baseRefName": "main",
+                            "isDraft": False,
+                            "state": "OPEN",
+                        },
+                        {
+                            "number": 42,
+                            "url": "https://example.com/pr/42",
+                            "title": "PR 42",
+                            "headRefName": "branch-42",
+                            "baseRefName": "main",
+                            "isDraft": True,
+                            "state": "OPEN",
+                        },
+                    ]
+                )
+            )
+            pr_review_coordinator.list_tracked_prs = lambda active_only=False: [tracked]
+
+            result = pr_review_coordinator.list_open_pull_requests_for_repo("/tmp/repo")
+
+            self.assertEqual(result["repo_name"], "repo")
+            self.assertEqual([item["number"] for item in result["prs"]], [43, 42])
+            self.assertFalse(result["prs"][0]["tracked"])
+            self.assertTrue(result["prs"][1]["tracked"])
+            self.assertEqual(result["prs"][1]["tracked_status"], "needs_review")
+            self.assertTrue(result["prs"][1]["tracked_active"])
+        finally:
+            pr_review_coordinator.ensure_repo_name = original_ensure_repo_name
+            pr_review_coordinator.run = original_run
+            pr_review_coordinator.list_tracked_prs = original_list_tracked_prs
+
+
+class HtmlPageTests(unittest.TestCase):
+    def test_html_page_does_not_force_meta_refresh(self):
+        page = pr_review_coordinator.html_page("Dashboard", "<main></main>").decode("utf-8")
+
+        self.assertNotIn('http-equiv="refresh"', page)
+
+
+class ThreadSelectionTests(unittest.TestCase):
+    def test_new_thread_sentinel_creates_fresh_codex_thread(self):
+        original_create_codex_thread = pr_review_coordinator.create_codex_thread
+        try:
+            pr_review_coordinator.create_codex_thread = lambda repo_root: {"id": "thread-fresh", "title": "Fresh thread"}
+
+            result = pr_review_coordinator.resolve_selected_thread(
+                "/tmp/repo",
+                "codex",
+                pr_review_coordinator.NEW_CODEX_THREAD_SENTINEL,
+            )
+
+            self.assertEqual(result["id"], "thread-fresh")
+            self.assertEqual(result["title"], "Fresh thread")
+        finally:
+            pr_review_coordinator.create_codex_thread = original_create_codex_thread
+
+
+class ProjectImportRenderingTests(unittest.TestCase):
+    def test_tracked_rows_are_selectable_and_offer_fresh_thread(self):
+        markup = pr_review_coordinator.render_project_import_section(
+            project_candidates=[],
+            selected_project_root="/tmp/repo",
+            selected_provider="codex",
+            browse_result={
+                "repo_root": "/tmp/repo",
+                "repo_name": "repo",
+                "prs": [
+                    {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "Tracked PR",
+                        "headRefName": "branch-42",
+                        "baseRefName": "main",
+                        "isDraft": False,
+                        "tracked": True,
+                        "tracked_status": "needs_review",
+                        "tracked_active": True,
+                        "tracked_thread_id": "thread-42",
+                        "tracked_thread_title": "Thread 42",
+                    }
+                ],
+            },
+            recent_threads=[{"id": "thread-99", "title": "Latest", "in_use_by": None}],
+            browse_error=None,
+            notice=None,
+        )
+
+        self.assertIn('name="selected_pr" value="42"', markup)
+        self.assertIn('name="thread_id_42"', markup)
+        self.assertIn('value="thread-42"', markup)
+        self.assertIn('name="new_thread_42"', markup)
+
+
 class WorktreeCleanlinessTests(unittest.TestCase):
     def test_git_status_is_clean_ignores_root_node_modules_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,14 +405,17 @@ class ThreadPolicyTests(unittest.TestCase):
         self.original_var_dir = pr_review_coordinator.VAR_DIR
         self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
         self.original_db = pr_review_coordinator.COORDINATOR_DB
+        self.original_state_db = pr_review_coordinator.CODEX_STATE_DB
         pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
         pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
         pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+        pr_review_coordinator.CODEX_STATE_DB = Path(self.temp_dir.name) / "state.sqlite"
 
     def tearDown(self):
         pr_review_coordinator.VAR_DIR = self.original_var_dir
         pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
         pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.CODEX_STATE_DB = self.original_state_db
         self.temp_dir.cleanup()
 
     def add_record(self, *, key, thread_id, active):
@@ -356,6 +473,40 @@ class ThreadPolicyTests(unittest.TestCase):
     def test_allows_reuse_after_prior_pr_is_inactive(self):
         self.add_record(key="repo-pr-1", thread_id="thread-1", active=False)
         pr_review_coordinator.assert_thread_available("thread-1", "repo-pr-2")
+
+    def test_recent_threads_include_in_use_annotations(self):
+        self.add_record(key="repo-pr-1", thread_id="thread-1", active=True)
+        connection = sqlite3.connect(pr_review_coordinator.CODEX_STATE_DB)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO threads (id, cwd, title, archived, updated_at) VALUES (?, ?, ?, 0, ?)",
+                ("thread-1", "/tmp/repo", "Thread One", 200),
+            )
+            connection.execute(
+                "INSERT INTO threads (id, cwd, title, archived, updated_at) VALUES (?, ?, ?, 0, ?)",
+                ("thread-2", "/tmp/repo", "Thread Two", 100),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = pr_review_coordinator.list_recent_threads_for_repo("/tmp/repo")
+
+        self.assertEqual([item["id"] for item in result], ["thread-1", "thread-2"])
+        self.assertEqual(result[0]["in_use_by"], "repo #1")
+        self.assertTrue(result[0]["conflict"])
+        self.assertIsNone(result[1]["in_use_by"])
 
 
 class RegisterTrackingTests(unittest.TestCase):
@@ -466,6 +617,9 @@ class QueueBehaviorTests(unittest.TestCase):
         self.original_record_event = pr_review_coordinator.record_event
         self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
         self.original_run_follow_up = pr_review_coordinator.run_follow_up
+        self.original_register_tracking = pr_review_coordinator.register_tracking
+        self.original_resolve_selected_thread = pr_review_coordinator.resolve_selected_thread
+        self.original_create_codex_thread = pr_review_coordinator.create_codex_thread
         pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
         pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
         pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
@@ -525,6 +679,9 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.record_event = self.original_record_event
         pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
         pr_review_coordinator.run_follow_up = self.original_run_follow_up
+        pr_review_coordinator.register_tracking = self.original_register_tracking
+        pr_review_coordinator.resolve_selected_thread = self.original_resolve_selected_thread
+        pr_review_coordinator.create_codex_thread = self.original_create_codex_thread
         self.temp_dir.cleanup()
 
     def snapshot(self, status="needs_review", signature="sig-1"):
@@ -622,6 +779,98 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.process_job(claimed)
 
         self.assertEqual(captured, {"record": "repo-pr-1", "dry_run": False, "force_run": True, "job_id": claimed.id})
+
+    def test_process_track_existing_job_uses_register_tracking(self):
+        captured = {}
+
+        def fake_register_tracking(**kwargs):
+            captured.update(kwargs)
+            return {"status": "ready", "tracked_pr": {"key": "repo-pr-9"}}
+
+        pr_review_coordinator.register_tracking = fake_register_tracking
+        pr_review_coordinator.enqueue_job(
+            "track-existing",
+            tracked_pr_key="repo-pr-9",
+            requested_by="test",
+            payload={
+                "repo_root": "/tmp/repo",
+                "repo_name": "repo",
+                "pr_number": 9,
+                "branch": "branch-9",
+                "provider": "codex",
+            },
+        )
+        claimed = pr_review_coordinator.claim_next_job()
+
+        result = pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            captured,
+            {
+                "repo_root": "/tmp/repo",
+                "repo_name": "repo",
+                "pr_number": 9,
+                "branch": "branch-9",
+                "worktree_root": str(pr_review_coordinator.CODEX_HOME / "worktrees" / "pr-review"),
+                "worktree_path": None,
+                "thread_id": None,
+                "worktree_layout": "nested",
+                "provider": "codex",
+            },
+        )
+        self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
+
+    def test_process_track_existing_job_can_create_fresh_codex_thread(self):
+        captured = {}
+
+        def fake_register_tracking(**kwargs):
+            captured.update(kwargs)
+            return {"status": "ready", "tracked_pr": {"key": "repo-pr-9"}}
+
+        pr_review_coordinator.register_tracking = fake_register_tracking
+        pr_review_coordinator.create_codex_thread = lambda repo_root: {"id": "thread-fresh", "title": "Fresh thread"}
+        pr_review_coordinator.enqueue_job(
+            "track-existing",
+            tracked_pr_key="repo-pr-9",
+            requested_by="test",
+            payload={
+                "repo_root": "/tmp/repo",
+                "repo_name": "repo",
+                "pr_number": 9,
+                "branch": "branch-9",
+                "provider": "codex",
+                "thread_id": pr_review_coordinator.NEW_CODEX_THREAD_SENTINEL,
+            },
+        )
+        claimed = pr_review_coordinator.claim_next_job()
+
+        result = pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(captured["thread_id"], "thread-fresh")
+        self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
+
+    def test_process_retarget_thread_job_updates_thread(self):
+        pr_review_coordinator.resolve_selected_thread = lambda repo_root, provider, requested_thread_id, prefer_latest_when_empty=False: {
+            "id": "thread-new",
+            "title": "Fresh thread",
+        }
+        pr_review_coordinator.enqueue_job(
+            "retarget-thread",
+            tracked_pr_key="repo-pr-1",
+            requested_by="test",
+            payload={"provider": "codex", "thread_id": "thread-new"},
+        )
+        claimed = pr_review_coordinator.claim_next_job()
+
+        result = pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(result["status"], "ready")
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        self.assertEqual(updated.thread_id, "thread-new")
+        self.assertEqual(updated.thread_title, "Fresh thread")
+        self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
 
 
 if __name__ == "__main__":
