@@ -290,6 +290,63 @@ class ThreadSelectionTests(unittest.TestCase):
         finally:
             pr_review_coordinator.create_codex_thread = original_create_codex_thread
 
+    def test_explicit_thread_id_does_not_fallback_to_latest_repo_thread(self):
+        original_state_db = pr_review_coordinator.CODEX_STATE_DB
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_db = Path(tmp) / "state.sqlite"
+                pr_review_coordinator.CODEX_STATE_DB = state_db
+                connection = sqlite3.connect(state_db)
+                try:
+                    connection.execute(
+                        """
+                        CREATE TABLE threads (
+                            id TEXT PRIMARY KEY,
+                            rollout_path TEXT NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            source TEXT NOT NULL,
+                            model_provider TEXT NOT NULL,
+                            cwd TEXT NOT NULL,
+                            title TEXT NOT NULL,
+                            sandbox_policy TEXT NOT NULL,
+                            approval_mode TEXT NOT NULL,
+                            tokens_used INTEGER NOT NULL DEFAULT 0,
+                            has_user_event INTEGER NOT NULL DEFAULT 0,
+                            archived INTEGER NOT NULL DEFAULT 0,
+                            archived_at INTEGER,
+                            git_sha TEXT,
+                            git_branch TEXT,
+                            git_origin_url TEXT,
+                            cli_version TEXT NOT NULL DEFAULT '',
+                            first_user_message TEXT NOT NULL DEFAULT '',
+                            agent_nickname TEXT,
+                            agent_role TEXT,
+                            memory_mode TEXT NOT NULL DEFAULT 'enabled'
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO threads (
+                            id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                            sandbox_policy, approval_mode, tokens_used, has_user_event, archived, cli_version,
+                            first_user_message, memory_mode
+                        ) VALUES (?, '', 0, 100, 'codex', 'openai', ?, ?, 'read-only', 'never', 0, 0, 0, '', '', 'enabled')
+                        """,
+                        ("thread-latest", "/tmp/repo", "Latest repo thread"),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                result = pr_review_coordinator.resolve_thread("/tmp/repo", "thread-explicit", provider="codex")
+
+                self.assertEqual(result["id"], "thread-explicit")
+                self.assertIsNone(result["title"])
+        finally:
+            pr_review_coordinator.CODEX_STATE_DB = original_state_db
+
 
 class DashboardRenderingTests(unittest.TestCase):
     def make_record(self, **overrides):
@@ -387,12 +444,16 @@ class ProjectImportRenderingTests(unittest.TestCase):
         )
 
         self.assertIn('name="selected_pr" value="42"', markup)
+        self.assertIn('name="thread_strategy_42"', markup)
         self.assertIn('name="thread_id_42"', markup)
-        self.assertIn('value="thread-42"', markup)
-        self.assertIn('name="new_thread_42"', markup)
-        self.assertIn("Choose which Codex thread each selected PR should resume.", markup)
+        self.assertIn("Keep current attached thread", markup)
+        self.assertIn("Use latest repo thread", markup)
+        self.assertIn("Use a specific existing thread ID", markup)
+        self.assertIn("Create fresh thread", markup)
+        self.assertIn("Collapse browser", markup)
+        self.assertIn('id="project-browser"', markup)
+        self.assertIn("Choose the thread action for each selected PR", markup)
         self.assertIn("Current stored title / opening prompt: Thread 42", markup)
-        self.assertIn("Create fresh thread instead", markup)
 
 
 class WorktreeCleanlinessTests(unittest.TestCase):

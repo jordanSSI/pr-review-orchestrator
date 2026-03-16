@@ -538,9 +538,11 @@ def resolve_thread(repo_root: str, explicit_thread_id: str | None, provider: str
         return {"id": synthetic_id, "cwd": repo_root, "title": "Cursor", "archived": 0, "git_branch": None, "git_origin_url": None}
 
     thread_id = explicit_thread_id or os.environ.get("CODEX_THREAD_ID")
-    thread = lookup_thread(thread_id) if thread_id else None
-    if thread:
-        return thread
+    if thread_id:
+        thread = lookup_thread(thread_id)
+        if thread:
+            return thread
+        return {"id": thread_id, "cwd": repo_root, "title": None, "archived": 0, "git_branch": None, "git_origin_url": None}
     fallback = latest_thread_for_repo(repo_root)
     if fallback:
         return fallback
@@ -1964,7 +1966,6 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
             f'<option value="{html.escape(thread["id"])}" label="{html.escape(compact_thread_text(thread.get("title"), limit=120) + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
             for thread in recent_threads
         )
-        options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
         current_thread_title = compact_thread_text(
             record.thread_title,
             limit=240,
@@ -2064,8 +2065,6 @@ def render_project_import_section(
             f'<option value="{html.escape(thread["id"])}" label="{html.escape(compact_thread_text(thread.get("title"), limit=120) + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
             for thread in recent_threads
         )
-        if selected_provider == "codex":
-            thread_options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
         thread_hint = "Leave blank to use the most recently updated unarchived Codex thread for this repo when the job is queued."
         if selected_provider == "codex":
             thread_hint += " Codex requires distinct active threads per PR."
@@ -2085,20 +2084,34 @@ def render_project_import_section(
             thread_input = '<span class="small">Provider does not use Codex threads</span>'
             if selected_provider == "codex":
                 existing_thread_id = pr.get("tracked_thread_id") or ""
-                placeholder = "Current attached thread ID" if existing_thread_id else "Latest repo thread ID"
-                hint = "Keep this value unchanged to keep the current attached thread for this PR." if existing_thread_id else thread_hint
-                title_hint = (
-                    f'Current stored title / opening prompt: {compact_thread_text(pr.get("tracked_thread_title"), limit=140, empty="No stored thread title was found.")}'
+                strategy_options = []
+                if existing_thread_id:
+                    strategy_options.append('<option value="keep_current" selected>Keep current attached thread</option>')
+                else:
+                    strategy_options.append('<option value="latest_repo" selected>Use latest repo thread</option>')
+                if existing_thread_id:
+                    strategy_options.append('<option value="latest_repo">Use latest repo thread</option>')
+                strategy_options.append('<option value="specific_thread">Use a specific existing thread ID</option>')
+                strategy_options.append('<option value="fresh_thread">Create fresh thread</option>')
+                specific_placeholder = "Other existing Codex thread ID" if existing_thread_id else "Existing Codex thread ID"
+                current_thread_markup = (
+                    f'<div class="small">Current attached thread: <code>{html.escape(existing_thread_id)}</code></div>'
+                    f'<div class="small">Current stored title / opening prompt: {html.escape(compact_thread_text(pr.get("tracked_thread_title"), limit=140, empty="No stored thread title was found."))}</div>'
                     if existing_thread_id
-                    else "Suggested thread titles come from Codex's stored thread title / opening prompt, not the latest thread reply."
+                    else ""
                 )
                 thread_input = (
-                    f'<label>Codex thread to attach when queued'
-                    f'<input type="text" name="thread_id_{number}" list="{datalist_id}" value="{html.escape(existing_thread_id)}" placeholder="{html.escape(placeholder)}">'
+                    f'<div class="thread-mode" data-thread-config data-existing-thread-id="{html.escape(existing_thread_id)}">'
+                    f'<label>Thread action when queued'
+                    f'<select name="thread_strategy_{number}" data-role="thread-strategy">{"".join(strategy_options)}</select>'
                     f'</label>'
-                    f'<label class="small inline-option"><input type="checkbox" name="new_thread_{number}" value="1"> Create fresh thread instead</label>'
-                    f'<div class="small">{html.escape(hint)}</div>'
-                    f'<div class="small">{html.escape(title_hint)}</div>'
+                    f'{current_thread_markup}'
+                    f'<label data-role="thread-id-wrapper">Specific existing Codex thread ID'
+                    f'<input type="text" name="thread_id_{number}" data-role="thread-id-input" list="{datalist_id}" value="" placeholder="{html.escape(specific_placeholder)}" disabled>'
+                    f'</label>'
+                    f'<div class="small" data-role="thread-mode-hint">{html.escape("This PR will keep its current attached thread unless you choose a different action." if existing_thread_id else thread_hint)}</div>'
+                    f'<div class="small">Suggested thread titles come from Codex\'s stored thread title / opening prompt, not the latest thread reply.</div>'
+                    f'</div>'
                 )
             draft_badge = '<span class="pill warn">draft</span>' if pr["isDraft"] else ""
             rows.append(
@@ -2113,11 +2126,18 @@ def render_project_import_section(
                 """
             )
         browser_markup = f"""
-        <div class="panel">
+        <details class="panel browser-panel" id="project-browser" data-browser-key="{html.escape(browse_result['repo_root'])}" open>
+          <summary>
+            <span>Open PRs for {html.escape(browse_result['repo_name'])}</span>
+            <span class="small">{html.escape(browse_result['repo_root'])}</span>
+          </summary>
           <div class="toolbar">
             <div>
-              <h2>Open PRs for {html.escape(browse_result['repo_name'])}</h2>
-              <p>{html.escape(browse_result['repo_root'])}</p>
+              <h2>Open PR browser</h2>
+              <p>Review open PRs for {html.escape(browse_result['repo_name'])} and choose which Codex thread each one should use.</p>
+            </div>
+            <div class="button-row">
+              <button type="button" onclick="collapseProjectBrowser(this)">Collapse browser</button>
             </div>
           </div>
           <form method="post" action="/track-open" class="bulk-track" onsubmit="return queueBulkTrack(this)">
@@ -2137,7 +2157,7 @@ def render_project_import_section(
               </div>
             </div>
             <datalist id="{datalist_id}">{thread_options}</datalist>
-            <p class="small">Choose which Codex thread each selected PR should resume. Titles shown in thread suggestions come from Codex's stored thread title / opening prompt, not the latest thread reply. Leave the field blank to use the latest unarchived repo thread, keep an existing value to keep that PR on its current thread, or choose Create fresh thread instead to start a new one.</p>
+            <p class="small">Choose the thread action for each selected PR: keep its current attached thread, use the latest repo thread, attach a specific existing thread ID, or create a fresh thread. Titles shown in thread suggestions come from Codex's stored thread title / opening prompt, not the latest thread reply.</p>
             <table>
               <thead>
                 <tr>
@@ -2153,7 +2173,7 @@ def render_project_import_section(
               </tbody>
             </table>
           </form>
-        </div>
+        </details>
         """
 
     return f"""
@@ -2393,6 +2413,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }}
             return true;
           }}
+          function projectBrowserStorageKey(panel) {{
+            return `pr-review-coordinator.project-browser:${{panel.dataset.browserKey || 'default'}}`;
+          }}
+          function rememberProjectBrowserState(panel) {{
+            sessionStorage.setItem(projectBrowserStorageKey(panel), panel.open ? '1' : '0');
+          }}
+          function collapseProjectBrowser(element) {{
+            const panel = element.closest('details[data-browser-key]');
+            if (!panel) {{
+              return;
+            }}
+            panel.open = false;
+            rememberProjectBrowserState(panel);
+          }}
+          function syncProjectBrowserState() {{
+            const panel = document.getElementById('project-browser');
+            if (!panel) {{
+              return;
+            }}
+            const stored = sessionStorage.getItem(projectBrowserStorageKey(panel));
+            if (stored === '0') {{
+              panel.open = false;
+            }} else if (stored === '1') {{
+              panel.open = true;
+            }}
+            panel.addEventListener('toggle', () => rememberProjectBrowserState(panel));
+          }}
+          function syncThreadStrategy(select) {{
+            const config = select.closest('[data-thread-config]');
+            if (!config) {{
+              return;
+            }}
+            const input = config.querySelector('[data-role="thread-id-input"]');
+            const wrapper = config.querySelector('[data-role="thread-id-wrapper"]');
+            const hint = config.querySelector('[data-role="thread-mode-hint"]');
+            const hasCurrentThread = !!config.dataset.existingThreadId;
+            const choice = select.value;
+            const needsSpecificId = choice === 'specific_thread';
+            if (input) {{
+              input.disabled = !needsSpecificId;
+            }}
+            if (wrapper) {{
+              wrapper.classList.toggle('muted', !needsSpecificId);
+            }}
+            if (hint) {{
+              if (choice === 'keep_current') {{
+                hint.textContent = 'This PR will keep its current attached thread.';
+              }} else if (choice === 'latest_repo') {{
+                hint.textContent = 'This PR will use the most recently updated unarchived Codex thread for this repo when queued.';
+              }} else if (choice === 'specific_thread') {{
+                hint.textContent = 'This PR will use the exact existing thread ID entered below.';
+              }} else if (choice === 'fresh_thread') {{
+                hint.textContent = 'This PR will create and attach a new Codex thread.';
+              }} else if (hasCurrentThread) {{
+                hint.textContent = 'This PR will keep its current attached thread unless you choose a different action.';
+              }} else {{
+                hint.textContent = 'Leave blank to use the most recently updated unarchived Codex thread for this repo when the job is queued.';
+              }}
+            }}
+          }}
           function toggleProjectPRs(form, checked) {{
             for (const input of form.querySelectorAll('input[name=\"selected_pr\"]')) {{
               if (!input.disabled) {{
@@ -2408,12 +2488,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             for (const button of form.querySelectorAll('button')) {{
               button.disabled = true;
             }}
+            const panel = form.closest('details[data-browser-key]');
+            if (panel) {{
+              panel.open = false;
+              rememberProjectBrowserState(panel);
+            }}
             return true;
           }}
           document.addEventListener('DOMContentLoaded', () => {{
             refreshPausedManually = sessionStorage.getItem(REFRESH_PAUSE_KEY) === '1';
             baselineFingerprint = formFingerprint();
             updateRefreshControls();
+            syncProjectBrowserState();
+            for (const select of document.querySelectorAll('select[data-role=\"thread-strategy\"]')) {{
+              syncThreadStrategy(select);
+              select.addEventListener('change', () => syncThreadStrategy(select));
+            }}
             window.setInterval(tickRefresh, 1000);
             document.addEventListener('input', resetRefreshCountdown, true);
             document.addEventListener('change', resetRefreshCountdown, true);
@@ -2555,10 +2645,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
                 if not repo_root or not branch:
                     continue
+                thread_strategy = (params.get(f"thread_strategy_{pr_number}", [""])[0] or "").strip() or None
                 requested_new_thread = bool(params.get(f"new_thread_{pr_number}", []))
                 existing_thread_id = (params.get(f"existing_thread_id_{pr_number}", [""])[0] or "").strip() or None
                 requested_thread_id = (params.get(f"thread_id_{pr_number}", [""])[0] or "").strip() or None
                 if provider == "codex":
+                    if thread_strategy == "keep_current":
+                        requested_thread_id = existing_thread_id
+                    elif thread_strategy == "latest_repo":
+                        requested_thread_id = None
+                    elif thread_strategy == "specific_thread":
+                        if not requested_thread_id:
+                            query = {
+                                "project_root": repo_root,
+                                "provider": provider,
+                                "notice": f"PR #{pr_number}: enter an existing Codex thread ID or choose a different thread action.",
+                            }
+                            self._redirect(f"/?{urlencode(query)}")
+                            return
+                    elif thread_strategy == "fresh_thread":
+                        requested_new_thread = True
                     if requested_thread_id == NEW_CODEX_THREAD_SENTINEL:
                         requested_new_thread = True
                     if requested_new_thread:
@@ -2713,10 +2819,14 @@ def html_page(title: str, body: str) -> bytes:
     .flash {{ margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; background: #d7edea; color: var(--accent); }}
     .flash.error {{ background: #f7d8d5; color: var(--bad); }}
     .bulk-track {{ display: block; }}
+    .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
+    .browser-panel[open] summary {{ margin-bottom: 12px; }}
     .refresh-controls {{ justify-content: space-between; margin: 12px 0 0; }}
     .thread-controls {{ display: grid; gap: 8px; margin-top: 8px; }}
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
     .thread-panel {{ border: 1px solid var(--line); border-radius: 10px; background: #f8f3eb; padding: 10px 12px; }}
+    .thread-mode {{ display: grid; gap: 6px; }}
+    .muted {{ opacity: 0.65; }}
     code {{ font: inherit; }}
     form {{ display: inline; }}
     label {{ display: flex; flex-direction: column; gap: 6px; }}
