@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from pr_review_common import (
+    AGENT_GITHUB_COMMENT_INSTRUCTION,
     CODEX_HOME,
     ScriptError,
     ensure_existing_worktree,
@@ -1404,6 +1405,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
         Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
+        {AGENT_GITHUB_COMMENT_INSTRUCTION}
         If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
 

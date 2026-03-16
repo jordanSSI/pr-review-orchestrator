@@ -29,6 +29,11 @@ COPILOT_LOGINS = {
     "chatgpt-codex-connector[bot]",
 }
 HANDLED_PR_COMMENT_MARKER = "pr-review-coordinator:handled-comment"
+AGENT_COMMENT_PREFIX = "[jordanBot]"
+AGENT_GITHUB_COMMENT_INSTRUCTION = (
+    f"Any GitHub comment or review reply you post must begin with `{AGENT_COMMENT_PREFIX}`. "
+    "This includes handled-comment replies and rationale-only replies."
+)
 
 
 class ScriptError(RuntimeError):
@@ -368,6 +373,8 @@ def serialize_unresolved_threads(pull_request: dict[str, Any]) -> list[dict[str,
 
 def extract_handled_pr_comment_ids(body: str | None) -> set[str]:
     if not body:
+        return set()
+    if not body.lstrip().startswith(AGENT_COMMENT_PREFIX):
         return set()
     matches = re.findall(rf"{re.escape(HANDLED_PR_COMMENT_MARKER)}\s+([A-Za-z0-9_=:-]+)", body)
     return {match.strip() for match in matches if match.strip()}
@@ -768,6 +775,7 @@ def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict
         You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
         Handle unresolved GitHub review feedback, actionable top-level PR comments, and completed failing CI checks on the current branch.
         Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer chatgpt-codex-connector (or copilot-pull-request-reviewer where required) when more review is needed, and resolve threads only after the fix is pushed.
+        {AGENT_GITHUB_COMMENT_INSTRUCTION}
         If you addressed a top-level PR comment, reply on the PR after pushing with a short note that includes `<!-- {HANDLED_PR_COMMENT_MARKER} COMMENT_ID -->` for each handled comment ID.
 
         If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.

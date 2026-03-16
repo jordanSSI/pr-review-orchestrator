@@ -145,7 +145,7 @@ class PullRequestSnapshotTests(unittest.TestCase):
                     {
                         "id": "issue-comment-2",
                         "author": {"login": "jordanSSI"},
-                        "body": "Merged master and resolved conflicts. <!-- pr-review-coordinator:handled-comment issue-comment-1 -->",
+                        "body": "[jordanBot] Merged master and resolved conflicts. <!-- pr-review-coordinator:handled-comment issue-comment-1 -->",
                         "createdAt": "2026-03-09T02:00:00Z",
                         "updatedAt": "2026-03-09T02:00:00Z",
                         "url": "https://example.com/comment-2",
@@ -155,6 +155,32 @@ class PullRequestSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["status"], "awaiting_final_test")
         self.assertEqual(snapshot["actionable_pr_comments"], [])
+
+    def test_handled_marker_without_jordanbot_prefix_does_not_suppress_prior_pr_comment(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "jordanSSI"},
+                        "body": "Please resolve merge conflicts with master.",
+                        "createdAt": "2026-03-09T01:00:00Z",
+                        "updatedAt": "2026-03-09T01:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    },
+                    {
+                        "id": "issue-comment-2",
+                        "author": {"login": "jordanSSI"},
+                        "body": "Merged master and resolved conflicts. <!-- pr-review-coordinator:handled-comment issue-comment-1 -->",
+                        "createdAt": "2026-03-09T02:00:00Z",
+                        "updatedAt": "2026-03-09T02:00:00Z",
+                        "url": "https://example.com/comment-2",
+                    },
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
 
 
 class CodexBinaryResolutionTests(unittest.TestCase):
@@ -173,6 +199,86 @@ class CodexBinaryResolutionTests(unittest.TestCase):
                     with mock.patch("pr_review_common.os.access", return_value=True):
                         resolved = pr_review_common.resolve_codex_executable()
         self.assertTrue(resolved.endswith("codex"))
+
+
+class PromptInstructionTests(unittest.TestCase):
+    def make_record(self, **overrides):
+        payload = {
+            "key": "repo-pr-42",
+            "repo_root": "/tmp/repo",
+            "repo_owner": "owner",
+            "repo_name": "repo",
+            "pr_number": 42,
+            "pr_url": "https://example.com/pr/42",
+            "pr_title": "Example PR",
+            "pr_state": "OPEN",
+            "branch": "feature/example",
+            "base_branch": "main",
+            "worktree_path": "/tmp/worktree",
+            "worktree_managed": 1,
+            "thread_id": "thread-42",
+            "thread_title": "Original bug report and context for the thread",
+            "status": "needs_review",
+            "active": 1,
+            "last_review_signature": None,
+            "last_handled_signature": None,
+            "last_review_status": "needs_review",
+            "last_review_comment_at": None,
+            "pending_copilot_review": 0,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 1,
+            "failing_check_count": 0,
+            "unresolved_threads_json": "[]",
+            "actionable_comments_json": "[]",
+            "failing_checks_json": "[]",
+            "ci_summary": None,
+            "run_state": None,
+            "run_reason": None,
+            "current_job_id": None,
+            "lock_started_at": None,
+            "lock_owner_pid": None,
+            "last_polled_at": None,
+            "last_prompted_at": None,
+            "last_run_started_at": None,
+            "last_run_finished_at": None,
+            "last_run_status": "ready",
+            "last_run_summary": "Idle",
+            "last_error": None,
+            "provider": "codex",
+            "created_at": 0,
+            "updated_at": 0,
+        }
+        payload.update(overrides)
+        return pr_review_coordinator.TrackedPR(**payload)
+
+    def test_codex_exec_review_prompt_requires_jordanbot_prefix(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(pr_review_common, "resolve_codex_executable", return_value="/usr/local/bin/codex"):
+            with mock.patch.object(pr_review_common, "run", side_effect=fake_run):
+                result = pr_review_common.codex_exec_review("/tmp/worktree", 42, "feature/example")
+
+        prompt = captured["cmd"][-1]
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("must begin with `[jordanBot]`", prompt)
+        self.assertIn(pr_review_common.HANDLED_PR_COMMENT_MARKER, prompt)
+
+    def test_resume_prompt_requires_jordanbot_prefix(self):
+        record = self.make_record()
+        snapshot = {
+            "unresolved_threads": [],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+        }
+
+        prompt = pr_review_coordinator.resume_prompt(record, snapshot)
+
+        self.assertIn("must begin with `[jordanBot]`", prompt)
+        self.assertIn("handled-comment COMMENT_ID", prompt)
 
 
 class WorktreePathTests(unittest.TestCase):
