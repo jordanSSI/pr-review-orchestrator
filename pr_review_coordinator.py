@@ -220,6 +220,15 @@ def format_timestamp(value_ms: int | None) -> str:
     return datetime.fromtimestamp(value_ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def compact_thread_text(value: str | None, *, limit: int = 160, empty: str = "Untitled thread") -> str:
+    text = " ".join((value or "").replace("\r", " ").replace("\n", " ").split())
+    if not text:
+        return empty
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 1)].rstrip() + "..."
+
+
 def json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
@@ -1952,39 +1961,69 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
     if record.provider == "codex":
         datalist_id = f"thread-options-{slugify(record.key)}"
         options = "".join(
-            f'<option value="{html.escape(thread["id"])}" label="{html.escape((thread.get("title") or "Untitled thread") + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
+            f'<option value="{html.escape(thread["id"])}" label="{html.escape(compact_thread_text(thread.get("title"), limit=120) + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
             for thread in recent_threads
         )
         options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
-        recent_summary = " | ".join(
-            f'{thread["id"][:8]} {thread.get("title") or "Untitled"}{" (in use by " + thread["in_use_by"] + ")" if thread.get("in_use_by") else ""}'
+        current_thread_title = compact_thread_text(
+            record.thread_title,
+            limit=240,
+            empty="No stored Codex thread title was found for this thread.",
+        )
+        recent_summary = "".join(
+            f'<div class="small"><code>{html.escape(thread["id"][:8])}</code> {html.escape(compact_thread_text(thread.get("title"), limit=120))}{" (in use by " + html.escape(thread["in_use_by"]) + ")" if thread.get("in_use_by") else ""}</div>'
             for thread in recent_threads[:4]
         )
+        if not recent_summary:
+            recent_summary = '<div class="small">No recent unarchived Codex threads were found for this repo.</div>'
         thread_controls = f"""
           <div class="thread-controls">
-            <div class="small">{html.escape(record.thread_title or "")}</div>
+            <div class="thread-panel">
+              <div class="small">Attached Codex thread</div>
+              <div><code>{html.escape(record.thread_id)}</code></div>
+              <div class="small">Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.</div>
+              <div class="small stack">{html.escape(current_thread_title)}</div>
+            </div>
             <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'thread update queued')">
-              <input type="text" name="thread_id" list="{datalist_id}" value="{html.escape(record.thread_id)}" placeholder="Thread id">
+              <label>Attach this PR to an existing Codex thread ID
+                <input type="text" name="thread_id" list="{datalist_id}" value="{html.escape(record.thread_id)}" placeholder="Existing Codex thread ID">
+              </label>
               <datalist id="{datalist_id}">{options}</datalist>
-              <button {actions_disabled}>Set thread</button>
+              <button {actions_disabled}>Set attached thread</button>
+              <div class="small">Uses the exact thread ID you enter or choose below.</div>
             </form>
             <form method="post" action="/renew-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'latest thread queued')">
-              <button {actions_disabled}>Use latest</button>
+              <button {actions_disabled}>Use latest repo thread</button>
+              <div class="small">Switches to the most recently updated unarchived Codex thread for this repo checkout.</div>
             </form>
             <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'fresh thread queued')">
               <input type="hidden" name="thread_id" value="{NEW_CODEX_THREAD_SENTINEL}">
-              <button {actions_disabled}>New thread</button>
+              <button {actions_disabled}>Create fresh thread</button>
+              <div class="small">Creates a new Codex thread and attaches this PR to it.</div>
             </form>
-            <div class="small">{html.escape(recent_summary)}</div>
+            <div class="thread-panel">
+              <div class="small">Recent repo threads</div>
+              <div class="small">Suggestions from recent unarchived Codex threads in this repo. Titles below are stored thread titles/opening prompts, not latest replies.</div>
+              {recent_summary}
+            </div>
           </div>
         """
     else:
-        thread_controls = f'<div class="small">{html.escape(record.thread_title or "")}</div>'
+        thread_controls = f"""
+          <div class="thread-controls">
+            <div class="thread-panel">
+              <div class="small">Attached provider thread</div>
+              <div><code>{html.escape(record.thread_id)}</code></div>
+              <div class="small">Stored thread label</div>
+              <div class="small stack">{html.escape(compact_thread_text(record.thread_title, limit=240, empty="No stored thread label was found."))}</div>
+            </div>
+          </div>
+        """
     return f"""
         <tr data-pr-key="{html.escape(record.key)}">
           <td>{status_badge(record.status)}</td>
           <td><a href="{html.escape(record.pr_url)}">{html.escape(record.repo_name)} #{record.pr_number}</a><div class="small">{html.escape(record.pr_title)}</div></td>
-          <td><code>{html.escape(record.branch)}</code><div class="small">{html.escape(record.thread_id)}</div>{thread_controls}</td>
+          <td><code>{html.escape(record.branch)}</code>{thread_controls}</td>
           <td><code>{html.escape(record.provider or "codex")}</code></td>
           <td><code>{html.escape(record.worktree_path)}</code><div class="small" data-role="detail-text">{html.escape(detail_text)}</div></td>
           <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div></td>
@@ -2022,12 +2061,12 @@ def render_project_import_section(
         selectable_count = 0
         datalist_id = f"project-thread-options-{slugify(browse_result['repo_name'])}"
         thread_options = "".join(
-            f'<option value="{html.escape(thread["id"])}" label="{html.escape((thread.get("title") or "Untitled thread") + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
+            f'<option value="{html.escape(thread["id"])}" label="{html.escape(compact_thread_text(thread.get("title"), limit=120) + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
             for thread in recent_threads
         )
         if selected_provider == "codex":
             thread_options += f'<option value="{NEW_CODEX_THREAD_SENTINEL}" label="Create a fresh Codex thread"></option>'
-        thread_hint = "Blank = latest repo thread at queue time."
+        thread_hint = "Leave blank to use the most recently updated unarchived Codex thread for this repo when the job is queued."
         if selected_provider == "codex":
             thread_hint += " Codex requires distinct active threads per PR."
         for pr in browse_result["prs"]:
@@ -2046,12 +2085,20 @@ def render_project_import_section(
             thread_input = '<span class="small">Provider does not use Codex threads</span>'
             if selected_provider == "codex":
                 existing_thread_id = pr.get("tracked_thread_id") or ""
-                placeholder = "Current thread" if existing_thread_id else "Latest repo thread"
-                hint = "Keep the current value to reuse the tracked thread." if existing_thread_id else thread_hint
+                placeholder = "Current attached thread ID" if existing_thread_id else "Latest repo thread ID"
+                hint = "Keep this value unchanged to keep the current attached thread for this PR." if existing_thread_id else thread_hint
+                title_hint = (
+                    f'Current stored title / opening prompt: {compact_thread_text(pr.get("tracked_thread_title"), limit=140, empty="No stored thread title was found.")}'
+                    if existing_thread_id
+                    else "Suggested thread titles come from Codex's stored thread title / opening prompt, not the latest thread reply."
+                )
                 thread_input = (
+                    f'<label>Codex thread to attach when queued'
                     f'<input type="text" name="thread_id_{number}" list="{datalist_id}" value="{html.escape(existing_thread_id)}" placeholder="{html.escape(placeholder)}">'
-                    f'<label class="small inline-option"><input type="checkbox" name="new_thread_{number}" value="1"> Fresh thread</label>'
+                    f'</label>'
+                    f'<label class="small inline-option"><input type="checkbox" name="new_thread_{number}" value="1"> Create fresh thread instead</label>'
                     f'<div class="small">{html.escape(hint)}</div>'
+                    f'<div class="small">{html.escape(title_hint)}</div>'
                 )
             draft_badge = '<span class="pill warn">draft</span>' if pr["isDraft"] else ""
             rows.append(
@@ -2090,7 +2137,7 @@ def render_project_import_section(
               </div>
             </div>
             <datalist id="{datalist_id}">{thread_options}</datalist>
-            <p class="small">Selections queue managed worktree tracking updates. Untracked PRs default to the latest unarchived repo thread, tracked PRs keep their existing thread unless you change it, and Fresh thread creates a new Codex thread.</p>
+            <p class="small">Choose which Codex thread each selected PR should resume. Titles shown in thread suggestions come from Codex's stored thread title / opening prompt, not the latest thread reply. Leave the field blank to use the latest unarchived repo thread, keep an existing value to keep that PR on its current thread, or choose Create fresh thread instead to start a new one.</p>
             <table>
               <thead>
                 <tr>
@@ -2668,7 +2715,8 @@ def html_page(title: str, body: str) -> bytes:
     .bulk-track {{ display: block; }}
     .refresh-controls {{ justify-content: space-between; margin: 12px 0 0; }}
     .thread-controls {{ display: grid; gap: 8px; margin-top: 8px; }}
-    .thread-controls form {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
+    .thread-panel {{ border: 1px solid var(--line); border-radius: 10px; background: #f8f3eb; padding: 10px 12px; }}
     code {{ font: inherit; }}
     form {{ display: inline; }}
     label {{ display: flex; flex-direction: column; gap: 6px; }}

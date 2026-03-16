@@ -291,6 +291,71 @@ class ThreadSelectionTests(unittest.TestCase):
             pr_review_coordinator.create_codex_thread = original_create_codex_thread
 
 
+class DashboardRenderingTests(unittest.TestCase):
+    def make_record(self, **overrides):
+        payload = {
+            "key": "repo-42",
+            "repo_root": "/tmp/repo",
+            "repo_owner": "owner",
+            "repo_name": "repo",
+            "pr_number": 42,
+            "pr_url": "https://example.com/pr/42",
+            "pr_title": "Example PR",
+            "pr_state": "OPEN",
+            "branch": "feature/example",
+            "base_branch": "main",
+            "worktree_path": "/tmp/worktree",
+            "worktree_managed": 1,
+            "thread_id": "thread-42",
+            "thread_title": "Original bug report and context for the thread",
+            "status": "needs_review",
+            "active": 1,
+            "last_review_signature": None,
+            "last_handled_signature": None,
+            "last_review_status": "needs_review",
+            "last_review_comment_at": None,
+            "pending_copilot_review": 0,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+            "unresolved_threads_json": "[]",
+            "actionable_comments_json": "[]",
+            "failing_checks_json": "[]",
+            "ci_summary": None,
+            "run_state": None,
+            "run_reason": None,
+            "current_job_id": None,
+            "lock_started_at": None,
+            "lock_owner_pid": None,
+            "last_polled_at": None,
+            "last_prompted_at": None,
+            "last_run_started_at": None,
+            "last_run_finished_at": None,
+            "last_run_status": "ready",
+            "last_run_summary": "Idle",
+            "last_error": None,
+            "provider": "codex",
+            "created_at": 0,
+            "updated_at": 0,
+        }
+        payload.update(overrides)
+        return pr_review_coordinator.TrackedPR(**payload)
+
+    def test_render_record_row_explains_thread_summary_and_actions(self):
+        markup = pr_review_coordinator.render_record_row(
+            self.make_record(),
+            recent_threads=[{"id": "thread-99", "title": "A recent thread title", "in_use_by": None}],
+        )
+
+        self.assertIn("Attached Codex thread", markup)
+        self.assertIn("Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.", markup)
+        self.assertIn("Set attached thread", markup)
+        self.assertIn("Use latest repo thread", markup)
+        self.assertIn("Create fresh thread", markup)
+        self.assertIn("Recent repo threads", markup)
+        self.assertIn("Titles below are stored thread titles/opening prompts, not latest replies.", markup)
+
+
 class ProjectImportRenderingTests(unittest.TestCase):
     def test_tracked_rows_are_selectable_and_offer_fresh_thread(self):
         markup = pr_review_coordinator.render_project_import_section(
@@ -325,6 +390,9 @@ class ProjectImportRenderingTests(unittest.TestCase):
         self.assertIn('name="thread_id_42"', markup)
         self.assertIn('value="thread-42"', markup)
         self.assertIn('name="new_thread_42"', markup)
+        self.assertIn("Choose which Codex thread each selected PR should resume.", markup)
+        self.assertIn("Current stored title / opening prompt: Thread 42", markup)
+        self.assertIn("Create fresh thread instead", markup)
 
 
 class WorktreeCleanlinessTests(unittest.TestCase):
