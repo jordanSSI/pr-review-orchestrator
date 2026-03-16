@@ -213,6 +213,78 @@ class WorktreePathTests(unittest.TestCase):
             )
 
 
+class WorktreeCleanlinessTests(unittest.TestCase):
+    def test_git_status_is_clean_ignores_root_node_modules_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "worktree"
+            repo_root = Path(tmp) / "repo"
+            worktree.mkdir()
+            repo_root.mkdir()
+            (repo_root / "node_modules").mkdir()
+            (worktree / "node_modules").symlink_to(repo_root / "node_modules")
+
+            with mock.patch.object(
+                pr_review_common,
+                "run",
+                return_value=mock.Mock(stdout="?? node_modules\n"),
+            ):
+                self.assertTrue(pr_review_common.git_status_is_clean(worktree))
+
+    def test_git_status_is_clean_keeps_real_node_modules_dirty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "worktree"
+            worktree.mkdir()
+            (worktree / "node_modules").mkdir()
+
+            with mock.patch.object(
+                pr_review_common,
+                "run",
+                return_value=mock.Mock(stdout="?? node_modules\n"),
+            ):
+                self.assertFalse(pr_review_common.git_status_is_clean(worktree))
+
+    def test_sync_worktree_to_remote_recreates_node_modules_symlink_after_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            worktree = Path(tmp) / "worktree"
+            repo_root.mkdir()
+            worktree.mkdir()
+            (repo_root / "node_modules").mkdir()
+            (worktree / "package.json").write_text("{}", encoding="utf-8")
+            node_modules_link = worktree / "node_modules"
+            node_modules_link.symlink_to(repo_root / "node_modules")
+            resolved_repo_root = repo_root.resolve()
+            resolved_worktree = worktree.resolve()
+            repo_root_variants = {str(repo_root), str(resolved_repo_root)}
+            worktree_variants = {str(worktree), str(resolved_worktree)}
+
+            def fake_run(cmd, *, cwd=None, check=True, capture_output=True):
+                git_cwd = cmd[2]
+                git_action = cmd[3:]
+
+                if git_cwd in worktree_variants and git_action[:1] == ["status"]:
+                    return mock.Mock(stdout="?? node_modules\n")
+                if git_cwd in repo_root_variants and git_action[:1] == ["fetch"]:
+                    return mock.Mock(stdout="")
+                if git_cwd in repo_root_variants and git_action == ["rev-parse", "origin/feature/test"]:
+                    return mock.Mock(stdout="remote-head\n")
+                if git_cwd in worktree_variants and git_action == ["rev-parse", "HEAD"]:
+                    return mock.Mock(stdout="local-head\n")
+                if git_cwd in worktree_variants and git_action[:2] == ["reset", "--hard"]:
+                    return mock.Mock(stdout="")
+                if git_cwd in worktree_variants and git_action == ["clean", "-fd"]:
+                    node_modules_link.unlink()
+                    return mock.Mock(stdout="")
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            with mock.patch.object(pr_review_common, "run", side_effect=fake_run):
+                result = pr_review_common.sync_worktree_to_remote(repo_root, "feature/test", worktree)
+
+            self.assertEqual(result["status"], "ready")
+            self.assertTrue(node_modules_link.is_symlink())
+            self.assertEqual(node_modules_link.resolve(), (repo_root / "node_modules").resolve())
+
+
 class ThreadPolicyTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()

@@ -625,10 +625,22 @@ def branch_checked_out_elsewhere(repo_root: str | Path, branch: str, path_to_ign
 
 
 def git_status_is_clean(worktree: str | Path) -> bool:
+    worktree_path = Path(worktree).resolve()
     result = run(
-        ["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=normal"],
+        ["git", "-C", str(worktree_path), "status", "--porcelain", "--untracked-files=normal"],
     )
-    return result.stdout.strip() == ""
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("?? "):
+            status_path = line[3:]
+            if " -> " in status_path:
+                status_path = status_path.split(" -> ", 1)[1]
+            status_path = status_path.rstrip("/")
+            if status_path == "node_modules" and (worktree_path / status_path).is_symlink():
+                continue
+        return False
+    return True
 
 
 def ensure_worktree_node_modules_symlink(worktree_path: str | Path, repo_root: str | Path) -> bool:
@@ -642,7 +654,7 @@ def ensure_worktree_node_modules_symlink(worktree_path: str | Path, repo_root: s
     repo_node_modules = repo / "node_modules"
     if not package_json.is_file():
         return False
-    if worktree_node_modules.exists():
+    if worktree_node_modules.exists() or worktree_node_modules.is_symlink():
         return False
     if not repo_node_modules.is_dir():
         return False
@@ -745,6 +757,7 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
     if local_head != remote_head:
         run(["git", "-C", str(worktree), "reset", "--hard", remote_ref])
     run(["git", "-C", str(worktree), "clean", "-fd"])
+    ensure_worktree_node_modules_symlink(worktree, repo_root)
     return {"status": "ready", "worktree": str(worktree), "head": remote_head, "changed": local_head != remote_head}
 
 
