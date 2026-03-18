@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from pr_review_common import (
     AGENT_GITHUB_COMMENT_INSTRUCTION,
     CODEX_HOME,
+    COPILOT_REVIEW_REQUEST_LOGIN,
     ScriptError,
     ensure_existing_worktree,
     ensure_worktree,
@@ -50,19 +51,21 @@ COORDINATOR_DB = VAR_DIR / "pr-review-coordinator.db"
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_WORKER_COUNT = 4
 NEW_CODEX_THREAD_SENTINEL = "__new_codex_thread__"
+COPILOT_RETRY_COOLDOWN_MS = 15 * 60 * 1000
 ACTIVE_STATUSES = {"needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "needs_review": 0,
     "needs_ci_fix": 1,
     "pending_copilot_review": 2,
-    "awaiting_final_review": 3,
-    "awaiting_final_test": 4,
-    "busy": 5,
-    "running": 6,
-    "idle": 7,
-    "untracked": 8,
-    "closed": 9,
-    "error": 10,
+    "copilot_review_cooldown": 3,
+    "awaiting_final_review": 4,
+    "awaiting_final_test": 5,
+    "busy": 6,
+    "running": 7,
+    "idle": 8,
+    "untracked": 9,
+    "closed": 10,
+    "error": 11,
 }
 
 
@@ -108,6 +111,7 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     last_run_status TEXT,
     last_run_summary TEXT,
     last_error TEXT,
+    last_copilot_rerequested_at INTEGER,
     provider TEXT NOT NULL DEFAULT 'codex',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -194,6 +198,7 @@ class TrackedPR:
     provider: str
     created_at: int
     updated_at: int
+    last_copilot_rerequested_at: int | None = None
 
 
 @dataclass
@@ -219,6 +224,23 @@ def format_timestamp(value_ms: int | None) -> str:
     if not value_ms:
         return ""
     return datetime.fromtimestamp(value_ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_github_timestamp_ms(value: str | None) -> int | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 
 
 def compact_thread_text(value: str | None, *, limit: int = 160, empty: str = "Untitled thread") -> str:
@@ -260,6 +282,7 @@ def connect_db() -> sqlite3.Connection:
             "lock_owner_pid": "INTEGER",
             "last_run_started_at": "INTEGER",
             "last_run_finished_at": "INTEGER",
+            "last_copilot_rerequested_at": "INTEGER",
             "provider": "TEXT NOT NULL DEFAULT 'codex'",
         },
     )
@@ -324,6 +347,7 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "last_run_status": record.last_run_status,
         "last_run_summary": record.last_run_summary,
         "last_error": record.last_error,
+        "last_copilot_rerequested_at": record.last_copilot_rerequested_at,
         "provider": record.provider,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
@@ -819,6 +843,32 @@ def summarize_failing_checks(failing_checks: list[dict[str, Any]]) -> str:
     if not failing_checks:
         return ""
     return "; ".join(item.get("summary") or item.get("name") or "Unknown failing check" for item in failing_checks[:5])
+
+
+def copilot_retry_after_ms(record: TrackedPR, snapshot: dict[str, Any]) -> int:
+    retry_after = now_ms() + COPILOT_RETRY_COOLDOWN_MS
+    error = snapshot.get("copilot_review_error") or {}
+    error_at = parse_github_timestamp_ms(error.get("createdAt"))
+    if error_at is not None:
+        retry_after = error_at + COPILOT_RETRY_COOLDOWN_MS
+    if record.last_copilot_rerequested_at:
+        retry_after = max(retry_after, record.last_copilot_rerequested_at + COPILOT_RETRY_COOLDOWN_MS)
+    return retry_after
+
+
+def request_copilot_review(record: TrackedPR) -> dict[str, Any]:
+    run(
+        [
+            "gh",
+            "pr",
+            "edit",
+            str(record.pr_number),
+            "--add-reviewer",
+            COPILOT_REVIEW_REQUEST_LOGIN,
+        ],
+        cwd=record.repo_root,
+    )
+    return {"status": "ready", "reviewer": COPILOT_REVIEW_REQUEST_LOGIN}
 
 
 def tracked_status_for_snapshot(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> str:
@@ -1576,6 +1626,61 @@ def cleanup_external_worktree(record: TrackedPR) -> dict[str, Any]:
         return {"status": "skipped", "removed": False, "reason": f"git refused removal: {exc}"}
 
 
+def maybe_handle_copilot_review_cooldown(record: TrackedPR, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    if snapshot["status"] != "copilot_review_cooldown":
+        return None
+
+    retry_after = copilot_retry_after_ms(record, snapshot)
+    if now_ms() < retry_after:
+        summary = f"Copilot review errored; next re-request after {format_timestamp(retry_after)}"
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="idle",
+            last_run_summary=summary,
+            last_error=None,
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
+        )
+        record_event(
+            "info",
+            "copilot_review_cooldown",
+            summary,
+            tracked_pr_key=record.key,
+            details={"retry_after": retry_after, "error_url": (snapshot.get("copilot_review_error") or {}).get("url")},
+        )
+        return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False, "retry_after": retry_after}
+
+    attempted_at = now_ms()
+    update_tracked_pr(
+        record.key,
+        last_run_status="running",
+        last_run_summary="Re-requesting Copilot review after cooldown",
+        last_error=None,
+    )
+    request_result = request_copilot_review(record)
+    refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+    summary = "Re-requested Copilot review after cooldown"
+    if refreshed_snapshot["status"] == "copilot_review_cooldown":
+        summary += "; waiting for GitHub to reflect the new review request"
+    updated = update_tracked_pr(
+        record.key,
+        last_copilot_rerequested_at=attempted_at,
+        last_run_finished_at=now_ms(),
+        last_run_status="idle",
+        last_run_summary=summary,
+        last_error=None,
+        **state_payload(refreshed_snapshot, last_prompted_at=record.last_prompted_at),
+    )
+    record_event(
+        "info",
+        "copilot_review_rerequested",
+        summary,
+        tracked_pr_key=record.key,
+        details={"requested_at": attempted_at, "reviewer": request_result["reviewer"]},
+    )
+    return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": refreshed_snapshot, "triggered": False, "request": request_result}
+
+
 def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int | None) -> dict[str, Any]:
     record_event("info", "poll_started", f"Polling PR #{record.pr_number}", tracked_pr_key=record.key, details={"job_id": job_id})
     update_tracked_pr(
@@ -1608,6 +1713,10 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
         )
         record_event("info", "pr_closed", f"Archived tracking for {snapshot['pr']['state']} PR", tracked_pr_key=record.key, details=cleanup)
         return {"status": "closed", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "cleanup": cleanup}
+
+    cooldown_result = maybe_handle_copilot_review_cooldown(record, snapshot)
+    if cooldown_result is not None:
+        return cooldown_result
 
     should_run, reason = should_trigger_follow_up(record, snapshot, force_run=force_run)
     if not should_run:
@@ -1927,7 +2036,7 @@ def run_daemon(host: str, port: int, poll_seconds: int) -> None:
 def status_badge(status: str | None) -> str:
     value = html.escape(status or "unknown")
     cls = "pill"
-    if status in {"needs_review", "needs_ci_fix", "pending_copilot_review", "running", "queued", "busy"}:
+    if status in {"needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "running", "queued", "busy"}:
         cls = "pill warn"
     elif status in {"error", "closed"}:
         cls = "pill bad"
@@ -1964,6 +2073,11 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
     thread_controls = ""
     if record.provider == "codex":
         datalist_id = f"thread-options-{slugify(record.key)}"
+        thread_summary = compact_thread_text(
+            record.thread_title,
+            limit=72,
+            empty=record.thread_id,
+        )
         options = "".join(
             f'<option value="{html.escape(thread["id"])}" label="{html.escape(compact_thread_text(thread.get("title"), limit=120) + (" | in use by " + thread["in_use_by"] if thread.get("in_use_by") else ""))}"></option>'
             for thread in recent_threads
@@ -1980,47 +2094,60 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
         if not recent_summary:
             recent_summary = '<div class="small">No recent unarchived Codex threads were found for this repo.</div>'
         thread_controls = f"""
-          <div class="thread-controls">
-            <div class="thread-panel">
-              <div class="small">Attached Codex thread</div>
-              <div><code>{html.escape(record.thread_id)}</code></div>
-              <div class="small">Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.</div>
-              <div class="small stack">{html.escape(current_thread_title)}</div>
+          <details class="thread-disclosure">
+            <summary>
+              <span>Codex thread</span>
+              <span class="small"><code>{html.escape(record.thread_id[:8])}</code> {html.escape(thread_summary)}</span>
+            </summary>
+            <div class="thread-controls">
+              <div class="thread-panel">
+                <div class="small">Attached Codex thread</div>
+                <div><code>{html.escape(record.thread_id)}</code></div>
+                <div class="small">Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.</div>
+                <div class="small stack">{html.escape(current_thread_title)}</div>
+              </div>
+              <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'thread update queued')">
+                <label>Attach this PR to an existing Codex thread ID
+                  <input type="text" name="thread_id" list="{datalist_id}" value="{html.escape(record.thread_id)}" placeholder="Existing Codex thread ID">
+                </label>
+                <datalist id="{datalist_id}">{options}</datalist>
+                <button {actions_disabled}>Set attached thread</button>
+                <div class="small">Uses the exact thread ID you enter or choose below.</div>
+              </form>
+              <form method="post" action="/renew-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'latest thread queued')">
+                <button {actions_disabled}>Use latest repo thread</button>
+                <div class="small">Switches to the most recently updated unarchived Codex thread for this repo checkout.</div>
+              </form>
+              <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'fresh thread queued')">
+                <input type="hidden" name="thread_id" value="{NEW_CODEX_THREAD_SENTINEL}">
+                <button {actions_disabled}>Create fresh thread</button>
+                <div class="small">Creates a new Codex thread and attaches this PR to it.</div>
+              </form>
+              <div class="thread-panel">
+                <div class="small">Recent repo threads</div>
+                <div class="small">Suggestions from recent unarchived Codex threads in this repo. Titles below are stored thread titles/opening prompts, not latest replies.</div>
+                {recent_summary}
+              </div>
             </div>
-            <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'thread update queued')">
-              <label>Attach this PR to an existing Codex thread ID
-                <input type="text" name="thread_id" list="{datalist_id}" value="{html.escape(record.thread_id)}" placeholder="Existing Codex thread ID">
-              </label>
-              <datalist id="{datalist_id}">{options}</datalist>
-              <button {actions_disabled}>Set attached thread</button>
-              <div class="small">Uses the exact thread ID you enter or choose below.</div>
-            </form>
-            <form method="post" action="/renew-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'latest thread queued')">
-              <button {actions_disabled}>Use latest repo thread</button>
-              <div class="small">Switches to the most recently updated unarchived Codex thread for this repo checkout.</div>
-            </form>
-            <form method="post" action="/retarget-thread?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'fresh thread queued')">
-              <input type="hidden" name="thread_id" value="{NEW_CODEX_THREAD_SENTINEL}">
-              <button {actions_disabled}>Create fresh thread</button>
-              <div class="small">Creates a new Codex thread and attaches this PR to it.</div>
-            </form>
-            <div class="thread-panel">
-              <div class="small">Recent repo threads</div>
-              <div class="small">Suggestions from recent unarchived Codex threads in this repo. Titles below are stored thread titles/opening prompts, not latest replies.</div>
-              {recent_summary}
-            </div>
-          </div>
+          </details>
         """
     else:
+        thread_summary = compact_thread_text(record.thread_title, limit=72, empty=record.thread_id)
         thread_controls = f"""
-          <div class="thread-controls">
-            <div class="thread-panel">
-              <div class="small">Attached provider thread</div>
-              <div><code>{html.escape(record.thread_id)}</code></div>
-              <div class="small">Stored thread label</div>
-              <div class="small stack">{html.escape(compact_thread_text(record.thread_title, limit=240, empty="No stored thread label was found."))}</div>
+          <details class="thread-disclosure">
+            <summary>
+              <span>Provider thread</span>
+              <span class="small"><code>{html.escape(record.thread_id[:8])}</code> {html.escape(thread_summary)}</span>
+            </summary>
+            <div class="thread-controls">
+              <div class="thread-panel">
+                <div class="small">Attached provider thread</div>
+                <div><code>{html.escape(record.thread_id)}</code></div>
+                <div class="small">Stored thread label</div>
+                <div class="small stack">{html.escape(compact_thread_text(record.thread_title, limit=240, empty="No stored thread label was found."))}</div>
+              </div>
             </div>
-          </div>
+          </details>
         """
     return f"""
         <tr data-pr-key="{html.escape(record.key)}">
@@ -2536,7 +2663,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <label>Status
               <select name="status">
                 <option value="all" {"selected" if status_filter == "all" else ""}>All</option>
-                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "awaiting_final_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
+                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "awaiting_final_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
               </select>
             </label>
             <label>Sort
@@ -2824,6 +2951,9 @@ def html_page(title: str, body: str) -> bytes:
     .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
     .browser-panel[open] summary {{ margin-bottom: 12px; }}
     .refresh-controls {{ justify-content: space-between; margin: 12px 0 0; }}
+    .thread-disclosure {{ margin-top: 8px; }}
+    .thread-disclosure summary {{ cursor: pointer; display: flex; flex-direction: column; gap: 4px; }}
+    .thread-disclosure[open] summary {{ margin-bottom: 8px; }}
     .thread-controls {{ display: grid; gap: 8px; margin-top: 8px; }}
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
     .thread-panel {{ border: 1px solid var(--line); border-radius: 10px; background: #f8f3eb; padding: 10px 12px; }}

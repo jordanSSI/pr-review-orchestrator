@@ -28,11 +28,16 @@ COPILOT_LOGINS = {
     "copilot[bot]",
     "chatgpt-codex-connector[bot]",
 }
+COPILOT_REVIEW_REQUEST_LOGIN = "copilot-pull-request-reviewer"
 HANDLED_PR_COMMENT_MARKER = "pr-review-coordinator:handled-comment"
 AGENT_COMMENT_PREFIX = "[jordanBot]"
 AGENT_GITHUB_COMMENT_INSTRUCTION = (
     f"Any GitHub comment or review reply you post must begin with `{AGENT_COMMENT_PREFIX}`. "
     "This includes handled-comment replies and rationale-only replies."
+)
+COPILOT_RETRYABLE_ERROR_SNIPPETS = (
+    "copilot encountered an error and was unable to review this pull request",
+    "try again by re-requesting a review",
 )
 
 
@@ -246,6 +251,15 @@ def is_copilot_login(login: str | None) -> bool:
     return normalized in COPILOT_LOGINS or "copilot" in normalized or "codex-connector" in normalized
 
 
+def is_retryable_copilot_review_error(author_login: str | None, body: str | None) -> bool:
+    if not is_copilot_login(author_login):
+        return False
+    normalized_body = " ".join((body or "").lower().split())
+    if not normalized_body:
+        return False
+    return all(snippet in normalized_body for snippet in COPILOT_RETRYABLE_ERROR_SNIPPETS)
+
+
 def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     return fetch_pull_request_state(repo_root, repo_name, pr_number)
 
@@ -306,6 +320,18 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
                   body
                   createdAt
                   updatedAt
+                  url
+                }
+              }
+              reviews(first: 100) {
+                nodes {
+                  id
+                  author {
+                    login
+                  }
+                  body
+                  state
+                  submittedAt
                   url
                 }
               }
@@ -412,10 +438,61 @@ def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[
         if comment["id"]
         and comment["body"]
         and not comment["is_handler_comment"]
+        and not is_retryable_copilot_review_error(comment["author"], comment["body"])
         and comment["id"] not in handled_ids
     ]
     actionable.sort(key=lambda item: ((item["updatedAt"] or item["createdAt"] or ""), item["id"]))
     return actionable
+
+
+def serialize_latest_copilot_activity(pull_request: dict[str, Any]) -> dict[str, Any] | None:
+    activities: list[dict[str, Any]] = []
+
+    for review in pull_request.get("reviews", {}).get("nodes") or []:
+        author = (review.get("author") or {}).get("login")
+        if not is_copilot_login(author):
+            continue
+        activities.append(
+            {
+                "source": "review",
+                "id": review.get("id"),
+                "author": author,
+                "body": (review.get("body") or "").strip(),
+                "state": review.get("state"),
+                "createdAt": review.get("submittedAt"),
+                "url": review.get("url"),
+            }
+        )
+
+    for comment in pull_request.get("comments", {}).get("nodes") or []:
+        author = (comment.get("author") or {}).get("login")
+        if not is_copilot_login(author):
+            continue
+        activities.append(
+            {
+                "source": "comment",
+                "id": comment.get("id"),
+                "author": author,
+                "body": (comment.get("body") or "").strip(),
+                "state": None,
+                "createdAt": comment.get("updatedAt") or comment.get("createdAt"),
+                "url": comment.get("url"),
+            }
+        )
+
+    if not activities:
+        return None
+    activities.sort(key=lambda item: ((item.get("createdAt") or ""), item.get("id") or ""))
+    return activities[-1]
+
+
+def serialize_retryable_copilot_review_error(pull_request: dict[str, Any]) -> dict[str, Any] | None:
+    latest = serialize_latest_copilot_activity(pull_request)
+    if not latest:
+        return None
+    if not is_retryable_copilot_review_error(latest.get("author"), latest.get("body")):
+        return None
+    return latest
 
 
 def serialize_failing_checks(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
@@ -469,9 +546,12 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
     unresolved = serialize_unresolved_threads(pull_request)
     actionable_pr_comments = serialize_actionable_pr_comments(pull_request)
     failing_checks = serialize_failing_checks(pull_request)
+    copilot_review_error = serialize_retryable_copilot_review_error(pull_request)
     latest_comment_at = None
     latest_comment_candidates = [item["latest_comment_at"] or "" for item in unresolved]
     latest_comment_candidates.extend(item["updatedAt"] or item["createdAt"] or "" for item in actionable_pr_comments)
+    if copilot_review_error and copilot_review_error.get("createdAt"):
+        latest_comment_candidates.append(copilot_review_error["createdAt"])
     if latest_comment_candidates:
         latest_comment_at = max(latest_comment_candidates) or None
     review_requests = pull_request.get("reviewRequests", {}).get("nodes") or []
@@ -485,6 +565,8 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         status = "needs_ci_fix"
     elif pending_copilot_review:
         status = "pending_copilot_review"
+    elif copilot_review_error:
+        status = "copilot_review_cooldown"
     else:
         status = "awaiting_final_test"
     signature_payload = {
@@ -493,6 +575,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,
         "pending_copilot_review": pending_copilot_review,
+        "copilot_review_error": copilot_review_error,
     }
     signature = json.dumps(signature_payload, sort_keys=True)
     return {
@@ -506,6 +589,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "signature": signature,
         "latest_comment_at": latest_comment_at,
         "pending_copilot_review": pending_copilot_review,
+        "copilot_review_error": copilot_review_error,
         "unresolved_threads": unresolved,
         "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,

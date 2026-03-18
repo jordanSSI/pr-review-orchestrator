@@ -141,6 +141,7 @@ Agents using this tool should follow these rules:
 - Do not manually edit the coordinator database or lock files.
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
+- If the coordinator reports `copilot_review_cooldown`, Copilot returned a transient review error; the coordinator will wait about 15 minutes and then re-request `copilot-pull-request-reviewer` automatically.
 - If the coordinator reports `awaiting_final_review`, the PR is clean and the orchestrator has already completed its follow-up pass; use that as the human handoff point instead of inspecting PR body text.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
 - Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
@@ -254,6 +255,7 @@ Stops tracking a PR record.
 - `needs_review`: unresolved GitHub review feedback or actionable top-level PR comments exist and follow-up work may be needed
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
+- `copilot_review_cooldown`: Copilot returned its transient "unable to review" error; the coordinator is cooling down before re-requesting review automatically
 - `awaiting_final_review`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain after the orchestrator has already run follow-up for this PR
 - `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain, but the orchestrator has not yet run follow-up for this PR
 - `busy`: the coordinator intentionally skipped this PR because another run or local work appears to be in progress

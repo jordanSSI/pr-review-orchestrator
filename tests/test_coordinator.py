@@ -18,6 +18,7 @@ def make_pull_request(
     failing_check=False,
     review_author="github-copilot[bot]",
     pr_comments=None,
+    reviews=None,
 ):
     review_requests = []
     if pending_copilot:
@@ -66,6 +67,7 @@ def make_pull_request(
         "reviewRequests": {"nodes": review_requests},
         "reviewThreads": {"nodes": review_threads},
         "comments": {"nodes": pr_comments or []},
+        "reviews": {"nodes": reviews or []},
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": contexts}}}}]},
     }
 
@@ -107,6 +109,68 @@ class PullRequestSnapshotTests(unittest.TestCase):
     def test_review_comments_take_priority_over_ci_failures(self):
         snapshot = self.snapshot(make_pull_request(unresolved=True, failing_check=True))
         self.assertEqual(snapshot["status"], "needs_review")
+
+    def test_retryable_copilot_error_review_enters_cooldown(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "github-copilot[bot]"},
+                        "body": "Copilot encountered an error and was unable to review this pull request. You can try again by re-requesting a review.",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T03:00:00Z",
+                        "url": "https://example.com/review-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "copilot_review_cooldown")
+        self.assertEqual(snapshot["copilot_review_error"]["source"], "review")
+
+    def test_retryable_copilot_error_comment_is_not_actionable(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "github-copilot[bot]"},
+                        "body": "Copilot encountered an error and was unable to review this pull request. You can try again by re-requesting a review.",
+                        "createdAt": "2026-03-09T03:00:00Z",
+                        "updatedAt": "2026-03-09T03:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "copilot_review_cooldown")
+        self.assertEqual(snapshot["actionable_pr_comments"], [])
+
+    def test_stale_copilot_error_is_ignored_after_newer_copilot_activity(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "github-copilot[bot]"},
+                        "body": "Copilot encountered an error and was unable to review this pull request. You can try again by re-requesting a review.",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T03:00:00Z",
+                        "url": "https://example.com/review-1",
+                    },
+                    {
+                        "id": "review-2",
+                        "author": {"login": "github-copilot[bot]"},
+                        "body": "No issues found in the latest pass.",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T04:00:00Z",
+                        "url": "https://example.com/review-2",
+                    },
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertIsNone(snapshot["copilot_review_error"])
 
     def test_clean_green_pr(self):
         snapshot = self.snapshot(make_pull_request())
@@ -510,6 +574,9 @@ class DashboardRenderingTests(unittest.TestCase):
             recent_threads=[{"id": "thread-99", "title": "A recent thread title", "in_use_by": None}],
         )
 
+        self.assertIn('class="thread-disclosure"', markup)
+        self.assertNotIn('class="thread-disclosure" open', markup)
+        self.assertIn("Codex thread", markup)
         self.assertIn("Attached Codex thread", markup)
         self.assertIn("Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.", markup)
         self.assertIn("Set attached thread", markup)
@@ -919,7 +986,7 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.create_codex_thread = self.original_create_codex_thread
         self.temp_dir.cleanup()
 
-    def snapshot(self, status="needs_review", signature="sig-1"):
+    def snapshot(self, status="needs_review", signature="sig-1", *, pending_copilot_review=False, copilot_review_error=None):
         return {
             "status": status,
             "pr": {
@@ -930,7 +997,8 @@ class QueueBehaviorTests(unittest.TestCase):
             },
             "signature": signature,
             "latest_comment_at": "2026-03-09T00:00:00Z",
-            "pending_copilot_review": False,
+            "pending_copilot_review": pending_copilot_review,
+            "copilot_review_error": copilot_review_error,
             "unresolved_threads": [{"id": "thread-1"}] if status == "needs_review" else [],
             "actionable_pr_comments": [],
             "failing_checks": [],
@@ -978,6 +1046,82 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(result["status"], "idle")
         self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_test")
         self.assertEqual(result["tracked_pr"]["last_run_summary"], "PR is not currently actionable")
+
+    def test_poll_record_waits_during_copilot_review_cooldown(self):
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
+            status="copilot_review_cooldown",
+            signature="sig-cooldown",
+            copilot_review_error={
+                "id": "review-1",
+                "author": "github-copilot[bot]",
+                "body": "Copilot encountered an error and was unable to review this pull request. You can try again by re-requesting a review.",
+                "createdAt": "2026-03-09T00:00:00Z",
+                "url": "https://example.com/review-1",
+            },
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        with mock.patch.object(
+            pr_review_coordinator,
+            "now_ms",
+            return_value=pr_review_coordinator.parse_github_timestamp_ms("2026-03-09T00:10:00Z"),
+        ):
+            result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=104)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["tracked_pr"]["status"], "copilot_review_cooldown")
+        self.assertIn("next re-request after", result["tracked_pr"]["last_run_summary"])
+        self.assertEqual(pr_review_coordinator.list_pending_jobs(), [])
+
+    def test_poll_record_rerequests_copilot_review_after_cooldown(self):
+        snapshots = iter(
+            [
+                self.snapshot(
+                    status="copilot_review_cooldown",
+                    signature="sig-cooldown",
+                    copilot_review_error={
+                        "id": "review-1",
+                        "author": "github-copilot[bot]",
+                        "body": "Copilot encountered an error and was unable to review this pull request. You can try again by re-requesting a review.",
+                        "createdAt": "2026-03-09T00:00:00Z",
+                        "url": "https://example.com/review-1",
+                    },
+                ),
+                self.snapshot(
+                    status="pending_copilot_review",
+                    signature="sig-pending",
+                    pending_copilot_review=True,
+                ),
+            ]
+        )
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: next(snapshots)
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, cwd=None):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            return mock.Mock(stdout="", stderr="")
+
+        with mock.patch.object(pr_review_coordinator, "run", side_effect=fake_run):
+            with mock.patch.object(
+                pr_review_coordinator,
+                "now_ms",
+                return_value=pr_review_coordinator.parse_github_timestamp_ms("2026-03-09T00:16:00Z"),
+            ):
+                result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=105)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["tracked_pr"]["status"], "pending_copilot_review")
+        self.assertEqual(
+            captured["cmd"],
+            ["gh", "pr", "edit", "1", "--add-reviewer", "copilot-pull-request-reviewer"],
+        )
+        self.assertEqual(captured["cwd"], "/tmp/repo")
+        self.assertEqual(
+            result["tracked_pr"]["last_copilot_rerequested_at"],
+            pr_review_coordinator.parse_github_timestamp_ms("2026-03-09T00:16:00Z"),
+        )
+        self.assertEqual(pr_review_coordinator.list_pending_jobs(), [])
 
     def test_poll_all_job_fans_out_per_pr_poll_jobs(self):
         job_info = pr_review_coordinator.enqueue_job("poll-all", requested_by="test")
