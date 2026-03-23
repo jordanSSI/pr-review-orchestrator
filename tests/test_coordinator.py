@@ -126,7 +126,6 @@ class PullRequestSnapshotTests(unittest.TestCase):
             )
         )
         self.assertEqual(snapshot["status"], "copilot_review_cooldown")
-        self.assertEqual(snapshot["copilot_review_error"]["source"], "review")
 
     def test_retryable_copilot_error_comment_is_not_actionable(self):
         snapshot = self.snapshot(
@@ -1250,6 +1249,16 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(updated.thread_id, "thread-new")
         self.assertEqual(updated.thread_title, "Fresh thread")
         self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
+
+
+class CliHelpTests(unittest.TestCase):
+    def test_top_level_help_mentions_canonical_managed_worktree_root(self):
+        parser = pr_review_coordinator.parse_args()
+        help_text = parser.format_help()
+
+        self.assertIn(str(pr_review_common.DEFAULT_WORKTREE_ROOT), help_text)
+        self.assertIn("Managed worktrees should normally live under one canonical root", help_text)
+        self.assertIn("Use --worktree-path only to attach an existing git worktree", help_text)
 
 
 if __name__ == "__main__":

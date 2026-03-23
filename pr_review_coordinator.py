@@ -27,6 +27,8 @@ from pr_review_common import (
     AGENT_GITHUB_COMMENT_INSTRUCTION,
     CODEX_HOME,
     COPILOT_REVIEW_REQUEST_LOGIN,
+    DEFAULT_WORKTREE_LAYOUT,
+    DEFAULT_WORKTREE_ROOT,
     ScriptError,
     ensure_existing_worktree,
     ensure_worktree,
@@ -3001,11 +3003,28 @@ def emit(payload: dict[str, Any], output_format: str) -> None:
 
 
 def parse_args() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Track active PRs against Codex threads and coordinate review follow-up.\n\n"
+            f"Managed worktrees should normally live under one canonical root: {DEFAULT_WORKTREE_ROOT} "
+            f"(default layout: {DEFAULT_WORKTREE_LAYOUT}). Use --worktree-root or --worktree-layout only "
+            "when intentionally adopting a different long-lived location scheme. Use --worktree-path only "
+            "to attach an existing git worktree instead of creating a managed one."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    handoff = subparsers.add_parser("handoff", help="Create branch/commit/PR/worktree and register tracking.")
-    handoff.add_argument("--repo-root", required=True)
+    handoff = subparsers.add_parser(
+        "handoff",
+        help="Create branch/commit/PR/worktree and register tracking.",
+        description=(
+            "Create or reuse the PR, create or reuse a managed PR worktree under the canonical worktree root, "
+            "then register tracking for follow-up."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    handoff.add_argument("--repo-root", required=True, help="Absolute path to the stable primary repo checkout.")
     handoff.add_argument("--repo-name")
     handoff.add_argument("--branch", required=True)
     handoff.add_argument("--base-branch")
@@ -3015,21 +3034,66 @@ def parse_args() -> argparse.ArgumentParser:
     handoff.add_argument("--draft", action="store_true")
     handoff.add_argument("--thread-id")
     handoff.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
-    handoff.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
-    handoff.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
-    handoff.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
+    handoff.add_argument(
+        "--worktree-root",
+        default=str(DEFAULT_WORKTREE_ROOT),
+        help=(
+            f"Root for managed PR worktrees. Keep one canonical root across repos and runs "
+            f"(default: {DEFAULT_WORKTREE_ROOT})."
+        ),
+    )
+    handoff.add_argument(
+        "--worktree-layout",
+        choices=("nested", "sibling"),
+        default=DEFAULT_WORKTREE_LAYOUT,
+        help=(
+            f"Layout for managed worktrees under --worktree-root. Keep this stable for a repo "
+            f"(default: {DEFAULT_WORKTREE_LAYOUT})."
+        ),
+    )
+    handoff.add_argument(
+        "--worktree-path",
+        help="Adopt an existing registered git worktree. This bypasses managed worktree creation.",
+    )
     handoff.add_argument("--format", choices=("json", "text"), default="json")
 
-    track = subparsers.add_parser("track", help="Register an existing PR against the current agent thread (codex) or a synthetic thread (cursor).")
-    track.add_argument("--repo-root", required=True)
+    track = subparsers.add_parser(
+        "track",
+        help="Register an existing PR against the current agent thread (codex) or a synthetic thread (cursor).",
+        description=(
+            "Register an existing PR against the current agent thread. By default this creates or reuses a managed "
+            "PR worktree under the canonical worktree root; use --worktree-path only when attaching an already "
+            "existing git worktree."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    track.add_argument("--repo-root", required=True, help="Absolute path to the stable primary repo checkout.")
     track.add_argument("--repo-name")
     track.add_argument("--pr", required=True, type=int)
     track.add_argument("--branch", required=True)
     track.add_argument("--thread-id")
     track.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
-    track.add_argument("--worktree-root", default=str(CODEX_HOME / "worktrees" / "pr-review"))
-    track.add_argument("--worktree-layout", choices=("nested", "sibling"), default="nested")
-    track.add_argument("--worktree-path", help="Use an existing registered git worktree instead of creating one.")
+    track.add_argument(
+        "--worktree-root",
+        default=str(DEFAULT_WORKTREE_ROOT),
+        help=(
+            f"Root for managed PR worktrees. Keep one canonical root across repos and runs "
+            f"(default: {DEFAULT_WORKTREE_ROOT})."
+        ),
+    )
+    track.add_argument(
+        "--worktree-layout",
+        choices=("nested", "sibling"),
+        default=DEFAULT_WORKTREE_LAYOUT,
+        help=(
+            f"Layout for managed worktrees under --worktree-root. Keep this stable for a repo "
+            f"(default: {DEFAULT_WORKTREE_LAYOUT})."
+        ),
+    )
+    track.add_argument(
+        "--worktree-path",
+        help="Adopt an existing registered git worktree. This bypasses managed worktree creation.",
+    )
     track.add_argument("--format", choices=("json", "text"), default="json")
 
     poll = subparsers.add_parser("poll-once", help="Poll tracked PRs and resume threads when review changed.")
