@@ -24,12 +24,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from pr_review_common import (
-    AGENT_GITHUB_COMMENT_INSTRUCTION,
     CODEX_HOME,
     COPILOT_REVIEW_REQUEST_LOGIN,
     DEFAULT_WORKTREE_LAYOUT,
     DEFAULT_WORKTREE_ROOT,
     ScriptError,
+    agent_github_comment_instruction,
     ensure_existing_worktree,
     ensure_worktree,
     git_status_is_clean,
@@ -1567,6 +1567,7 @@ def summarize_ci_failures(failing_checks: list[dict[str, Any]]) -> str:
 
 
 def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
+    comment_instruction = agent_github_comment_instruction()
     return textwrap.dedent(
         f"""
         Continue this existing Codex thread for PR follow-up.
@@ -1584,7 +1585,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
         Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
-        {AGENT_GITHUB_COMMENT_INSTRUCTION}
+        {comment_instruction}
         If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
 
@@ -2165,7 +2166,9 @@ def run_daemon(host: str, port: int, poll_seconds: int) -> None:
 def status_badge(status: str | None) -> str:
     value = html.escape(status or "unknown")
     cls = "pill"
-    if status in {"needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "running", "queued", "busy"}:
+    if status in {"awaiting_final_review", "awaiting_final_test", "succeeded"}:
+        cls = "pill good"
+    elif status in {"needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "running", "queued", "busy"}:
         cls = "pill warn"
     elif status in {"error", "closed"}:
         cls = "pill bad"
@@ -2825,6 +2828,9 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
           }}
 
           function badgeClass(status) {{
+            if (['awaiting_final_review', 'awaiting_final_test', 'succeeded'].includes(status)) {{
+              return 'pill good';
+            }}
             if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
               return 'pill warn';
             }}
@@ -2839,9 +2845,11 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             return `<span class="${{badgeClass(value)}}">${{escapeHtml(value)}}</span>`;
           }}
 
+          let _flashTimer = null;
           function showFlash(message, tone='success') {{
             const flash = document.getElementById('flash');
             if (!flash) return;
+            if (_flashTimer) {{ clearTimeout(_flashTimer); _flashTimer = null; }}
             if (!message) {{
               flash.textContent = '';
               flash.className = 'flash hidden';
@@ -2849,6 +2857,9 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             }}
             flash.textContent = message;
             flash.className = tone === 'error' ? 'flash error' : 'flash success';
+            if (tone !== 'error') {{
+              _flashTimer = setTimeout(() => {{ flash.textContent = ''; flash.className = 'flash hidden'; }}, 4000);
+            }}
           }}
 
           function updateRefreshControls() {{
@@ -3180,6 +3191,9 @@ def render_import_shell(project_candidates: list[dict[str, Any]]) -> str:
           }}
 
           function badgeClass(status) {{
+            if (['awaiting_final_review', 'awaiting_final_test', 'succeeded'].includes(status)) {{
+              return 'pill good';
+            }}
             if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
               return 'pill warn';
             }}
@@ -3680,58 +3694,88 @@ def html_page(title: str, body: str) -> bytes:
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f3efe7;
-      --ink: #1f2933;
-      --muted: #5b6870;
-      --line: #d5cec3;
-      --card: #fffaf2;
-      --accent: #0f766e;
-      --warn: #b45309;
-      --bad: #b42318;
+      --bg: #f5f1eb;
+      --ink: #1a1f25;
+      --muted: #6b7280;
+      --line: #ddd6cc;
+      --card: #fffcf7;
+      --surface: #f0ebe3;
+      --accent: #0d7377;
+      --accent-hover: #0a5c5f;
+      --accent-soft: #d4efed;
+      --good: #15803d;
+      --good-soft: #dcfce7;
+      --warn: #92400e;
+      --warn-soft: #fef3c7;
+      --bad: #dc2626;
+      --bad-soft: #fee2e2;
+      --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+      --shadow-md: 0 4px 6px rgba(0,0,0,0.05), 0 2px 4px rgba(0,0,0,0.04);
+      --focus-ring: 0 0 0 3px rgba(13, 115, 119, 0.3);
+      --radius: 10px;
+      --radius-sm: 6px;
     }}
-    body {{ margin: 0; font: 14px/1.45 Menlo, Monaco, monospace; background: linear-gradient(180deg, #efe7da 0%, #f8f3eb 100%); color: var(--ink); }}
-    header {{ padding: 24px 28px 12px; }}
-    h1, h2 {{ margin: 0 0 12px; }}
-    p {{ margin: 6px 0 0; color: var(--muted); }}
-    main {{ padding: 0 28px 28px; }}
-    .nav-bar {{ display: flex; gap: 10px; margin: 16px 0 0; }}
-    .nav-link {{ display: inline-block; padding: 8px 12px; border-radius: 999px; background: #ebe3d4; color: var(--ink); text-decoration: none; }}
-    .nav-link.current {{ background: var(--accent); color: #fffaf2; }}
-    .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 12px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
-    button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 8px 12px; border-radius: 8px; cursor: pointer; font: inherit; }}
-    input[type="text"] {{ min-width: 360px; cursor: text; }}
-    input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; }}
-    button[disabled], select[disabled], input[disabled] {{ opacity: 0.6; cursor: not-allowed; }}
-    table {{ width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 18px; }}
-    th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }}
-    th {{ background: #ebe3d4; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{ margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }}
+    header {{ padding: 28px 32px 16px; background: var(--card); border-bottom: 1px solid var(--line); box-shadow: var(--shadow); }}
+    h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }}
+    h2 {{ margin: 0 0 10px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }}
+    p {{ margin: 4px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }}
+    main {{ padding: 24px 32px 40px; max-width: 1600px; }}
+    code {{ font: 13px/1.4 Menlo, Monaco, 'Cascadia Code', monospace; }}
+    a {{ color: var(--accent); }}
+    a:hover {{ color: var(--accent-hover); }}
+    .nav-bar {{ display: flex; gap: 6px; margin: 16px 0 0; }}
+    .nav-link {{ display: inline-block; padding: 7px 16px; border-radius: 999px; background: var(--surface); color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }}
+    .nav-link:hover {{ background: var(--line); color: var(--ink); }}
+    .nav-link.current {{ background: var(--accent); color: #fff; }}
+    .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 10px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
+    button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 7px 14px; border-radius: var(--radius-sm); cursor: pointer; font: inherit; font-size: 13px; color: var(--ink); transition: all 0.15s ease; }}
+    button:hover:not([disabled]) {{ background: var(--surface); border-color: #c5beb3; }}
+    button:active:not([disabled]) {{ transform: scale(0.98); }}
+    button:focus-visible, select:focus-visible, input:focus-visible {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
+    button.primary, button[data-action="run-one"], button[data-action="poll-all"], #queue-selected-prs {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }}
+    button.primary:hover:not([disabled]), button[data-action="run-one"]:hover:not([disabled]), button[data-action="poll-all"]:hover:not([disabled]), #queue-selected-prs:hover:not([disabled]) {{ background: var(--accent-hover); border-color: var(--accent-hover); }}
+    button[data-action="untrack-cleanup"] {{ color: var(--bad); border-color: rgba(220,38,38,0.25); }}
+    button[data-action="untrack-cleanup"]:hover:not([disabled]) {{ background: var(--bad-soft); border-color: var(--bad); }}
+    input[type="text"] {{ min-width: 340px; cursor: text; }}
+    input[type="text"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
+    input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; accent-color: var(--accent); }}
+    button[disabled], select[disabled], input[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
+    table {{ width: 100%; border-collapse: separate; border-spacing: 0; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-bottom: 24px; box-shadow: var(--shadow); }}
+    th, td {{ padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }}
+    th {{ background: var(--surface); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
     tr:last-child td {{ border-bottom: none; }}
-    .pill {{ display: inline-block; padding: 2px 8px; border-radius: 999px; background: #d7edea; color: var(--accent); }}
-    .warn {{ background: #fce7c3; color: var(--warn); }}
-    .bad {{ background: #f7d8d5; color: var(--bad); }}
-    .small {{ color: var(--muted); font-size: 12px; }}
+    tbody tr:hover {{ background: rgba(13, 115, 119, 0.03); }}
+    .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; background: var(--surface); color: var(--muted); white-space: nowrap; }}
+    .pill.good {{ background: var(--good-soft); color: var(--good); }}
+    .pill.warn {{ background: var(--warn-soft); color: var(--warn); }}
+    .pill.bad {{ background: var(--bad-soft); color: var(--bad); }}
+    .small {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
     .stack {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
-    .panel {{ background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 0 0 18px; }}
-    .flash {{ margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; background: #d7edea; color: var(--accent); }}
-    .flash.success {{ background: #d7edea; color: var(--accent); }}
-    .flash.error {{ background: #f7d8d5; color: var(--bad); }}
+    .muted {{ opacity: 0.6; }}
+    .panel {{ background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 24px; margin: 0 0 20px; box-shadow: var(--shadow); }}
+    .flash {{ margin: 14px 0 0; padding: 10px 16px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; border: 1px solid transparent; animation: flashIn 0.25s ease; }}
+    .flash.success {{ background: var(--accent-soft); color: var(--accent); border-color: rgba(13,115,119,0.2); }}
+    .flash.error {{ background: var(--bad-soft); color: var(--bad); border-color: rgba(220,38,38,0.2); }}
     .hidden {{ display: none; }}
+    @keyframes flashIn {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+    .refresh-controls {{ justify-content: space-between; margin: 14px 0 0; align-items: center; }}
     .bulk-track {{ display: block; }}
-    .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
+    .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-weight: 500; }}
     .browser-panel[open] summary {{ margin-bottom: 12px; }}
-    .refresh-controls {{ justify-content: space-between; margin: 12px 0 0; }}
     .thread-disclosure {{ margin-top: 8px; }}
-    .thread-disclosure summary {{ cursor: pointer; display: flex; flex-direction: column; gap: 4px; }}
+    .thread-disclosure summary {{ cursor: pointer; display: flex; flex-direction: column; gap: 4px; padding: 4px 0; border-radius: var(--radius-sm); }}
+    .thread-disclosure summary:hover {{ color: var(--accent); }}
     .thread-disclosure[open] summary {{ margin-bottom: 8px; }}
-    .thread-controls {{ display: grid; gap: 8px; margin-top: 8px; }}
+    .thread-controls {{ display: grid; gap: 10px; margin-top: 8px; }}
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
-    .thread-panel {{ border: 1px solid var(--line); border-radius: 10px; background: #f8f3eb; padding: 10px 12px; }}
+    .thread-panel {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 12px 14px; }}
     .thread-mode {{ display: grid; gap: 6px; }}
-    .button-stack {{ display: grid; gap: 8px; justify-items: start; }}
-    .muted {{ opacity: 0.65; }}
-    code {{ font: inherit; }}
+    .button-stack {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: start; }}
     form {{ display: inline; }}
-    label {{ display: flex; flex-direction: column; gap: 6px; }}
+    label {{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }}
+    label select, label input {{ font-size: 13px; color: var(--ink); }}
     label.inline-option {{ display: inline-flex; flex-direction: row; align-items: center; gap: 6px; }}
   </style>
 </head>

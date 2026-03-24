@@ -71,6 +71,16 @@ prc --help
 
 `prc` is a shorthand alias for `pr-review-coordinator`; both commands run the same CLI.
 
+On first install, the coordinator also bootstraps `~/.codex/pr-review-coordinator.json` with:
+
+```json
+{
+  "agent_nickname": "jordanBot"
+}
+```
+
+That nickname is used to enforce the required PR comment prefix, so agent-authored handled-comment replies default to `[jordanBot] ...`.
+
 ## Quickstart
 
 ### New PR handoff
@@ -148,6 +158,7 @@ Agents using this tool should follow these rules:
 - If the coordinator reports `awaiting_final_review`, the PR is clean and the orchestrator has already completed its follow-up pass; use that as the human handoff point instead of inspecting PR body text.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
 - Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
+- Agent-authored PR replies should begin with the configured prefix from `~/.codex/pr-review-coordinator.json`, which the installer bootstraps to `[jordanBot]` by default.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
 ## Guidance For Installed Agents

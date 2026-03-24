@@ -20,10 +20,23 @@ TARGET_BIN="$TARGET_DIR/pr-review-coordinator"
 TARGET_SHORT_BIN="$TARGET_DIR/prc"
 SHELL_RC="${PR_REVIEW_COORDINATOR_SHELL_RC:-$HOME/.zshrc}"
 LOGIN_SHELL_RC="${PR_REVIEW_COORDINATOR_LOGIN_SHELL_RC:-$HOME/.zprofile}"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+COORDINATOR_CONFIG="$CODEX_HOME_DIR/pr-review-coordinator.json"
 
 mkdir -p "$TARGET_DIR"
 ln -sfn "$SOURCE_BIN" "$TARGET_BIN"
 ln -sfn "$SOURCE_BIN" "$TARGET_SHORT_BIN"
+
+mkdir -p "$CODEX_HOME_DIR"
+BOOTSTRAPPED_CONFIG=0
+if [[ ! -f "$COORDINATOR_CONFIG" ]]; then
+  cat > "$COORDINATOR_CONFIG" <<'EOF'
+{
+  "agent_nickname": "jordanBot"
+}
+EOF
+  BOOTSTRAPPED_CONFIG=1
+fi
 
 if [[ "$TARGET_DIR" == "$HOME/.local/bin" ]]; then
   for rc_file in "$SHELL_RC" "$LOGIN_SHELL_RC"; do
@@ -41,6 +54,9 @@ fi
 
 echo "Installed pr-review-coordinator to $TARGET_BIN"
 echo "Installed prc to $TARGET_SHORT_BIN"
+if [[ "$BOOTSTRAPPED_CONFIG" == "1" ]]; then
+  echo "Bootstrapped coordinator config at $COORDINATOR_CONFIG with agent nickname jordanBot"
+fi
 if [[ "$TARGET_DIR" == "$HOME/.local/bin" ]]; then
   echo "Ensured $HOME/.local/bin is exported from $SHELL_RC and $LOGIN_SHELL_RC"
 fi

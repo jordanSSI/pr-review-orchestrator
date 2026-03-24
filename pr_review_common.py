@@ -22,6 +22,8 @@ AUTOMATIONS_DIR = CODEX_HOME / "automations"
 AUTOMATIONS_DB = CODEX_HOME / "sqlite" / "codex-dev.db"
 DEFAULT_WORKTREE_ROOT = CODEX_HOME / "worktrees" / "pr-review"
 DEFAULT_WORKTREE_LAYOUT = "nested"
+PR_REVIEW_COORDINATOR_CONFIG = CODEX_HOME / "pr-review-coordinator.json"
+DEFAULT_AGENT_NICKNAME = "jordanBot"
 COPILOT_LOGINS = {
     "copilot-pull-request-reviewer[bot]",
     "github-copilot[bot]",
@@ -30,11 +32,6 @@ COPILOT_LOGINS = {
 }
 COPILOT_REVIEW_REQUEST_LOGIN = "copilot-pull-request-reviewer"
 HANDLED_PR_COMMENT_MARKER = "pr-review-coordinator:handled-comment"
-AGENT_COMMENT_PREFIX = "[jordanBot]"
-AGENT_GITHUB_COMMENT_INSTRUCTION = (
-    f"Any GitHub comment or review reply you post must begin with `{AGENT_COMMENT_PREFIX}`. "
-    "This includes handled-comment replies and rationale-only replies."
-)
 COPILOT_RETRYABLE_ERROR_SNIPPETS = (
     "copilot encountered an error and was unable to review this pull request",
     "try again by re-requesting a review",
@@ -43,6 +40,57 @@ COPILOT_RETRYABLE_ERROR_SNIPPETS = (
 
 class ScriptError(RuntimeError):
     """Raised for expected script failures."""
+
+
+def load_pr_review_coordinator_config() -> dict[str, Any]:
+    if not PR_REVIEW_COORDINATOR_CONFIG.exists():
+        return {}
+    try:
+        return json.loads(PR_REVIEW_COORDINATOR_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def normalize_agent_comment_prefix(value: str | None) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        return ""
+    if normalized.startswith("[") and normalized.endswith("]"):
+        return normalized
+    return f"[{normalized}]"
+
+
+def resolve_agent_comment_prefix() -> str:
+    env_prefix = normalize_agent_comment_prefix(os.environ.get("PR_REVIEW_COORDINATOR_AGENT_COMMENT_PREFIX"))
+    if env_prefix:
+        return env_prefix
+
+    env_nickname = normalize_agent_comment_prefix(os.environ.get("PR_REVIEW_COORDINATOR_AGENT_NICKNAME"))
+    if env_nickname:
+        return env_nickname
+
+    config = load_pr_review_coordinator_config()
+    config_prefix = normalize_agent_comment_prefix(str(config.get("agent_comment_prefix") or ""))
+    if config_prefix:
+        return config_prefix
+
+    config_nickname = normalize_agent_comment_prefix(str(config.get("agent_nickname") or ""))
+    if config_nickname:
+        return config_nickname
+
+    return normalize_agent_comment_prefix(DEFAULT_AGENT_NICKNAME)
+
+
+def agent_github_comment_instruction() -> str:
+    prefix = resolve_agent_comment_prefix()
+    return (
+        f"Any GitHub comment or review reply you post must begin with `{prefix}`. "
+        "This includes handled-comment replies and rationale-only replies."
+    )
+
+
+AGENT_COMMENT_PREFIX = resolve_agent_comment_prefix()
+AGENT_GITHUB_COMMENT_INSTRUCTION = agent_github_comment_instruction()
 
 
 def project_dir() -> Path:
@@ -400,7 +448,7 @@ def serialize_unresolved_threads(pull_request: dict[str, Any]) -> list[dict[str,
 def extract_handled_pr_comment_ids(body: str | None) -> set[str]:
     if not body:
         return set()
-    if not body.lstrip().startswith(AGENT_COMMENT_PREFIX):
+    if not body.lstrip().startswith(resolve_agent_comment_prefix()):
         return set()
     matches = re.findall(rf"{re.escape(HANDLED_PR_COMMENT_MARKER)}\s+([A-Za-z0-9_=:-]+)", body)
     return {match.strip() for match in matches if match.strip()}
@@ -854,12 +902,13 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
 
 def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict[str, Any]:
     codex_bin = resolve_codex_executable()
+    comment_instruction = agent_github_comment_instruction()
     prompt = textwrap.dedent(
         f"""
         You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
         Handle unresolved GitHub review feedback, actionable top-level PR comments, and completed failing CI checks on the current branch.
         Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer chatgpt-codex-connector (or copilot-pull-request-reviewer where required) when more review is needed, and resolve threads only after the fix is pushed.
-        {AGENT_GITHUB_COMMENT_INSTRUCTION}
+        {comment_instruction}
         If you addressed a top-level PR comment, reply on the PR after pushing with a short note that includes `<!-- {HANDLED_PR_COMMENT_MARKER} COMMENT_ID -->` for each handled comment ID.
 
         If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.

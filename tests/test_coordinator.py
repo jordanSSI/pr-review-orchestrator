@@ -249,6 +249,42 @@ class PullRequestSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "needs_review")
         self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
 
+    def test_handled_marker_uses_configured_prefix(self):
+        original_config = pr_review_common.PR_REVIEW_COORDINATOR_CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "pr-review-coordinator.json"
+                config_path.write_text('{"agent_nickname":"reviewBot"}', encoding="utf-8")
+                pr_review_common.PR_REVIEW_COORDINATOR_CONFIG = config_path
+
+                snapshot = self.snapshot(
+                    make_pull_request(
+                        pr_comments=[
+                            {
+                                "id": "issue-comment-1",
+                                "author": {"login": "jordanSSI"},
+                                "body": "Please resolve merge conflicts with master.",
+                                "createdAt": "2026-03-09T01:00:00Z",
+                                "updatedAt": "2026-03-09T01:00:00Z",
+                                "url": "https://example.com/comment-1",
+                            },
+                            {
+                                "id": "issue-comment-2",
+                                "author": {"login": "jordanSSI"},
+                                "body": "[reviewBot] Merged master and resolved conflicts. <!-- pr-review-coordinator:handled-comment issue-comment-1 -->",
+                                "createdAt": "2026-03-09T02:00:00Z",
+                                "updatedAt": "2026-03-09T02:00:00Z",
+                                "url": "https://example.com/comment-2",
+                            },
+                        ]
+                    )
+                )
+
+                self.assertEqual(snapshot["status"], "awaiting_final_test")
+                self.assertEqual(snapshot["actionable_pr_comments"], [])
+        finally:
+            pr_review_common.PR_REVIEW_COORDINATOR_CONFIG = original_config
+
 
 class CodexBinaryResolutionTests(unittest.TestCase):
     def test_prefers_codex_bin_override(self):
@@ -349,6 +385,17 @@ class PromptInstructionTests(unittest.TestCase):
 
 
 class WorktreePathTests(unittest.TestCase):
+    def test_resolve_agent_comment_prefix_uses_bootstrapped_config(self):
+        original_config = pr_review_common.PR_REVIEW_COORDINATOR_CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "pr-review-coordinator.json"
+                config_path.write_text('{"agent_nickname":"reviewBot"}', encoding="utf-8")
+                pr_review_common.PR_REVIEW_COORDINATOR_CONFIG = config_path
+                self.assertEqual(pr_review_common.resolve_agent_comment_prefix(), "[reviewBot]")
+        finally:
+            pr_review_common.PR_REVIEW_COORDINATOR_CONFIG = original_config
+
     def test_nested_layout_keeps_repo_subdirectory_shape(self):
         path = pr_review_common.worktree_path(
             "starshipit-wms",
