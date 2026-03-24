@@ -17,11 +17,13 @@ fi
 
 TARGET_DIR="${PR_REVIEW_COORDINATOR_BIN_DIR:-$DEFAULT_TARGET_DIR}"
 TARGET_BIN="$TARGET_DIR/pr-review-coordinator"
+TARGET_SHORT_BIN="$TARGET_DIR/prc"
 SHELL_RC="${PR_REVIEW_COORDINATOR_SHELL_RC:-$HOME/.zshrc}"
 LOGIN_SHELL_RC="${PR_REVIEW_COORDINATOR_LOGIN_SHELL_RC:-$HOME/.zprofile}"
 
 mkdir -p "$TARGET_DIR"
 ln -sfn "$SOURCE_BIN" "$TARGET_BIN"
+ln -sfn "$SOURCE_BIN" "$TARGET_SHORT_BIN"
 
 if [[ "$TARGET_DIR" == "$HOME/.local/bin" ]]; then
   for rc_file in "$SHELL_RC" "$LOGIN_SHELL_RC"; do
@@ -38,9 +40,12 @@ if [[ "$TARGET_DIR" == "$HOME/.local/bin" ]]; then
 fi
 
 echo "Installed pr-review-coordinator to $TARGET_BIN"
+echo "Installed prc to $TARGET_SHORT_BIN"
 if [[ "$TARGET_DIR" == "$HOME/.local/bin" ]]; then
   echo "Ensured $HOME/.local/bin is exported from $SHELL_RC and $LOGIN_SHELL_RC"
 fi
 echo
 echo "Verify:"
+echo "  prc --help"
+echo "  # or"
 echo "  pr-review-coordinator --help"

@@ -54,6 +54,7 @@ From the `pr-review-orchestrator` repository:
 By default, the installer will:
 - use `/usr/local/bin` if it is writable
 - otherwise fall back to `~/.local/bin`
+- install both `pr-review-coordinator` and the shorthand alias `prc`
 - add `~/.local/bin` to `~/.zshrc` and `~/.zprofile` when needed
 
 If you want a different target directory, set `PR_REVIEW_COORDINATOR_BIN_DIR` first:
@@ -65,8 +66,10 @@ PR_REVIEW_COORDINATOR_BIN_DIR="$HOME/bin" ./install.sh
 Verify the install:
 
 ```bash
-pr-review-coordinator --help
+prc --help
 ```
+
+`prc` is a shorthand alias for `pr-review-coordinator`; both commands run the same CLI.
 
 ## Quickstart
 
@@ -83,7 +86,7 @@ Use `handoff` when your local coding pass is done and you want the coordinator t
 Example (defaults to Codex):
 
 ```bash
-pr-review-coordinator handoff \
+prc handoff \
   --repo-root /absolute/path/to/your/repo \
   --branch feat/example-change \
   --commit-message "Add example change" \
@@ -96,7 +99,7 @@ pr-review-coordinator handoff \
 Use `track` when the PR and worktree already exist and you only need to attach them to the current agent thread (Codex by default; use `--provider cursor` for Cursor):
 
 ```bash
-pr-review-coordinator track \
+prc track \
   --repo-root /absolute/path/to/your/repo \
   --pr 123 \
   --branch feat/example-change
@@ -107,7 +110,7 @@ pr-review-coordinator track \
 Run both processes together for local development:
 
 ```bash
-pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
+prc serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 ```
 
 Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
@@ -115,14 +118,14 @@ Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 For independent restarts:
 
 ```bash
-pr-review-coordinator daemon --host 127.0.0.1 --port 8765 --poll-seconds 300
-pr-review-coordinator web --host 127.0.0.1 --port 8765
+prc daemon --host 127.0.0.1 --port 8765 --poll-seconds 300
+prc web --host 127.0.0.1 --port 8765
 ```
 
 ## Operational Model
 
 1. Do initial work in a normal Codex thread for a repo.
-2. When the change is ready, run `pr-review-coordinator handoff ...` from that same thread.
+2. When the change is ready, run `prc handoff ...` from that same thread.
 3. The handoff command captures `CODEX_THREAD_ID`, creates or reuses the PR, creates the dedicated PR worktree, and registers `repo + PR + branch + worktree + thread_id`.
 4. The daemon queues lightweight per-PR poll jobs that fetch unresolved review feedback, Copilot review state, and completed failing CI.
 5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
@@ -135,7 +138,7 @@ pr-review-coordinator web --host 127.0.0.1 --port 8765
 Agents using this tool should follow these rules:
 - Prefer `handoff` for the first transition from local implementation to PR lifecycle.
 - Prefer `track` only when the PR already exists and should be attached to the current thread.
-- Use the `pr-review-coordinator` PATH command rather than a machine-specific local path.
+- Use the `prc` PATH command for brevity; `pr-review-coordinator` remains supported and equivalent.
 - Active PRs must not share the same Codex thread.
 - Treat the tracked worktree as the only location for automated review follow-up changes.
 - Do not manually edit the coordinator database or lock files.
@@ -157,14 +160,14 @@ Recommended wording:
 
 ```md
 ## Pull Request Lifecycle
-- Use the `pr-review-coordinator` PATH command for orchestrator actions; do not hard-code a machine-specific local filesystem path in instructions, comments, or PR descriptions.
-- Use `pr-review-coordinator handoff ...` as the preferred single-step path for branch, commit, PR, dedicated worktree, and tracking.
-- If handoff partially succeeds, switch the main checkout back to the base branch, create or confirm the PR worktree, then run `pr-review-coordinator track ...`.
+- Use the `prc` PATH command for orchestrator actions; `pr-review-coordinator` remains supported, but prefer the shorthand in examples and instructions.
+- Use `prc handoff ...` as the preferred single-step path for branch, commit, PR, dedicated worktree, and tracking.
+- If handoff partially succeeds, switch the main checkout back to the base branch, create or confirm the PR worktree, then run `prc track ...`.
 - The coordinator follows up on both GitHub review feedback and completed failing CI failures.
 ```
 
 Preferred conventions:
-- refer to the command as `pr-review-coordinator`
+- refer to the command as `prc` when brevity helps, and mention `pr-review-coordinator` as the equivalent long form when clarity matters
 - describe it as a PATH command
 - avoid `/Users/...` examples
 - avoid placeholders like `PATH_TO_PR_REVIEW_COORDINATOR` when the installer is expected to put the command on `PATH`
@@ -176,7 +179,7 @@ Preferred conventions:
 Creates or updates the branch/PR handoff and registers tracking.
 
 ```bash
-pr-review-coordinator handoff \
+prc handoff \
   --repo-root /absolute/path/to/your/repo \
   --branch feat/example-change \
   --commit-message "Add example change" \
@@ -199,7 +202,7 @@ Common options:
 Registers an already-open PR and worktree against the current agent thread (Codex by default). Use `--provider cursor` to use Cursor for follow-up; when `--provider` is not provided, it defaults to **codex**.
 
 ```bash
-pr-review-coordinator track \
+prc track \
   --repo-root /absolute/path/to/your/repo \
   --pr 123 \
   --branch feat/example-change
@@ -210,7 +213,7 @@ pr-review-coordinator track \
 Runs one review poll tick.
 
 ```bash
-pr-review-coordinator poll-once --dry-run
+prc poll-once --dry-run
 ```
 
 Use `--dry-run` to inspect what would happen without queuing or resuming the agent (Codex or Cursor).
@@ -220,7 +223,7 @@ Use `--dry-run` to inspect what would happen without queuing or resuming the age
 Lists tracked PRs and current stored state.
 
 ```bash
-pr-review-coordinator status --all
+prc status --all
 ```
 
 ### `serve`
@@ -228,7 +231,7 @@ pr-review-coordinator status --all
 Runs the daemon and web UI together for compatibility.
 
 ```bash
-pr-review-coordinator serve --host 127.0.0.1 --port 8765 --poll-seconds 300
+prc serve --host 127.0.0.1 --port 8765 --poll-seconds 300
 ```
 
 ### `daemon`
