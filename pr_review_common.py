@@ -454,22 +454,30 @@ def extract_handled_pr_comment_ids(body: str | None) -> set[str]:
     return {match.strip() for match in matches if match.strip()}
 
 
+def is_linear_linkback_comment(author: str | None, body: str | None) -> bool:
+    if author != "linear" or not body:
+        return False
+    return body.lstrip().startswith("<!-- linear-linkback -->")
+
+
 def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
     comments = pull_request.get("comments", {}).get("nodes") or []
     handled_ids: set[str] = set()
     comment_summaries: list[dict[str, Any]] = []
     for comment in comments:
         body = (comment.get("body") or "").strip()
+        author = (comment.get("author") or {}).get("login")
         handled_ids.update(extract_handled_pr_comment_ids(body))
         comment_summaries.append(
             {
                 "id": comment.get("id"),
-                "author": (comment.get("author") or {}).get("login"),
+                "author": author,
                 "body": body,
                 "createdAt": comment.get("createdAt"),
                 "updatedAt": comment.get("updatedAt"),
                 "url": comment.get("url"),
                 "is_handler_comment": HANDLED_PR_COMMENT_MARKER in body,
+                "is_linear_linkback": is_linear_linkback_comment(author, body),
             }
         )
 
@@ -486,6 +494,7 @@ def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[
         if comment["id"]
         and comment["body"]
         and not comment["is_handler_comment"]
+        and not comment["is_linear_linkback"]
         and not is_retryable_copilot_review_error(comment["author"], comment["body"])
         and comment["id"] not in handled_ids
     ]

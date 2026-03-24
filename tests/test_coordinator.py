@@ -197,6 +197,42 @@ class PullRequestSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "needs_review")
         self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
 
+    def test_linear_linkback_comment_is_not_actionable(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "linear"},
+                        "body": "<!-- linear-linkback -->\n<details>\n<summary><a href=\"https://linear.app/ssi/issue/SSI-4070/example\">SSI-4070 Example</a></summary>\n<p>Context</p>\n</details>",
+                        "createdAt": "2026-03-09T01:00:00Z",
+                        "updatedAt": "2026-03-09T01:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertEqual(snapshot["actionable_pr_comments"], [])
+
+    def test_non_linkback_linear_comment_still_triggers_needs_review(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "linear"},
+                        "body": "Please review this follow-up before merging.",
+                        "createdAt": "2026-03-09T01:00:00Z",
+                        "updatedAt": "2026-03-09T01:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
+
     def test_handled_marker_comment_suppresses_prior_pr_comment(self):
         snapshot = self.snapshot(
             make_pull_request(
