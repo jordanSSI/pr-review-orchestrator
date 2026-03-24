@@ -69,6 +69,20 @@ PRIORITY_ORDER = {
     "closed": 10,
     "error": 11,
 }
+WEB_STATUS_FILTERS = [
+    "needs_review",
+    "needs_ci_fix",
+    "pending_copilot_review",
+    "copilot_review_cooldown",
+    "awaiting_final_review",
+    "awaiting_final_test",
+    "queued",
+    "busy",
+    "error",
+    "untracked",
+]
+WEB_SORT_KEYS = {"updated", "status", "pr", "last_poll"}
+WEB_SCOPE_VALUES = {"active", "archived", "all"}
 
 
 SCHEMA = """
@@ -353,6 +367,119 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "provider": record.provider,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+    }
+
+
+def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
+    data = dict(job) if isinstance(job, dict) else dict(job.__dict__)
+    return {
+        "id": data["id"],
+        "action": data["action"],
+        "tracked_pr_key": data.get("tracked_pr_key"),
+        "status": data["status"],
+        "requested_at": data.get("requested_at"),
+        "requested_at_label": format_timestamp(data.get("requested_at")),
+        "started_at": data.get("started_at"),
+        "started_at_label": format_timestamp(data.get("started_at")),
+        "finished_at": data.get("finished_at"),
+        "finished_at_label": format_timestamp(data.get("finished_at")),
+        "requested_by": data.get("requested_by"),
+        "result_summary": data.get("result_summary"),
+        "error": data.get("error"),
+    }
+
+
+def event_to_dict(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": event.get("id"),
+        "created_at": event.get("created_at"),
+        "created_at_label": format_timestamp(event.get("created_at")),
+        "level": event.get("level"),
+        "event_type": event.get("event_type"),
+        "tracked_pr_key": event.get("tracked_pr_key") or "",
+        "message": event.get("message") or "",
+    }
+
+
+def thread_option_to_dict(thread: dict[str, Any]) -> dict[str, Any]:
+    title = thread.get("title")
+    return {
+        "id": thread["id"],
+        "short_id": thread["id"][:8],
+        "title": title,
+        "summary": compact_thread_text(title, limit=120),
+        "in_use_by": thread.get("in_use_by"),
+        "conflict": bool(thread.get("conflict")),
+    }
+
+
+def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None = None, recent_threads: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    pending_jobs = pending_jobs or []
+    recent_threads = recent_threads or []
+    details = []
+    if record.unresolved_thread_count:
+        details.append(f"{record.unresolved_thread_count} review thread(s)")
+    if record.actionable_comment_count:
+        details.append(f"{record.actionable_comment_count} PR comment(s)")
+    if record.failing_check_count:
+        details.append(f"{record.failing_check_count} failing check(s)")
+    if record.ci_summary:
+        details.append(record.ci_summary)
+    pending_text = describe_pending_jobs(record, pending_jobs)
+    if pending_text:
+        details.append(f"pending: {pending_text}")
+    thread_summary = compact_thread_text(
+        record.thread_title,
+        limit=72,
+        empty=record.thread_id,
+    )
+    return {
+        "key": record.key,
+        "status": record.status,
+        "repo_name": record.repo_name,
+        "pr_number": record.pr_number,
+        "pr_url": record.pr_url,
+        "pr_title": record.pr_title,
+        "branch": record.branch,
+        "provider": record.provider or "codex",
+        "worktree_path": record.worktree_path,
+        "detail_text": " | ".join(details),
+        "run_status": record.run_state or record.last_run_status or "unknown",
+        "run_summary": record.last_run_summary or "",
+        "last_polled_at": record.last_polled_at,
+        "last_polled_label": format_timestamp(record.last_polled_at),
+        "actions_disabled": bool(pending_jobs),
+        "thread": {
+            "id": record.thread_id,
+            "short_id": record.thread_id[:8],
+            "summary": thread_summary,
+            "title": compact_thread_text(
+                record.thread_title,
+                limit=240,
+                empty="No stored Codex thread title was found for this thread." if record.provider == "codex" else "No stored thread label was found.",
+            ),
+            "provider": record.provider or "codex",
+            "recent_threads": [thread_option_to_dict(thread) for thread in recent_threads],
+        },
+    }
+
+
+def serialize_import_pr(pr: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "number": pr["number"],
+        "url": pr["url"],
+        "title": pr["title"],
+        "headRefName": pr["headRefName"],
+        "baseRefName": pr.get("baseRefName"),
+        "isDraft": bool(pr.get("isDraft")),
+        "state": pr.get("state") or "OPEN",
+        "tracked": bool(pr.get("tracked")),
+        "tracked_status": pr.get("tracked_status"),
+        "tracked_active": bool(pr.get("tracked_active")),
+        "tracked_key": pr.get("tracked_key"),
+        "tracked_thread_id": pr.get("tracked_thread_id"),
+        "tracked_thread_title": pr.get("tracked_thread_title"),
+        "tracked_provider": pr.get("tracked_provider"),
     }
 
 
@@ -2341,10 +2468,1047 @@ def sort_records(records: list[TrackedPR], sort_key: str) -> list[TrackedPR]:
     return sorted(records, key=lambda record: record.updated_at, reverse=True)
 
 
+def normalize_dashboard_scope(value: str | None) -> str:
+    scope = (value or "active").strip().lower()
+    return scope if scope in WEB_SCOPE_VALUES else "active"
+
+
+def normalize_dashboard_status_filter(value: str | None) -> str:
+    status_filter = (value or "all").strip()
+    return status_filter if status_filter == "all" or status_filter in WEB_STATUS_FILTERS else "all"
+
+
+def normalize_dashboard_sort_key(value: str | None) -> str:
+    sort_key = (value or "updated").strip()
+    return sort_key if sort_key in WEB_SORT_KEYS else "updated"
+
+
+def build_dashboard_payload(scope: str, status_filter: str, sort_key: str) -> dict[str, Any]:
+    normalized_scope = normalize_dashboard_scope(scope)
+    normalized_status_filter = normalize_dashboard_status_filter(status_filter)
+    normalized_sort_key = normalize_dashboard_sort_key(sort_key)
+    records = list_tracked_prs(active_only=False)
+    if normalized_scope == "active":
+        records = [record for record in records if record.active]
+    elif normalized_scope == "archived":
+        records = [record for record in records if not record.active]
+    if normalized_status_filter != "all":
+        records = [record for record in records if record.status == normalized_status_filter]
+    pending_jobs = pending_jobs_by_pr()
+    thread_candidates_by_repo = {
+        repo_root: list_recent_threads_for_repo(repo_root)
+        for repo_root in {record.repo_root for record in records if record.provider == "codex"}
+    }
+    return {
+        "filters": {
+            "scope": normalized_scope,
+            "status": normalized_status_filter,
+            "sort": normalized_sort_key,
+        },
+        "records": [
+            serialize_dashboard_record(record, pending_jobs.get(record.key, []), thread_candidates_by_repo.get(record.repo_root, []))
+            for record in sort_records(records, normalized_sort_key)
+        ],
+        "jobs": [job_to_dict(job) for job in list_recent_jobs(15)],
+        "events": [event_to_dict(event) for event in list_recent_events(20)],
+    }
+
+
+def build_import_payload(project_root: str, provider: str) -> dict[str, Any]:
+    selected_provider = (provider or "codex").strip().lower() or "codex"
+    requested_root = (project_root or "").strip()
+    payload: dict[str, Any] = {
+        "ok": False,
+        "repo_root": requested_root,
+        "provider": selected_provider,
+        "repo_name": None,
+        "repo_owner": None,
+        "threads": [],
+        "prs": [],
+        "error": None,
+    }
+    if not requested_root:
+        payload["error"] = "Enter a local git checkout path."
+        return payload
+    resolved_root = canonical_repo_root(requested_root)
+    if not resolved_root:
+        payload["error"] = f"Not a local git checkout: {requested_root}"
+        return payload
+    try:
+        browse_result = list_open_pull_requests_for_repo(resolved_root)
+        browse_threads = list_recent_threads_for_repo(resolved_root)
+    except ScriptError as exc:
+        payload["repo_root"] = resolved_root
+        payload["error"] = str(exc)
+        return payload
+    payload.update(
+        {
+            "ok": True,
+            "repo_root": browse_result["repo_root"],
+            "repo_name": browse_result["repo_name"],
+            "repo_owner": browse_result["repo_owner"],
+            "threads": [thread_option_to_dict(thread) for thread in browse_threads],
+            "prs": [serialize_import_pr(pr) for pr in browse_result["prs"]],
+        }
+    )
+    return payload
+
+
+def queue_simple_web_action(action: str, *, key: str | None, payload: dict[str, Any] | None = None, requested_by: str = "web") -> tuple[int, dict[str, Any]]:
+    if action != "poll-all" and not key:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    job = enqueue_job(action, tracked_pr_key=key if action != "poll-all" else None, requested_by=requested_by, payload=payload)
+    job_data = job["job"]
+    return HTTPStatus.ACCEPTED, {
+        "ok": True,
+        "message": f"Queued {action.replace('-', ' ')}.",
+        "job_id": job_data["id"],
+        "tracked_pr_key": key if action != "poll-all" else None,
+    }
+
+
+def queue_track_open_from_request(params: dict[str, list[str]], *, requested_by: str = "web") -> tuple[int, dict[str, Any]]:
+    repo_root = (params.get("project_root", [""])[0] or "").strip()
+    repo_name = (params.get("repo_name", [""])[0] or "").strip() or None
+    provider = (params.get("provider", ["codex"])[0] or "codex").strip().lower() or "codex"
+    if not repo_root:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "Project repo is required."}
+    queued = 0
+    job_ids: list[int] = []
+    resolved_threads: dict[int, dict[str, Any]] = {}
+    thread_collisions: dict[str, list[int]] = {}
+    for value in params.get("selected_pr", []):
+        try:
+            pr_number = int(value)
+        except ValueError:
+            continue
+        branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
+        if not repo_root or not branch:
+            continue
+        thread_strategy = (params.get(f"thread_strategy_{pr_number}", [""])[0] or "").strip() or None
+        requested_new_thread = bool(params.get(f"new_thread_{pr_number}", []))
+        existing_thread_id = (params.get(f"existing_thread_id_{pr_number}", [""])[0] or "").strip() or None
+        requested_thread_id = (params.get(f"thread_id_{pr_number}", [""])[0] or "").strip() or None
+        if provider != "codex":
+            continue
+        if thread_strategy == "keep_current":
+            requested_thread_id = existing_thread_id
+        elif thread_strategy == "latest_repo":
+            requested_thread_id = None
+        elif thread_strategy == "specific_thread":
+            if not requested_thread_id:
+                return HTTPStatus.BAD_REQUEST, {
+                    "ok": False,
+                    "message": f"PR #{pr_number}: enter an existing Codex thread ID or choose a different thread action.",
+                }
+        elif thread_strategy == "fresh_thread":
+            requested_new_thread = True
+        if requested_thread_id == NEW_CODEX_THREAD_SENTINEL:
+            requested_new_thread = True
+        if requested_new_thread:
+            resolved_threads[pr_number] = {"id": NEW_CODEX_THREAD_SENTINEL, "title": "Fresh Codex thread"}
+            continue
+        if not requested_thread_id and existing_thread_id:
+            requested_thread_id = existing_thread_id
+        try:
+            thread = resolve_selected_thread(repo_root, provider, requested_thread_id, prefer_latest_when_empty=True)
+            key = tracked_pr_key(repo_name or ensure_repo_name(repo_root, None)[1], pr_number)
+            assert_thread_available(thread["id"], key)
+            resolved_threads[pr_number] = thread
+            thread_collisions.setdefault(thread["id"], []).append(pr_number)
+        except ScriptError as exc:
+            return HTTPStatus.BAD_REQUEST, {"ok": False, "message": str(exc)}
+    duplicate_threads = {thread_id: numbers for thread_id, numbers in thread_collisions.items() if len(numbers) > 1}
+    if duplicate_threads:
+        collision_summary = ", ".join(
+            f"{thread_id[:8]} for PRs {', '.join(str(number) for number in numbers)}"
+            for thread_id, numbers in duplicate_threads.items()
+        )
+        return HTTPStatus.BAD_REQUEST, {
+            "ok": False,
+            "message": f"Codex thread ids must be distinct per active PR: {collision_summary}",
+        }
+    detected_repo_name = repo_name or ensure_repo_name(repo_root, None)[1]
+    for value in params.get("selected_pr", []):
+        try:
+            pr_number = int(value)
+        except ValueError:
+            continue
+        branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
+        if not repo_root or not branch:
+            continue
+        key = tracked_pr_key(detected_repo_name, pr_number)
+        job = enqueue_job(
+            "track-existing",
+            tracked_pr_key=key,
+            requested_by=requested_by,
+            payload={
+                "repo_root": repo_root,
+                "repo_name": detected_repo_name,
+                "pr_number": pr_number,
+                "branch": branch,
+                "provider": provider,
+                "thread_id": (resolved_threads.get(pr_number) or {}).get("id"),
+            },
+        )
+        job_ids.append(job["job"]["id"])
+        queued += 1
+    return HTTPStatus.ACCEPTED, {
+        "ok": True,
+        "message": f"Queued {queued} PR import job(s)." if queued else "No PRs selected.",
+        "queued": queued,
+        "job_ids": job_ids,
+        "repo_root": repo_root,
+        "provider": provider,
+    }
+
+
+def queue_retarget_thread_from_request(path: str, params: dict[str, list[str]], *, requested_by: str = "web") -> tuple[int, dict[str, Any]]:
+    key = params.get("key", [None])[0]
+    if not key:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    record = get_tracked_pr(key)
+    thread_id = None if path.endswith("/renew-thread") else ((params.get("thread_id", [""])[0] or "").strip() or None)
+    message = "Queued thread update."
+    if record.provider == "codex":
+        if thread_id == NEW_CODEX_THREAD_SENTINEL:
+            message = "Queued fresh Codex thread creation."
+        else:
+            try:
+                thread = resolve_selected_thread(record.repo_root, record.provider, thread_id, prefer_latest_when_empty=True)
+                assert_thread_available(thread["id"], record.key)
+            except ScriptError as exc:
+                return HTTPStatus.BAD_REQUEST, {"ok": False, "message": str(exc)}
+            thread_id = thread["id"]
+            message = f"Queued thread update to {thread['id'][:8]}."
+    job = enqueue_job(
+        "retarget-thread",
+        tracked_pr_key=key,
+        requested_by=requested_by,
+        payload={"thread_id": thread_id, "provider": record.provider},
+    )
+    return HTTPStatus.ACCEPTED, {
+        "ok": True,
+        "message": message,
+        "job_id": job["job"]["id"],
+        "tracked_pr_key": key,
+        "thread_id": thread_id,
+    }
+
+
+def render_web_navigation(active: str) -> str:
+    items = [
+        ("/", "Dashboard"),
+        ("/import", "Import Open PRs"),
+    ]
+    links = []
+    for href, label in items:
+        cls = "nav-link current" if active == href else "nav-link"
+        links.append(f'<a class="{cls}" href="{href}">{html.escape(label)}</a>')
+    return f'<nav class="nav-bar">{"".join(links)}</nav>'
+
+
+def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str:
+    normalized_scope = normalize_dashboard_scope(scope)
+    normalized_status_filter = normalize_dashboard_status_filter(status_filter)
+    normalized_sort_key = normalize_dashboard_sort_key(sort_key)
+    return f"""
+        <header>
+          <h1>PR Review Coordinator</h1>
+          <p>Tracked PR dashboard with fetch-based refresh. Filters stay in the URL; queued actions update data without reloading the page.</p>
+          {render_web_navigation("/")}
+          <div class="toolbar refresh-controls">
+            <div class="small" id="refresh-status">Loading dashboard…</div>
+            <div class="button-row">
+              <button type="button" id="refresh-toggle">Pause auto-refresh</button>
+              <button type="button" id="refresh-now">Refresh now</button>
+            </div>
+          </div>
+          <div id="flash" class="flash hidden"></div>
+        </header>
+        <main id="dashboard-root">
+          <div class="actions">
+            <button type="button" data-action="poll-all">Poll all now</button>
+          </div>
+          <form id="dashboard-filters" class="filters">
+            <label>Scope
+              <select name="scope">
+                <option value="active" {"selected" if normalized_scope == "active" else ""}>Active</option>
+                <option value="archived" {"selected" if normalized_scope == "archived" else ""}>Archived</option>
+                <option value="all" {"selected" if normalized_scope == "all" else ""}>All</option>
+              </select>
+            </label>
+            <label>Status
+              <select name="status">
+                <option value="all" {"selected" if normalized_status_filter == "all" else ""}>All</option>
+                {"".join(f'<option value="{name}" {"selected" if normalized_status_filter == name else ""}>{name}</option>' for name in WEB_STATUS_FILTERS)}
+              </select>
+            </label>
+            <label>Sort
+              <select name="sort">
+                <option value="updated" {"selected" if normalized_sort_key == "updated" else ""}>Updated</option>
+                <option value="status" {"selected" if normalized_sort_key == "status" else ""}>Status</option>
+                <option value="pr" {"selected" if normalized_sort_key == "pr" else ""}>PR number/repo</option>
+                <option value="last_poll" {"selected" if normalized_sort_key == "last_poll" else ""}>Last poll</option>
+              </select>
+            </label>
+            <button type="submit">Apply</button>
+          </form>
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>PR</th>
+                <th>Branch / Thread</th>
+                <th>Provider</th>
+                <th>Worktree / CI</th>
+                <th>Run state</th>
+                <th>Last poll</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="tracked-pr-body">
+              <tr><td colspan="8">Loading tracked PRs…</td></tr>
+            </tbody>
+          </table>
+          <h2>Recent Jobs</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Action</th>
+                <th>Status</th>
+                <th>Requested</th>
+                <th>Finished</th>
+                <th>Summary</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-body">
+              <tr><td colspan="6">Loading jobs…</td></tr>
+            </tbody>
+          </table>
+          <h2>Recent Events</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Level</th>
+                <th>Event</th>
+                <th>PR</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody id="events-body">
+              <tr><td colspan="5">Loading events…</td></tr>
+            </tbody>
+          </table>
+        </main>
+        <script>
+          const DASHBOARD_API_URL = '/api/dashboard';
+          const ACTION_API_BASE = '/api/actions';
+          const REFRESH_INTERVAL_SECONDS = 5;
+          const REFRESH_PAUSE_KEY = 'pr-review-coordinator.refresh-paused';
+          const NEW_THREAD_SENTINEL = {json.dumps(NEW_CODEX_THREAD_SENTINEL)};
+          const state = {{
+            filters: {{
+              scope: {json.dumps(normalized_scope)},
+              status: {json.dumps(normalized_status_filter)},
+              sort: {json.dumps(normalized_sort_key)},
+            }},
+            refreshPaused: sessionStorage.getItem(REFRESH_PAUSE_KEY) === '1',
+            secondsRemaining: REFRESH_INTERVAL_SECONDS,
+            loading: false,
+          }};
+
+          function escapeHtml(value) {{
+            return String(value ?? '').replace(/[&<>\"']/g, (char) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[char]);
+          }}
+
+          function badgeClass(status) {{
+            if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
+              return 'pill warn';
+            }}
+            if (['error', 'closed'].includes(status)) {{
+              return 'pill bad';
+            }}
+            return 'pill';
+          }}
+
+          function statusBadge(status) {{
+            const value = status || 'unknown';
+            return `<span class="${{badgeClass(value)}}">${{escapeHtml(value)}}</span>`;
+          }}
+
+          function showFlash(message, tone='success') {{
+            const flash = document.getElementById('flash');
+            if (!flash) return;
+            if (!message) {{
+              flash.textContent = '';
+              flash.className = 'flash hidden';
+              return;
+            }}
+            flash.textContent = message;
+            flash.className = tone === 'error' ? 'flash error' : 'flash success';
+          }}
+
+          function updateRefreshControls() {{
+            const status = document.getElementById('refresh-status');
+            const toggle = document.getElementById('refresh-toggle');
+            if (status) {{
+              status.textContent = state.refreshPaused ? 'Auto-refresh paused.' : `Auto-refresh in ${{state.secondsRemaining}}s.`;
+            }}
+            if (toggle) {{
+              toggle.textContent = state.refreshPaused ? 'Resume auto-refresh' : 'Pause auto-refresh';
+            }}
+          }}
+
+          function updateUrl() {{
+            const params = new URLSearchParams();
+            params.set('scope', state.filters.scope);
+            params.set('status', state.filters.status);
+            params.set('sort', state.filters.sort);
+            history.replaceState(null, '', `/?${{params.toString()}}`);
+          }}
+
+          function threadControlsMarkup(record) {{
+            const thread = record.thread;
+            if (thread.provider !== 'codex') {{
+              return `
+                <details class="thread-disclosure">
+                  <summary>
+                    <span>Provider thread</span>
+                    <span class="small"><code>${{escapeHtml(thread.short_id)}}</code> ${{escapeHtml(thread.summary)}}</span>
+                  </summary>
+                  <div class="thread-controls">
+                    <div class="thread-panel">
+                      <div class="small">Attached provider thread</div>
+                      <div><code>${{escapeHtml(thread.id)}}</code></div>
+                      <div class="small">Stored thread label</div>
+                      <div class="small stack">${{escapeHtml(thread.title)}}</div>
+                    </div>
+                  </div>
+                </details>
+              `;
+            }}
+            const disabled = record.actions_disabled ? 'disabled' : '';
+            const options = (thread.recent_threads || []).map((item) => {{
+              const label = item.in_use_by ? `${{item.summary}} | in use by ${{item.in_use_by}}` : item.summary;
+              return `<option value="${{escapeHtml(item.id)}}" label="${{escapeHtml(label)}}"></option>`;
+            }}).join('');
+            const recentSummary = (thread.recent_threads || []).slice(0, 4).map((item) => {{
+              const suffix = item.in_use_by ? ` (in use by ${{escapeHtml(item.in_use_by)}})` : '';
+              return `<div class="small"><code>${{escapeHtml(item.short_id)}}</code> ${{escapeHtml(item.summary)}}${{suffix}}</div>`;
+            }}).join('') || '<div class="small">No recent unarchived Codex threads were found for this repo.</div>';
+            return `
+              <details class="thread-disclosure">
+                <summary>
+                  <span>Codex thread</span>
+                  <span class="small"><code>${{escapeHtml(thread.short_id)}}</code> ${{escapeHtml(thread.summary)}}</span>
+                </summary>
+                <div class="thread-controls">
+                  <div class="thread-panel">
+                    <div class="small">Attached Codex thread</div>
+                    <div><code>${{escapeHtml(thread.id)}}</code></div>
+                    <div class="small">Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.</div>
+                    <div class="small stack">${{escapeHtml(thread.title)}}</div>
+                  </div>
+                  <div class="thread-panel">
+                    <label>Attach this PR to an existing Codex thread ID
+                      <input type="text" data-role="thread-id-input" value="${{escapeHtml(thread.id)}}" list="thread-options-${{escapeHtml(record.key)}}" placeholder="Existing Codex thread ID" ${{disabled}}>
+                    </label>
+                    <datalist id="thread-options-${{escapeHtml(record.key)}}">${{options}}</datalist>
+                    <div class="button-row">
+                      <button type="button" data-action="set-thread" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Set attached thread</button>
+                      <button type="button" data-action="latest-thread" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Use latest repo thread</button>
+                      <button type="button" data-action="fresh-thread" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Create fresh thread</button>
+                    </div>
+                    <div class="small">Use the buttons above to keep the same PR and update only its attached thread.</div>
+                  </div>
+                  <div class="thread-panel">
+                    <div class="small">Recent repo threads</div>
+                    <div class="small">Suggestions from recent unarchived Codex threads in this repo. Titles below are stored thread titles/opening prompts, not latest replies.</div>
+                    ${{recentSummary}}
+                  </div>
+                </div>
+              </details>
+            `;
+          }}
+
+          function renderTrackedPrs(records) {{
+            const tbody = document.getElementById('tracked-pr-body');
+            if (!tbody) return;
+            if (!records.length) {{
+              tbody.innerHTML = '<tr><td colspan="8">No matching tracked PRs</td></tr>';
+              return;
+            }}
+            tbody.innerHTML = records.map((record) => {{
+              const disabled = record.actions_disabled ? 'disabled' : '';
+              return `
+                <tr data-pr-key="${{escapeHtml(record.key)}}">
+                  <td>${{statusBadge(record.status)}}</td>
+                  <td><a href="${{escapeHtml(record.pr_url)}}">${{escapeHtml(record.repo_name)}} #${{escapeHtml(record.pr_number)}}</a><div class="small">${{escapeHtml(record.pr_title)}}</div></td>
+                  <td><code>${{escapeHtml(record.branch)}}</code>${{threadControlsMarkup(record)}}</td>
+                  <td><code>${{escapeHtml(record.provider)}}</code></td>
+                  <td><code>${{escapeHtml(record.worktree_path)}}</code><div class="small" data-role="detail-text">${{escapeHtml(record.detail_text || '')}}</div></td>
+                  <td>${{statusBadge(record.run_status)}}<div class="small stack" data-role="run-summary">${{escapeHtml(record.run_summary || '')}}</div></td>
+                  <td>${{escapeHtml(record.last_polled_label || '')}}</td>
+                  <td>
+                    <div class="button-stack">
+                      <button type="button" data-action="run-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Run now</button>
+                      <button type="button" data-action="poll-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Poll</button>
+                      <button type="button" data-action="untrack" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack</button>
+                      <button type="button" data-action="untrack-cleanup" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack + Cleanup</button>
+                    </div>
+                  </td>
+                </tr>
+              `;
+            }}).join('');
+          }}
+
+          function renderJobs(jobs) {{
+            const tbody = document.getElementById('jobs-body');
+            if (!tbody) return;
+            tbody.innerHTML = jobs.length ? jobs.map((job) => `
+              <tr>
+                <td>${{escapeHtml(job.id)}}</td>
+                <td>${{escapeHtml(job.action)}}</td>
+                <td>${{statusBadge(job.status)}}</td>
+                <td>${{escapeHtml(job.requested_at_label || '')}}</td>
+                <td>${{escapeHtml(job.finished_at_label || '')}}</td>
+                <td class="stack">${{escapeHtml(job.result_summary || job.error || '')}}</td>
+              </tr>
+            `).join('') : '<tr><td colspan="6">No jobs yet</td></tr>';
+          }}
+
+          function renderEvents(events) {{
+            const tbody = document.getElementById('events-body');
+            if (!tbody) return;
+            tbody.innerHTML = events.length ? events.map((event) => `
+              <tr>
+                <td>${{escapeHtml(event.created_at_label || '')}}</td>
+                <td>${{statusBadge(event.level)}}</td>
+                <td>${{escapeHtml(event.event_type || '')}}</td>
+                <td><code>${{escapeHtml(event.tracked_pr_key || '')}}</code></td>
+                <td class="stack">${{escapeHtml(event.message || '')}}</td>
+              </tr>
+            `).join('') : '<tr><td colspan="5">No events yet</td></tr>';
+          }}
+
+          async function loadDashboard(options = {{}}) {{
+            if (state.loading) return;
+            state.loading = true;
+            const params = new URLSearchParams(state.filters);
+            try {{
+              const response = await fetch(`${{DASHBOARD_API_URL}}?${{params.toString()}}`, {{ headers: {{ Accept: 'application/json' }} }});
+              const data = await response.json();
+              if (!response.ok) {{
+                throw new Error(data.message || 'Failed to load dashboard.');
+              }}
+              state.filters = data.filters;
+              updateUrl();
+              renderTrackedPrs(data.records || []);
+              renderJobs(data.jobs || []);
+              renderEvents(data.events || []);
+              if (!options.preserveFlash) {{
+                showFlash('');
+              }}
+              state.secondsRemaining = REFRESH_INTERVAL_SECONDS;
+            }} catch (error) {{
+              showFlash(error.message || 'Failed to load dashboard.', 'error');
+            }} finally {{
+              state.loading = false;
+              updateRefreshControls();
+            }}
+          }}
+
+          function markRowPending(row, label) {{
+            if (!row) return;
+            row.querySelectorAll('button').forEach((button) => {{
+              button.disabled = true;
+            }});
+            const detail = row.querySelector('[data-role="detail-text"]');
+            if (detail && !detail.textContent.includes(label)) {{
+              detail.textContent = detail.textContent ? `${{detail.textContent}} | pending: ${{label}}` : `pending: ${{label}}`;
+            }}
+            const summary = row.querySelector('[data-role="run-summary"]');
+            if (summary && label) {{
+              summary.textContent = label;
+            }}
+          }}
+
+          async function postAction(path, params, options = {{}}) {{
+            const response = await fetch(path, {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', Accept: 'application/json' }},
+              body: new URLSearchParams(params).toString(),
+            }});
+            const data = await response.json();
+            if (!response.ok || !data.ok) {{
+              throw new Error(data.message || 'Request failed.');
+            }}
+            showFlash(data.message || 'Queued action.');
+            await loadDashboard({{ preserveFlash: true }});
+          }}
+
+          document.addEventListener('DOMContentLoaded', () => {{
+            const filtersForm = document.getElementById('dashboard-filters');
+            const refreshToggle = document.getElementById('refresh-toggle');
+            const refreshNow = document.getElementById('refresh-now');
+
+            if (filtersForm) {{
+              filtersForm.addEventListener('submit', (event) => {{
+                event.preventDefault();
+                state.filters.scope = filtersForm.elements.scope.value;
+                state.filters.status = filtersForm.elements.status.value;
+                state.filters.sort = filtersForm.elements.sort.value;
+                loadDashboard();
+              }});
+            }}
+
+            if (refreshToggle) {{
+              refreshToggle.addEventListener('click', () => {{
+                state.refreshPaused = !state.refreshPaused;
+                sessionStorage.setItem(REFRESH_PAUSE_KEY, state.refreshPaused ? '1' : '0');
+                state.secondsRemaining = REFRESH_INTERVAL_SECONDS;
+                updateRefreshControls();
+              }});
+            }}
+
+            if (refreshNow) {{
+              refreshNow.addEventListener('click', () => loadDashboard());
+            }}
+
+            document.body.addEventListener('click', async (event) => {{
+              const button = event.target.closest('button[data-action]');
+              if (!button) return;
+              const action = button.dataset.action;
+              const row = button.closest('tr[data-pr-key]');
+              try {{
+                if (action === 'poll-all') {{
+                  await postAction(`${{ACTION_API_BASE}}/poll-all`, {{}}, {{ label: 'poll all queued' }});
+                  return;
+                }}
+                if (!row) return;
+                const key = button.dataset.key;
+                if (!key) return;
+                if (action === 'set-thread') {{
+                  const input = row.querySelector('[data-role="thread-id-input"]');
+                  markRowPending(row, 'thread update queued');
+                  await postAction(`${{ACTION_API_BASE}}/retarget-thread`, {{ key, thread_id: input ? input.value.trim() : '' }});
+                  return;
+                }}
+                if (action === 'latest-thread') {{
+                  markRowPending(row, 'latest thread queued');
+                  await postAction(`${{ACTION_API_BASE}}/retarget-thread`, {{ key }});
+                  return;
+                }}
+                if (action === 'fresh-thread') {{
+                  markRowPending(row, 'fresh thread queued');
+                  await postAction(`${{ACTION_API_BASE}}/retarget-thread`, {{ key, thread_id: NEW_THREAD_SENTINEL }});
+                  return;
+                }}
+                markRowPending(row, `${{action.replace(/-/g, ' ')}} queued`);
+                await postAction(`${{ACTION_API_BASE}}/${{action}}`, {{ key }});
+              }} catch (error) {{
+                showFlash(error.message || 'Request failed.', 'error');
+                await loadDashboard({{ preserveFlash: true }});
+              }}
+            }});
+
+            updateRefreshControls();
+            loadDashboard();
+            window.setInterval(() => {{
+              if (state.refreshPaused || state.loading) {{
+                updateRefreshControls();
+                return;
+              }}
+              state.secondsRemaining -= 1;
+              if (state.secondsRemaining <= 0) {{
+                loadDashboard();
+                return;
+              }}
+              updateRefreshControls();
+            }}, 1000);
+          }});
+        </script>
+    """
+
+
+def render_import_shell(project_candidates: list[dict[str, Any]]) -> str:
+    project_options = "".join(
+        f'<option value="{html.escape(item["repo_root"])}">{html.escape(item["repo_name"])} - {html.escape(item["repo_root"])}</option>'
+        for item in project_candidates
+    )
+    return f"""
+        <header>
+          <h1>PR Review Coordinator</h1>
+          <p>Queue open PRs into the orchestrator without sharing state with the live dashboard refresh loop.</p>
+          {render_web_navigation("/import")}
+          <div id="flash" class="flash hidden"></div>
+        </header>
+        <main id="import-root">
+          <div class="panel">
+            <h2>Track Open PRs</h2>
+            <form id="import-form" class="filters">
+              <label>Project repo
+                <input type="text" name="project_root" list="project-roots" placeholder="/Users/jordan/source/example-repo">
+                <datalist id="project-roots">{project_options}</datalist>
+              </label>
+              <label>Provider
+                <select name="provider">
+                  <option value="codex">codex</option>
+                  <option value="cursor">cursor</option>
+                </select>
+              </label>
+              <button type="submit">Load active PRs</button>
+            </form>
+            <p>Suggestions come from tracked repos and recent Codex threads. Pick a local repo checkout, then queue its open PRs into the orchestrator.</p>
+          </div>
+          <section id="import-browser" class="panel">
+            <p>Select a repo checkout and load its open PRs.</p>
+          </section>
+        </main>
+        <script>
+          const IMPORT_SELECTION_KEY = 'pr-review-coordinator.import-selection';
+          const IMPORT_DRAFT_PREFIX = 'pr-review-coordinator.import-draft:';
+          const IMPORT_API_URL = '/api/import/open-prs';
+          const ACTION_API_BASE = '/api/actions';
+          const PROJECT_CANDIDATES = {json.dumps(project_candidates)};
+
+          function escapeHtml(value) {{
+            return String(value ?? '').replace(/[&<>\"']/g, (char) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[char]);
+          }}
+
+          function badgeClass(status) {{
+            if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
+              return 'pill warn';
+            }}
+            if (['error', 'closed'].includes(status)) {{
+              return 'pill bad';
+            }}
+            return 'pill';
+          }}
+
+          function statusBadge(status) {{
+            const value = status || 'unknown';
+            return `<span class="${{badgeClass(value)}}">${{escapeHtml(value)}}</span>`;
+          }}
+
+          function showFlash(message, tone='success') {{
+            const flash = document.getElementById('flash');
+            if (!flash) return;
+            if (!message) {{
+              flash.textContent = '';
+              flash.className = 'flash hidden';
+              return;
+            }}
+            flash.textContent = message;
+            flash.className = tone === 'error' ? 'flash error' : 'flash success';
+          }}
+
+          function selectionValue() {{
+            try {{
+              return JSON.parse(sessionStorage.getItem(IMPORT_SELECTION_KEY) || 'null');
+            }} catch (_error) {{
+              return null;
+            }}
+          }}
+
+          function saveSelection(repoRoot, provider) {{
+            sessionStorage.setItem(IMPORT_SELECTION_KEY, JSON.stringify({{ repoRoot, provider }}));
+          }}
+
+          function draftKey(repoRoot, provider) {{
+            return `${{IMPORT_DRAFT_PREFIX}}${{repoRoot}}:${{provider}}`;
+          }}
+
+          function loadDraft(repoRoot, provider) {{
+            try {{
+              return JSON.parse(sessionStorage.getItem(draftKey(repoRoot, provider)) || '{{}}');
+            }} catch (_error) {{
+              return {{}};
+            }}
+          }}
+
+          function saveDraft(repoRoot, provider, draft) {{
+            sessionStorage.setItem(draftKey(repoRoot, provider), JSON.stringify(draft));
+          }}
+
+          function defaultThreadStrategy(pr) {{
+            return pr.tracked_thread_id ? 'keep_current' : 'latest_repo';
+          }}
+
+          function threadHint(existingThreadId, choice, provider) {{
+            if (provider !== 'codex') {{
+              return 'Provider does not use Codex threads.';
+            }}
+            if (choice === 'keep_current') return 'This PR will keep its current attached thread.';
+            if (choice === 'latest_repo') return 'This PR will use the most recently updated unarchived Codex thread for this repo when the job is queued.';
+            if (choice === 'specific_thread') return 'This PR will use the exact existing thread ID entered below.';
+            if (choice === 'fresh_thread') return 'This PR will create and attach a new Codex thread.';
+            return existingThreadId ? 'This PR will keep its current attached thread unless you choose a different action.' : 'Leave blank to use the most recently updated unarchived Codex thread for this repo when the job is queued.';
+          }}
+
+          function syncDraftFromDom(browser, repoRoot, provider) {{
+            const draft = {{ selected: {{}}, strategies: {{}}, threadIds: {{}} }};
+            browser.querySelectorAll('tr[data-pr-number]').forEach((row) => {{
+              const number = row.dataset.prNumber;
+              const checkbox = row.querySelector('input[name="selected_pr"]');
+              const strategy = row.querySelector('select[data-role="thread-strategy"]');
+              const threadId = row.querySelector('input[data-role="thread-id-input"]');
+              draft.selected[number] = !!(checkbox && checkbox.checked);
+              if (strategy) {{
+                draft.strategies[number] = strategy.value;
+              }}
+              if (threadId) {{
+                draft.threadIds[number] = threadId.value;
+              }}
+            }});
+            saveDraft(repoRoot, provider, draft);
+          }}
+
+          function syncThreadStrategy(config) {{
+            const select = config.querySelector('select[data-role="thread-strategy"]');
+            const input = config.querySelector('input[data-role="thread-id-input"]');
+            const wrapper = config.querySelector('[data-role="thread-id-wrapper"]');
+            const hint = config.querySelector('[data-role="thread-mode-hint"]');
+            const choice = select ? select.value : '';
+            const existingThreadId = config.dataset.existingThreadId || '';
+            const needsSpecificId = choice === 'specific_thread';
+            if (input) {{
+              input.disabled = !needsSpecificId;
+            }}
+            if (wrapper) {{
+              wrapper.classList.toggle('muted', !needsSpecificId);
+            }}
+            if (hint) {{
+              hint.textContent = threadHint(existingThreadId, choice, config.dataset.provider || 'codex');
+            }}
+          }}
+
+          function renderImportBrowser(data, repoRoot, provider) {{
+            const browser = document.getElementById('import-browser');
+            if (!browser) return;
+            if (!data.ok) {{
+              browser.innerHTML = `<p>${{escapeHtml(data.error || 'Unable to load open PRs.')}}</p>`;
+              return;
+            }}
+            browser.dataset.repoRoot = data.repo_root;
+            browser.dataset.provider = provider;
+            browser.dataset.repoName = data.repo_name || '';
+            const draft = loadDraft(repoRoot, provider);
+            const threadOptions = (data.threads || []).map((thread) => {{
+              const label = thread.in_use_by ? `${{thread.summary}} | in use by ${{thread.in_use_by}}` : thread.summary;
+              return `<option value="${{escapeHtml(thread.id)}}" label="${{escapeHtml(label)}}"></option>`;
+            }}).join('');
+            const rows = (data.prs || []).map((pr) => {{
+              const number = String(pr.number);
+              const selected = Object.prototype.hasOwnProperty.call(draft.selected || {{}}, number) ? !!draft.selected[number] : !pr.tracked;
+              const strategy = (draft.strategies || {{}})[number] || defaultThreadStrategy(pr);
+              const threadIdValue = (draft.threadIds || {{}})[number] || '';
+              const tracking = pr.tracked ? `${{statusBadge(pr.tracked_status)}}<div class="small">${{escapeHtml(pr.tracked_active ? 'active' : 'archived')}}</div>` : '<span class="small">Not tracked</span>';
+              const currentThreadMarkup = pr.tracked_thread_id
+                ? `<div class="small">Current attached thread: <code>${{escapeHtml(pr.tracked_thread_id)}}</code></div><div class="small">Current stored title / opening prompt: ${{escapeHtml(pr.tracked_thread_title || 'No stored thread title was found.')}}</div>`
+                : '';
+              const threadInput = provider === 'codex'
+                ? `
+                  <div class="thread-mode" data-thread-config data-existing-thread-id="${{escapeHtml(pr.tracked_thread_id || '')}}" data-provider="${{escapeHtml(provider)}}">
+                    <label>Thread action when queued
+                      <select name="thread_strategy_${{escapeHtml(number)}}" data-role="thread-strategy">
+                        ${{pr.tracked_thread_id ? `<option value="keep_current"${{strategy === 'keep_current' ? ' selected' : ''}}>Keep current attached thread</option>` : ''}}
+                        <option value="latest_repo"${{strategy === 'latest_repo' ? ' selected' : ''}}>Use latest repo thread</option>
+                        <option value="specific_thread"${{strategy === 'specific_thread' ? ' selected' : ''}}>Use a specific existing thread ID</option>
+                        <option value="fresh_thread"${{strategy === 'fresh_thread' ? ' selected' : ''}}>Create fresh thread</option>
+                      </select>
+                    </label>
+                    ${{currentThreadMarkup}}
+                    <label data-role="thread-id-wrapper">Specific existing Codex thread ID
+                      <input type="text" data-role="thread-id-input" name="thread_id_${{escapeHtml(number)}}" list="import-thread-options" value="${{escapeHtml(threadIdValue)}}" placeholder="Existing Codex thread ID">
+                    </label>
+                    <div class="small" data-role="thread-mode-hint">${{escapeHtml(threadHint(pr.tracked_thread_id || '', strategy, provider))}}</div>
+                    <div class="small">Suggested thread titles come from Codex's stored thread title / opening prompt, not the latest thread reply.</div>
+                  </div>
+                `
+                : '<span class="small">Provider does not use Codex threads</span>';
+              return `
+                <tr data-pr-number="${{escapeHtml(number)}}" data-branch="${{escapeHtml(pr.headRefName)}}" data-existing-thread-id="${{escapeHtml(pr.tracked_thread_id || '')}}">
+                  <td><input type="checkbox" name="selected_pr" value="${{escapeHtml(number)}}" ${{selected ? 'checked' : ''}}></td>
+                  <td><a href="${{escapeHtml(pr.url)}}">#${{escapeHtml(number)}}</a> ${{pr.isDraft ? '<span class="pill warn">draft</span>' : ''}}<div class="small">${{escapeHtml(pr.title)}}</div></td>
+                  <td><code>${{escapeHtml(pr.headRefName)}}</code><div class="small">base: ${{escapeHtml(pr.baseRefName || '')}}</div></td>
+                  <td>${{threadInput}}</td>
+                  <td>${{tracking}}</td>
+                </tr>
+              `;
+            }}).join('') || '<tr><td colspan="5">No open PRs found</td></tr>';
+            browser.innerHTML = `
+              <div class="toolbar">
+                <div>
+                  <h2>Open PR browser</h2>
+                  <p>Review open PRs for ${{escapeHtml(data.repo_name)}} and choose which Codex thread each one should use.</p>
+                  <div class="small">${{escapeHtml(data.repo_root)}}</div>
+                </div>
+                <div class="button-row">
+                  <button type="button" id="select-all-prs">Select all visible</button>
+                  <button type="button" id="clear-all-prs">Clear</button>
+                  <button type="button" id="queue-selected-prs">Queue selected PRs</button>
+                </div>
+              </div>
+              <datalist id="import-thread-options">${{threadOptions}}</datalist>
+              <p class="small">Choose the thread action for each selected PR: keep its current attached thread, use the latest repo thread, attach a specific existing thread ID, or create a fresh thread.</p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Add</th>
+                    <th>PR</th>
+                    <th>Branch</th>
+                    <th>Codex thread</th>
+                    <th>Tracking</th>
+                  </tr>
+                </thead>
+                <tbody>${{rows}}</tbody>
+              </table>
+            `;
+            browser.querySelectorAll('[data-thread-config]').forEach((config) => syncThreadStrategy(config));
+          }}
+
+          async function loadOpenPrs(repoRoot, provider) {{
+            const params = new URLSearchParams({{ repo_root: repoRoot, provider }});
+            const response = await fetch(`${{IMPORT_API_URL}}?${{params.toString()}}`, {{ headers: {{ Accept: 'application/json' }} }});
+            const data = await response.json();
+            if (!response.ok || !data.ok) {{
+              throw new Error(data.error || data.message || 'Unable to load open PRs.');
+            }}
+            renderImportBrowser(data, data.repo_root, provider);
+            saveSelection(data.repo_root, provider);
+            showFlash('');
+          }}
+
+          async function queueSelectedPrs(browser, repoRoot, provider) {{
+            const params = new URLSearchParams();
+            params.set('project_root', repoRoot);
+            params.set('provider', provider);
+            params.set('repo_name', browser.dataset.repoName || '');
+            browser.querySelectorAll('tr[data-pr-number]').forEach((row) => {{
+              const checkbox = row.querySelector('input[name="selected_pr"]');
+              if (!checkbox || !checkbox.checked) return;
+              const number = row.dataset.prNumber;
+              params.append('selected_pr', number);
+              params.append(`branch_${{number}}`, row.dataset.branch || '');
+              params.append(`existing_thread_id_${{number}}`, row.dataset.existingThreadId || '');
+              const strategy = row.querySelector('select[data-role="thread-strategy"]');
+              const threadId = row.querySelector('input[data-role="thread-id-input"]');
+              if (strategy) params.append(`thread_strategy_${{number}}`, strategy.value);
+              if (threadId) params.append(`thread_id_${{number}}`, threadId.value.trim());
+            }});
+            const response = await fetch(`${{ACTION_API_BASE}}/track-open`, {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', Accept: 'application/json' }},
+              body: params.toString(),
+            }});
+            const data = await response.json();
+            if (!response.ok || !data.ok) {{
+              throw new Error(data.message || 'Unable to queue selected PRs.');
+            }}
+            showFlash(data.message || 'Queued selected PRs.');
+          }}
+
+          document.addEventListener('DOMContentLoaded', () => {{
+            const form = document.getElementById('import-form');
+            const browser = document.getElementById('import-browser');
+            const selection = selectionValue();
+            if (form && selection) {{
+              form.elements.project_root.value = selection.repoRoot || '';
+              form.elements.provider.value = selection.provider || 'codex';
+            }}
+
+            if (form) {{
+              form.addEventListener('submit', async (event) => {{
+                event.preventDefault();
+                const repoRoot = form.elements.project_root.value.trim();
+                const provider = form.elements.provider.value;
+                if (!repoRoot) {{
+                  showFlash('Enter a local git checkout path first.', 'error');
+                  return;
+                }}
+                try {{
+                  await loadOpenPrs(repoRoot, provider);
+                }} catch (error) {{
+                  showFlash(error.message || 'Unable to load open PRs.', 'error');
+                }}
+              }});
+            }}
+
+            if (browser) {{
+              browser.addEventListener('change', (event) => {{
+                const repoRoot = form ? form.elements.project_root.value.trim() : '';
+                const provider = form ? form.elements.provider.value : 'codex';
+                const config = event.target.closest('[data-thread-config]');
+                if (config) {{
+                  syncThreadStrategy(config);
+                }}
+                if (repoRoot) {{
+                  syncDraftFromDom(browser, repoRoot, provider);
+                }}
+              }});
+
+              browser.addEventListener('input', () => {{
+                const repoRoot = form ? form.elements.project_root.value.trim() : '';
+                const provider = form ? form.elements.provider.value : 'codex';
+                if (repoRoot) {{
+                  syncDraftFromDom(browser, repoRoot, provider);
+                }}
+              }});
+
+              browser.addEventListener('click', async (event) => {{
+                const target = event.target;
+                if (!(target instanceof HTMLElement)) return;
+                if (target.id === 'select-all-prs' || target.id === 'clear-all-prs') {{
+                  const checked = target.id === 'select-all-prs';
+                  browser.querySelectorAll('input[name="selected_pr"]').forEach((input) => {{
+                    input.checked = checked;
+                  }});
+                  const repoRoot = form ? form.elements.project_root.value.trim() : '';
+                  const provider = form ? form.elements.provider.value : 'codex';
+                  if (repoRoot) {{
+                    syncDraftFromDom(browser, repoRoot, provider);
+                  }}
+                  return;
+                }}
+                if (target.id === 'queue-selected-prs') {{
+                  const repoRoot = form ? form.elements.project_root.value.trim() : '';
+                  const provider = form ? form.elements.provider.value : 'codex';
+                  try {{
+                    await queueSelectedPrs(browser, repoRoot, provider);
+                  }} catch (error) {{
+                    showFlash(error.message || 'Unable to queue selected PRs.', 'error');
+                  }}
+                }}
+              }});
+            }}
+
+            if (selection && form && selection.repoRoot) {{
+              form.requestSubmit();
+            }}
+          }});
+        </script>
+    """
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def _send_html(self, content: bytes, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        content = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         try:
@@ -2380,359 +3544,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         params = parse_qs(parsed.query)
-        scope = params.get("scope", ["active"])[0]
-        status_filter = params.get("status", ["all"])[0]
-        sort_key = params.get("sort", ["updated"])[0]
-        selected_project_root = params.get("project_root", [""])[0].strip()
-        selected_provider = params.get("provider", ["codex"])[0].strip().lower() or "codex"
-        notice = params.get("notice", [""])[0].strip() or None
-        project_candidates = list_recent_project_candidates()
-        browse_result: dict[str, Any] | None = None
-        browse_threads: list[dict[str, Any]] = []
-        browse_error: str | None = None
-        if selected_project_root:
-            resolved_root = canonical_repo_root(selected_project_root)
-            if not resolved_root:
-                browse_error = f"Not a local git checkout: {selected_project_root}"
-            else:
-                selected_project_root = resolved_root
-                try:
-                    browse_result = list_open_pull_requests_for_repo(selected_project_root)
-                    browse_threads = list_recent_threads_for_repo(selected_project_root)
-                except ScriptError as exc:
-                    browse_error = str(exc)
-            if selected_project_root and all(item["repo_root"] != selected_project_root for item in project_candidates):
-                extra_candidate = {
-                    "repo_root": selected_project_root,
-                    "repo_name": Path(selected_project_root).name,
-                    "repo_owner": "",
-                    "source": "manual",
-                    "thread_title": None,
-                }
-                project_candidates = [extra_candidate, *project_candidates]
-
-        records = list_tracked_prs(active_only=False)
-        if scope == "active":
-            records = [record for record in records if record.active]
-        elif scope == "archived":
-            records = [record for record in records if not record.active]
-        if status_filter != "all":
-            records = [record for record in records if record.status == status_filter]
-        pending_jobs = pending_jobs_by_pr()
-        thread_candidates_by_repo = {
-            repo_root: list_recent_threads_for_repo(repo_root)
-            for repo_root in {record.repo_root for record in records if record.provider == "codex"}
-        }
-        rows = [
-            render_record_row(record, pending_jobs.get(record.key, []), thread_candidates_by_repo.get(record.repo_root, []))
-            for record in sort_records(records, sort_key)
-        ]
-        jobs = list_recent_jobs(15)
-        events = list_recent_events(20)
-
-        body = f"""
-        <header>
-          <h1>PR Review Coordinator</h1>
-          <p>Web UI reads tracked state and enqueues daemon jobs. Auto-refresh runs every 5 seconds when the page is idle.</p>
-          <div class="toolbar refresh-controls">
-            <div class="small" id="refresh-status">Auto-refresh in 5s.</div>
-            <div class="button-row">
-              <button type="button" id="refresh-toggle" onclick="toggleRefreshPause()">Pause auto-refresh</button>
-              <button type="button" onclick="refreshNow()">Refresh now</button>
-            </div>
-          </div>
-        </header>
-        <script>
-          const REFRESH_INTERVAL_SECONDS = 5;
-          const REFRESH_PAUSE_KEY = 'pr-review-coordinator.refresh-paused';
-          let refreshPausedManually = false;
-          let refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
-          let baselineFingerprint = '';
-
-          function formFingerprint() {{
-            const forms = Array.from(document.querySelectorAll('form'));
-            return JSON.stringify(forms.map((form) => {{
-              const elements = Array.from(form.querySelectorAll('input, select, textarea'));
-              return {{
-                action: form.getAttribute('action') || '',
-                method: form.getAttribute('method') || 'get',
-                values: elements.map((element) => {{
-                  const key = element.name || element.id || element.type || element.tagName;
-                  const value = element.type === 'checkbox' || element.type === 'radio' ? String(element.checked) : element.value;
-                  return [key, element.type || element.tagName, value];
-                }}),
-              }};
-            }}));
-          }}
-
-          function refreshPauseReason() {{
-            if (refreshPausedManually) {{
-              return 'manual';
-            }}
-            const active = document.activeElement;
-            if (active && active.matches && active.matches('input:not([type="hidden"]), select, textarea')) {{
-              return 'editing';
-            }}
-            if (formFingerprint() !== baselineFingerprint) {{
-              return 'dirty';
-            }}
-            return null;
-          }}
-
-          function updateRefreshControls() {{
-            const reason = refreshPauseReason();
-            const status = document.getElementById('refresh-status');
-            const toggle = document.getElementById('refresh-toggle');
-            if (status) {{
-              if (reason === 'manual') {{
-                status.textContent = 'Auto-refresh paused.';
-              }} else if (reason) {{
-                status.textContent = 'Auto-refresh paused while you edit.';
-              }} else {{
-                status.textContent = `Auto-refresh in ${{refreshSecondsRemaining}}s.`;
-              }}
-            }}
-            if (toggle) {{
-              toggle.textContent = refreshPausedManually ? 'Resume auto-refresh' : 'Pause auto-refresh';
-            }}
-          }}
-
-          function resetRefreshCountdown() {{
-            refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
-            updateRefreshControls();
-          }}
-
-          function toggleRefreshPause() {{
-            refreshPausedManually = !refreshPausedManually;
-            sessionStorage.setItem(REFRESH_PAUSE_KEY, refreshPausedManually ? '1' : '0');
-            resetRefreshCountdown();
-          }}
-
-          function refreshNow() {{
-            baselineFingerprint = formFingerprint();
-            window.location.reload();
-          }}
-
-          function tickRefresh() {{
-            const reason = refreshPauseReason();
-            if (reason) {{
-              refreshSecondsRemaining = REFRESH_INTERVAL_SECONDS;
-              updateRefreshControls();
-              return;
-            }}
-            refreshSecondsRemaining -= 1;
-            if (refreshSecondsRemaining <= 0) {{
-              window.location.reload();
-              return;
-            }}
-            updateRefreshControls();
-          }}
-
-          function queueAction(form, label) {{
-            const row = form.closest('tr');
-            if (!row) return true;
-            for (const button of row.querySelectorAll('button')) {{
-              button.disabled = true;
-            }}
-            const summary = row.querySelector('[data-role="run-summary"]');
-            if (summary) {{
-              summary.textContent = label;
-            }}
-            const detail = row.querySelector('[data-role="detail-text"]');
-            if (detail && !detail.textContent.includes(label)) {{
-              detail.textContent = detail.textContent ? `${{detail.textContent}} | pending: ${{label}}` : `pending: ${{label}}`;
-            }}
-            return true;
-          }}
-          function projectBrowserStorageKey(panel) {{
-            return `pr-review-coordinator.project-browser:${{panel.dataset.browserKey || 'default'}}`;
-          }}
-          function rememberProjectBrowserState(panel) {{
-            sessionStorage.setItem(projectBrowserStorageKey(panel), panel.open ? '1' : '0');
-          }}
-          function collapseProjectBrowser(element) {{
-            const panel = element.closest('details[data-browser-key]');
-            if (!panel) {{
-              return;
-            }}
-            panel.open = false;
-            rememberProjectBrowserState(panel);
-          }}
-          function syncProjectBrowserState() {{
-            const panel = document.getElementById('project-browser');
-            if (!panel) {{
-              return;
-            }}
-            const stored = sessionStorage.getItem(projectBrowserStorageKey(panel));
-            if (stored === '0') {{
-              panel.open = false;
-            }} else if (stored === '1') {{
-              panel.open = true;
-            }}
-            panel.addEventListener('toggle', () => rememberProjectBrowserState(panel));
-          }}
-          function syncThreadStrategy(select) {{
-            const config = select.closest('[data-thread-config]');
-            if (!config) {{
-              return;
-            }}
-            const input = config.querySelector('[data-role="thread-id-input"]');
-            const wrapper = config.querySelector('[data-role="thread-id-wrapper"]');
-            const hint = config.querySelector('[data-role="thread-mode-hint"]');
-            const hasCurrentThread = !!config.dataset.existingThreadId;
-            const choice = select.value;
-            const needsSpecificId = choice === 'specific_thread';
-            if (input) {{
-              input.disabled = !needsSpecificId;
-            }}
-            if (wrapper) {{
-              wrapper.classList.toggle('muted', !needsSpecificId);
-            }}
-            if (hint) {{
-              if (choice === 'keep_current') {{
-                hint.textContent = 'This PR will keep its current attached thread.';
-              }} else if (choice === 'latest_repo') {{
-                hint.textContent = 'This PR will use the most recently updated unarchived Codex thread for this repo when queued.';
-              }} else if (choice === 'specific_thread') {{
-                hint.textContent = 'This PR will use the exact existing thread ID entered below.';
-              }} else if (choice === 'fresh_thread') {{
-                hint.textContent = 'This PR will create and attach a new Codex thread.';
-              }} else if (hasCurrentThread) {{
-                hint.textContent = 'This PR will keep its current attached thread unless you choose a different action.';
-              }} else {{
-                hint.textContent = 'Leave blank to use the most recently updated unarchived Codex thread for this repo when the job is queued.';
-              }}
-            }}
-          }}
-          function toggleProjectPRs(form, checked) {{
-            for (const input of form.querySelectorAll('input[name=\"selected_pr\"]')) {{
-              if (!input.disabled) {{
-                input.checked = checked;
-              }}
-            }}
-          }}
-          function queueBulkTrack(form) {{
-            const selected = form.querySelectorAll('input[name=\"selected_pr\"]:checked');
-            if (!selected.length) {{
-              return false;
-            }}
-            for (const button of form.querySelectorAll('button')) {{
-              button.disabled = true;
-            }}
-            const panel = form.closest('details[data-browser-key]');
-            if (panel) {{
-              panel.open = false;
-              rememberProjectBrowserState(panel);
-            }}
-            return true;
-          }}
-          document.addEventListener('DOMContentLoaded', () => {{
-            refreshPausedManually = sessionStorage.getItem(REFRESH_PAUSE_KEY) === '1';
-            baselineFingerprint = formFingerprint();
-            updateRefreshControls();
-            syncProjectBrowserState();
-            for (const select of document.querySelectorAll('select[data-role=\"thread-strategy\"]')) {{
-              syncThreadStrategy(select);
-              select.addEventListener('change', () => syncThreadStrategy(select));
-            }}
-            window.setInterval(tickRefresh, 1000);
-            document.addEventListener('input', resetRefreshCountdown, true);
-            document.addEventListener('change', resetRefreshCountdown, true);
-            document.addEventListener('focusin', resetRefreshCountdown, true);
-            document.addEventListener('focusout', () => window.setTimeout(updateRefreshControls, 0), true);
-            for (const form of document.querySelectorAll('form')) {{
-              form.addEventListener('submit', () => {{
-                baselineFingerprint = formFingerprint();
-              }});
-            }}
-          }});
-        </script>
-        <main>
-          {render_project_import_section(project_candidates, selected_project_root, selected_provider, browse_result, browse_threads, browse_error, notice)}
-          <div class="actions">
-            <form method="post" action="/poll"><button>Poll all now</button></form>
-          </div>
-          <form method="get" class="filters">
-            <input type="hidden" name="project_root" value="{html.escape(selected_project_root)}">
-            <input type="hidden" name="provider" value="{html.escape(selected_provider)}">
-            <label>Scope
-              <select name="scope">
-                <option value="active" {"selected" if scope == "active" else ""}>Active</option>
-                <option value="archived" {"selected" if scope == "archived" else ""}>Archived</option>
-                <option value="all" {"selected" if scope == "all" else ""}>All</option>
-              </select>
-            </label>
-            <label>Status
-              <select name="status">
-                <option value="all" {"selected" if status_filter == "all" else ""}>All</option>
-                {"".join(f'<option value="{name}" {"selected" if status_filter == name else ""}>{name}</option>' for name in ["needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "awaiting_final_review", "awaiting_final_test", "queued", "busy", "error", "untracked"])}
-              </select>
-            </label>
-            <label>Sort
-              <select name="sort">
-                <option value="updated" {"selected" if sort_key == "updated" else ""}>Updated</option>
-                <option value="status" {"selected" if sort_key == "status" else ""}>Status</option>
-                <option value="pr" {"selected" if sort_key == "pr" else ""}>PR number/repo</option>
-                <option value="last_poll" {"selected" if sort_key == "last_poll" else ""}>Last poll</option>
-              </select>
-            </label>
-            <button type="submit">Apply</button>
-          </form>
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>PR</th>
-                <th>Branch / Thread</th>
-                <th>Provider</th>
-                <th>Worktree / CI</th>
-                <th>Run state</th>
-                <th>Last poll</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {''.join(rows) or '<tr><td colspan="8">No matching tracked PRs</td></tr>'}
-            </tbody>
-          </table>
-          <h2>Recent Jobs</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Action</th>
-                <th>Status</th>
-                <th>Requested</th>
-                <th>Finished</th>
-                <th>Summary</th>
-              </tr>
-            </thead>
-            <tbody>
-              {''.join(render_job_row(job) for job in jobs) or '<tr><td colspan="6">No jobs yet</td></tr>'}
-            </tbody>
-          </table>
-          <h2>Recent Events</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Level</th>
-                <th>Event</th>
-                <th>PR</th>
-                <th>Message</th>
-              </tr>
-            </thead>
-            <tbody>
-              {''.join(render_event_row(event) for event in events) or '<tr><td colspan="5">No events yet</td></tr>'}
-            </tbody>
-          </table>
-        </main>
-        """
-        self._send_html(html_page("PR Review Coordinator", body))
+        if parsed.path == "/":
+            body = render_dashboard_shell(
+                params.get("scope", ["active"])[0],
+                params.get("status", ["all"])[0],
+                params.get("sort", ["updated"])[0],
+            )
+            self._send_html(html_page("PR Review Coordinator", body))
+            return
+        if parsed.path == "/import":
+            body = render_import_shell(list_recent_project_candidates())
+            self._send_html(html_page("PR Review Coordinator Import", body))
+            return
+        if parsed.path == "/api/dashboard":
+            payload = build_dashboard_payload(
+                params.get("scope", ["active"])[0],
+                params.get("status", ["all"])[0],
+                params.get("sort", ["updated"])[0],
+            )
+            self._send_json(payload)
+            return
+        if parsed.path == "/api/import/open-prs":
+            payload = build_import_payload(
+                params.get("repo_root", [""])[0],
+                params.get("provider", ["codex"])[0],
+            )
+            status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.BAD_REQUEST
+            self._send_json(payload, status=status)
+            return
+        self._send_html(html_page("Not found", "<main><p>Unknown action</p></main>"), status=404)
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         params = self._request_params()
+        if parsed.path == "/api/actions/poll-all":
+            status, payload = queue_simple_web_action("poll-all", key=None, requested_by="web")
+            payload["message"] = "Queued poll all."
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/poll-one":
+            status, payload = queue_simple_web_action("poll-one", key=params.get("key", [None])[0], requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/run-one":
+            status, payload = queue_simple_web_action("run-one", key=params.get("key", [None])[0], payload={"force_run": True}, requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/untrack":
+            status, payload = queue_simple_web_action("untrack", key=params.get("key", [None])[0], requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/untrack-cleanup":
+            status, payload = queue_simple_web_action("untrack-cleanup", key=params.get("key", [None])[0], requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/track-open":
+            status, payload = queue_track_open_from_request(params, requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/retarget-thread":
+            status, payload = queue_retarget_thread_from_request(parsed.path, params, requested_by="web")
+            self._send_json(payload, status=status)
+            return
         if parsed.path == "/poll":
             enqueue_job("poll-all", requested_by="web")
             self._redirect("/")
@@ -2762,124 +3635,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._redirect("/")
             return
         if parsed.path == "/track-open":
-            repo_root = (params.get("project_root", [""])[0] or "").strip()
-            repo_name = (params.get("repo_name", [""])[0] or "").strip() or None
-            provider = (params.get("provider", ["codex"])[0] or "codex").strip().lower() or "codex"
-            queued = 0
-            resolved_threads: dict[int, dict[str, Any]] = {}
-            thread_collisions: dict[str, list[int]] = {}
-            for value in params.get("selected_pr", []):
-                try:
-                    pr_number = int(value)
-                except ValueError:
-                    continue
-                branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
-                if not repo_root or not branch:
-                    continue
-                thread_strategy = (params.get(f"thread_strategy_{pr_number}", [""])[0] or "").strip() or None
-                requested_new_thread = bool(params.get(f"new_thread_{pr_number}", []))
-                existing_thread_id = (params.get(f"existing_thread_id_{pr_number}", [""])[0] or "").strip() or None
-                requested_thread_id = (params.get(f"thread_id_{pr_number}", [""])[0] or "").strip() or None
-                if provider == "codex":
-                    if thread_strategy == "keep_current":
-                        requested_thread_id = existing_thread_id
-                    elif thread_strategy == "latest_repo":
-                        requested_thread_id = None
-                    elif thread_strategy == "specific_thread":
-                        if not requested_thread_id:
-                            query = {
-                                "project_root": repo_root,
-                                "provider": provider,
-                                "notice": f"PR #{pr_number}: enter an existing Codex thread ID or choose a different thread action.",
-                            }
-                            self._redirect(f"/?{urlencode(query)}")
-                            return
-                    elif thread_strategy == "fresh_thread":
-                        requested_new_thread = True
-                    if requested_thread_id == NEW_CODEX_THREAD_SENTINEL:
-                        requested_new_thread = True
-                    if requested_new_thread:
-                        resolved_threads[pr_number] = {"id": NEW_CODEX_THREAD_SENTINEL, "title": "Fresh Codex thread"}
-                        continue
-                    if not requested_thread_id and existing_thread_id:
-                        requested_thread_id = existing_thread_id
-                    try:
-                        thread = resolve_selected_thread(repo_root, provider, requested_thread_id, prefer_latest_when_empty=True)
-                        key = tracked_pr_key(repo_name or ensure_repo_name(repo_root, None)[1], pr_number)
-                        assert_thread_available(thread["id"], key)
-                        resolved_threads[pr_number] = thread
-                        thread_collisions.setdefault(thread["id"], []).append(pr_number)
-                    except ScriptError as exc:
-                        query = {"project_root": repo_root, "provider": provider, "notice": str(exc)}
-                        self._redirect(f"/?{urlencode(query)}")
-                        return
-            duplicate_threads = {thread_id: numbers for thread_id, numbers in thread_collisions.items() if len(numbers) > 1}
-            if duplicate_threads:
-                collision_summary = ", ".join(
-                    f"{thread_id[:8]} for PRs {', '.join(str(number) for number in numbers)}"
-                    for thread_id, numbers in duplicate_threads.items()
-                )
-                query = {
-                    "project_root": repo_root,
-                    "provider": provider,
-                    "notice": f"Codex thread ids must be distinct per active PR: {collision_summary}",
-                }
-                self._redirect(f"/?{urlencode(query)}")
-                return
-            detected_repo_name = repo_name or ensure_repo_name(repo_root, None)[1]
-            for value in params.get("selected_pr", []):
-                try:
-                    pr_number = int(value)
-                except ValueError:
-                    continue
-                branch = (params.get(f"branch_{pr_number}", [""])[0] or "").strip()
-                if not repo_root or not branch:
-                    continue
-                key = tracked_pr_key(detected_repo_name, pr_number)
-                enqueue_job(
-                    "track-existing",
-                    tracked_pr_key=key,
-                    requested_by="web",
-                    payload={
-                        "repo_root": repo_root,
-                        "repo_name": detected_repo_name,
-                        "pr_number": pr_number,
-                        "branch": branch,
-                        "provider": provider,
-                        "thread_id": (resolved_threads.get(pr_number) or {}).get("id"),
-                    },
-                )
-                queued += 1
-            query = {"project_root": repo_root, "provider": provider}
-            query["notice"] = f"Queued {queued} PR import job(s)." if queued else "No PRs selected."
-            self._redirect(f"/?{urlencode(query)}")
+            queue_track_open_from_request(params, requested_by="web")
+            self._redirect("/import")
             return
         if parsed.path in {"/retarget-thread", "/renew-thread"}:
-            notice = "No PR selected."
-            key = params.get("key", [None])[0]
-            if key:
-                record = get_tracked_pr(key)
-                notice = "Queued thread update."
-                thread_id = None if parsed.path == "/renew-thread" else ((params.get("thread_id", [""])[0] or "").strip() or None)
-                if record.provider == "codex":
-                    if thread_id == NEW_CODEX_THREAD_SENTINEL:
-                        notice = "Queued fresh Codex thread creation."
-                    else:
-                        try:
-                            thread = resolve_selected_thread(record.repo_root, record.provider, thread_id, prefer_latest_when_empty=True)
-                            assert_thread_available(thread["id"], record.key)
-                        except ScriptError as exc:
-                            self._redirect(f"/?{urlencode({'notice': str(exc)})}")
-                            return
-                        thread_id = thread["id"]
-                        notice = f"Queued thread update to {thread['id'][:8]}."
-                enqueue_job(
-                    "retarget-thread",
-                    tracked_pr_key=key,
-                    requested_by="web",
-                    payload={"thread_id": thread_id, "provider": record.provider},
-                )
-            self._redirect(f"/?{urlencode({'notice': notice})}")
+            queue_retarget_thread_from_request(parsed.path, params, requested_by="web")
+            self._redirect("/")
             return
         self._send_html(html_page("Not found", "<main><p>Unknown action</p></main>"), status=404)
 
@@ -2933,10 +3694,14 @@ def html_page(title: str, body: str) -> bytes:
     h1, h2 {{ margin: 0 0 12px; }}
     p {{ margin: 6px 0 0; color: var(--muted); }}
     main {{ padding: 0 28px 28px; }}
+    .nav-bar {{ display: flex; gap: 10px; margin: 16px 0 0; }}
+    .nav-link {{ display: inline-block; padding: 8px 12px; border-radius: 999px; background: #ebe3d4; color: var(--ink); text-decoration: none; }}
+    .nav-link.current {{ background: var(--accent); color: #fffaf2; }}
     .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 12px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
     button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 8px 12px; border-radius: 8px; cursor: pointer; font: inherit; }}
     input[type="text"] {{ min-width: 360px; cursor: text; }}
     input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; }}
+    button[disabled], select[disabled], input[disabled] {{ opacity: 0.6; cursor: not-allowed; }}
     table {{ width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 18px; }}
     th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }}
     th {{ background: #ebe3d4; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
@@ -2948,7 +3713,9 @@ def html_page(title: str, body: str) -> bytes:
     .stack {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
     .panel {{ background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 0 0 18px; }}
     .flash {{ margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; background: #d7edea; color: var(--accent); }}
+    .flash.success {{ background: #d7edea; color: var(--accent); }}
     .flash.error {{ background: #f7d8d5; color: var(--bad); }}
+    .hidden {{ display: none; }}
     .bulk-track {{ display: block; }}
     .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
     .browser-panel[open] summary {{ margin-bottom: 12px; }}
@@ -2960,6 +3727,7 @@ def html_page(title: str, body: str) -> bytes:
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
     .thread-panel {{ border: 1px solid var(--line); border-radius: 10px; background: #f8f3eb; padding: 10px 12px; }}
     .thread-mode {{ display: grid; gap: 6px; }}
+    .button-stack {{ display: grid; gap: 8px; justify-items: start; }}
     .muted {{ opacity: 0.65; }}
     code {{ font: inherit; }}
     form {{ display: inline; }}

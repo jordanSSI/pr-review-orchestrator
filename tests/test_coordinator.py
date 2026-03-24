@@ -2,7 +2,11 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -440,6 +444,286 @@ class HtmlPageTests(unittest.TestCase):
         page = pr_review_coordinator.html_page("Dashboard", "<main></main>").decode("utf-8")
 
         self.assertNotIn('http-equiv="refresh"', page)
+
+
+class DashboardHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        self.original_state_db = pr_review_coordinator.CODEX_STATE_DB
+        self.original_ensure_repo_name = pr_review_coordinator.ensure_repo_name
+        self.original_run = pr_review_coordinator.run
+        self.original_list_recent_threads_for_repo = pr_review_coordinator.list_recent_threads_for_repo
+        self.original_resolve_selected_thread = pr_review_coordinator.resolve_selected_thread
+        self.original_assert_thread_available = pr_review_coordinator.assert_thread_available
+
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+        pr_review_coordinator.CODEX_STATE_DB = Path(self.temp_dir.name) / "state.sqlite"
+
+        self.server = pr_review_coordinator.ThreadingHTTPServer(("127.0.0.1", 0), pr_review_coordinator.DashboardHandler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        host, port = self.server.server_address
+        self.base_url = f"http://{host}:{port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
+
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.CODEX_STATE_DB = self.original_state_db
+        pr_review_coordinator.ensure_repo_name = self.original_ensure_repo_name
+        pr_review_coordinator.run = self.original_run
+        pr_review_coordinator.list_recent_threads_for_repo = self.original_list_recent_threads_for_repo
+        pr_review_coordinator.resolve_selected_thread = self.original_resolve_selected_thread
+        pr_review_coordinator.assert_thread_available = self.original_assert_thread_available
+        self.temp_dir.cleanup()
+
+    def request(self, method, path, data=None):
+        body = None
+        headers = {}
+        if data is not None:
+            body = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
+        request = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    def add_record(self, **overrides):
+        payload = {
+            "key": "repo-pr-42",
+            "repo_root": "/tmp/repo",
+            "repo_owner": "owner",
+            "repo_name": "repo",
+            "pr_number": 42,
+            "pr_url": "https://example.com/pr/42",
+            "pr_title": "Example PR",
+            "pr_state": "OPEN",
+            "branch": "feature/example",
+            "base_branch": "main",
+            "worktree_path": "/tmp/worktree",
+            "worktree_managed": 1,
+            "thread_id": "thread-42",
+            "thread_title": "Original bug report and context for the thread",
+            "status": "needs_review",
+            "active": 1,
+            "last_review_signature": None,
+            "last_handled_signature": None,
+            "last_review_status": "needs_review",
+            "last_review_comment_at": None,
+            "pending_copilot_review": 0,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+            "unresolved_threads_json": "[]",
+            "actionable_comments_json": "[]",
+            "failing_checks_json": "[]",
+            "ci_summary": None,
+            "run_state": None,
+            "run_reason": None,
+            "current_job_id": None,
+            "lock_started_at": None,
+            "lock_owner_pid": None,
+            "last_polled_at": None,
+            "last_prompted_at": None,
+            "last_run_started_at": None,
+            "last_run_finished_at": None,
+            "last_run_status": "ready",
+            "last_run_summary": "Idle",
+            "last_error": None,
+            "last_copilot_rerequested_at": None,
+            "provider": "codex",
+            "created_at": 0,
+            "updated_at": 0,
+        }
+        payload.update(overrides)
+        pr_review_coordinator.upsert_tracked_pr(payload)
+
+    def test_get_root_renders_dashboard_shell_without_import_controls(self):
+        status, body = self.request("GET", "/?scope=all&status=needs_review&sort=pr&project_root=/tmp/repo&provider=cursor&notice=test")
+
+        self.assertEqual(status, 200)
+        self.assertIn('id="dashboard-root"', body)
+        self.assertIn('name="scope"', body)
+        self.assertIn('value="all" selected', body)
+        self.assertIn('value="needs_review" selected', body)
+        self.assertIn('value="pr" selected', body)
+        self.assertNotIn('id="import-form"', body)
+        self.assertNotIn("Track Open PRs", body)
+
+    def test_get_import_renders_import_shell(self):
+        status, body = self.request("GET", "/import?project_root=/tmp/repo&provider=cursor&notice=test")
+
+        self.assertEqual(status, 200)
+        self.assertIn('id="import-form"', body)
+        self.assertIn('id="import-browser"', body)
+        self.assertNotIn('id="dashboard-filters"', body)
+
+    def test_api_dashboard_returns_filtered_payload(self):
+        self.add_record(key="repo-pr-1", pr_number=1, pr_title="Needs review", status="needs_review", active=1, updated_at=10)
+        self.add_record(key="repo-pr-2", pr_number=2, pr_title="Archived", status="awaiting_final_test", active=0, updated_at=20)
+        pr_review_coordinator.enqueue_job("poll-one", tracked_pr_key="repo-pr-1", requested_by="test")
+        pr_review_coordinator.record_event("info", "test_event", "hello", tracked_pr_key="repo-pr-1")
+
+        status, body = self.request("GET", "/api/dashboard?scope=all&status=needs_review&sort=pr")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["filters"], {"scope": "all", "status": "needs_review", "sort": "pr"})
+        self.assertEqual(len(payload["records"]), 1)
+        self.assertEqual(payload["records"][0]["key"], "repo-pr-1")
+        self.assertTrue(payload["jobs"])
+        self.assertTrue(payload["events"])
+
+    def test_api_import_open_prs_returns_repo_data(self):
+        pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
+        pr_review_coordinator.run = lambda *args, **kwargs: mock.Mock(
+            stdout=json.dumps(
+                [
+                    {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "Example PR",
+                        "headRefName": "feature/example",
+                        "baseRefName": "main",
+                        "isDraft": False,
+                        "state": "OPEN",
+                    }
+                ]
+            )
+        )
+        pr_review_coordinator.list_recent_threads_for_repo = lambda repo_root, limit=12, current_key=None: [
+            {"id": "thread-1", "title": "Recent thread", "updated_at": 100, "in_use_by": None, "conflict": False}
+        ]
+
+        with tempfile.TemporaryDirectory() as repo_dir:
+            status_result = mock.Mock(stdout=repo_dir)
+            original_run = pr_review_coordinator.run
+
+            def fake_run(cmd, cwd=None):
+                if cmd[:4] == ["git", "-C", repo_dir, "rev-parse"]:
+                    return status_result
+                return original_run(cmd, cwd=cwd)
+
+            pr_review_coordinator.run = fake_run
+            status, body = self.request("GET", f"/api/import/open-prs?repo_root={urllib.parse.quote(repo_dir)}&provider=codex")
+
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["repo_name"], "repo")
+        self.assertEqual(payload["prs"][0]["number"], 42)
+        self.assertEqual(payload["threads"][0]["id"], "thread-1")
+
+    def test_api_track_open_returns_accepted_json(self):
+        pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
+        pr_review_coordinator.resolve_selected_thread = lambda repo_root, provider, requested_thread_id, prefer_latest_when_empty=False: {
+            "id": requested_thread_id or "thread-latest",
+            "title": "Thread",
+        }
+        pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/track-open",
+            data={
+                "project_root": "/tmp/repo",
+                "repo_name": "repo",
+                "provider": "codex",
+                "selected_pr": ["42"],
+                "branch_42": "feature/example",
+                "thread_strategy_42": "specific_thread",
+                "thread_id_42": "thread-42",
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["queued"], 1)
+        job = pr_review_coordinator.get_job(payload["job_ids"][0])
+        self.assertEqual(job.action, "track-existing")
+
+    def test_api_track_open_rejects_missing_specific_thread(self):
+        status, body = self.request(
+            "POST",
+            "/api/actions/track-open",
+            data={
+                "project_root": "/tmp/repo",
+                "repo_name": "repo",
+                "provider": "codex",
+                "selected_pr": ["42"],
+                "branch_42": "feature/example",
+                "thread_strategy_42": "specific_thread",
+                "thread_id_42": "",
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("enter an existing Codex thread ID", payload["message"])
+
+    def test_api_track_open_rejects_duplicate_thread_selection(self):
+        pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
+        pr_review_coordinator.resolve_selected_thread = lambda repo_root, provider, requested_thread_id, prefer_latest_when_empty=False: {
+            "id": "thread-shared",
+            "title": "Thread",
+        }
+        pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/track-open",
+            data={
+                "project_root": "/tmp/repo",
+                "repo_name": "repo",
+                "provider": "codex",
+                "selected_pr": ["42", "43"],
+                "branch_42": "feature/one",
+                "thread_strategy_42": "specific_thread",
+                "thread_id_42": "thread-shared",
+                "branch_43": "feature/two",
+                "thread_strategy_43": "specific_thread",
+                "thread_id_43": "thread-shared",
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("must be distinct", payload["message"])
+
+    def test_api_retarget_thread_returns_accepted_json(self):
+        self.add_record()
+        pr_review_coordinator.resolve_selected_thread = lambda repo_root, provider, requested_thread_id, prefer_latest_when_empty=False: {
+            "id": requested_thread_id or "thread-latest",
+            "title": "Thread",
+        }
+        pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/retarget-thread",
+            data={"key": "repo-pr-42", "thread_id": "thread-new"},
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["ok"])
+        self.assertIn("Queued thread update", payload["message"])
+        job = pr_review_coordinator.get_job(payload["job_id"])
+        self.assertEqual(job.action, "retarget-thread")
 
 
 class ThreadSelectionTests(unittest.TestCase):
