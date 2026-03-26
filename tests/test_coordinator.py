@@ -1400,6 +1400,32 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_review")
         self.assertEqual(result["tracked_pr"]["last_run_summary"], "PR is awaiting final review")
 
+    def test_clean_pr_after_agent_run_does_not_emit_fake_state_transition(self):
+        events = []
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: events.append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
+            status="awaiting_final_test",
+            signature="sig-clean",
+        )
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            status="awaiting_final_review",
+            last_prompted_at=1,
+            last_handled_signature="sig-needs-review",
+            last_run_status="ok",
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=102)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(
+            [event for event in events if event["event_type"] == "state_transition"],
+            [],
+        )
+
     def test_clean_pr_without_agent_run_stays_awaiting_final_test(self):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
             status="awaiting_final_test",
@@ -1412,6 +1438,42 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(result["status"], "idle")
         self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_test")
         self.assertEqual(result["tracked_pr"]["last_run_summary"], "PR is not currently actionable")
+
+    def test_poll_record_treats_dirty_worktree_as_busy_without_queueing_follow_up(self):
+        dirty_worktree = Path(self.temp_dir.name) / "dirty-worktree"
+        dirty_worktree.mkdir()
+        pr_review_coordinator.update_tracked_pr("repo-pr-1", worktree_path=str(dirty_worktree))
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot()
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        with mock.patch.object(pr_review_coordinator, "git_status_is_clean", return_value=False):
+            result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=103)
+
+        self.assertEqual(result["status"], "busy")
+        self.assertEqual(result["tracked_pr"]["last_run_status"], "busy")
+        self.assertEqual(pr_review_coordinator.list_pending_jobs(), [])
+
+    def test_poll_record_skips_duplicate_follow_up_event_when_run_already_queued(self):
+        events = []
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: events.append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(signature="sig-duplicate")
+        pr_review_coordinator.enqueue_job(
+            "run-one",
+            tracked_pr_key="repo-pr-1",
+            requested_by="test",
+            payload={"force_run": False, "signature": "sig-duplicate"},
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=104)
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(
+            [event for event in events if event["event_type"] == "follow_up_queued"],
+            [],
+        )
 
     def test_poll_record_waits_during_copilot_review_cooldown(self):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(

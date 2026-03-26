@@ -1821,13 +1821,14 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
     )
     snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
     previous_status = record.status
-    if previous_status != snapshot["status"]:
+    tracked_status = tracked_status_for_snapshot(snapshot, last_prompted_at=record.last_prompted_at)
+    if previous_status != tracked_status:
         record_event(
             "info",
             "state_transition",
-            f"PR state changed from {previous_status} to {snapshot['status']}",
+            f"PR state changed from {previous_status} to {tracked_status}",
             tracked_pr_key=record.key,
-            details={"from": previous_status, "to": snapshot["status"]},
+            details={"from": previous_status, "to": tracked_status, "snapshot_status": snapshot["status"]},
         )
 
     if snapshot["pr"]["state"] != "OPEN":
@@ -1872,6 +1873,20 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
         )
         return {"status": "dry_run", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True}
 
+    worktree_path = Path(record.worktree_path)
+    if worktree_path.exists() and not git_status_is_clean(worktree_path):
+        summary = f"Worktree has local changes; treating this PR as busy: {record.worktree_path}"
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="busy",
+            last_run_summary=summary,
+            last_error=None,
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
+        )
+        record_event("info", "worktree_busy", summary, tracked_pr_key=record.key)
+        return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
+
     enqueue_result = enqueue_job(
         "run-one",
         tracked_pr_key=record.key,
@@ -1888,7 +1903,8 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
         last_error=None,
         **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
     )
-    record_event("info", "follow_up_queued", summary, tracked_pr_key=record.key, details={"job_id": job["id"], "duplicate": enqueue_result["duplicate"]})
+    if not enqueue_result["duplicate"]:
+        record_event("info", "follow_up_queued", summary, tracked_pr_key=record.key, details={"job_id": job["id"], "duplicate": False})
     return {"status": "queued", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True, "job": job}
 
 
