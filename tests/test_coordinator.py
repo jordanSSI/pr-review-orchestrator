@@ -386,6 +386,8 @@ class PromptInstructionTests(unittest.TestCase):
             "provider": "codex",
             "created_at": 0,
             "updated_at": 0,
+            "live_activity_json": None,
+            "live_activity_updated_at": None,
         }
         payload.update(overrides)
         return pr_review_coordinator.TrackedPR(**payload)
@@ -951,6 +953,52 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertIn("Recent repo threads", markup)
         self.assertIn("Titles below are stored thread titles/opening prompts, not latest replies.", markup)
 
+    def test_render_record_row_shows_live_activity_panel(self):
+        markup = pr_review_coordinator.render_record_row(
+            self.make_record(
+                live_activity_json=json.dumps(
+                    {
+                        "headline": "Investigating failing typecheck in the PR worktree",
+                        "items": [
+                            {"kind": "file", "text": "Updated src/worker.ts +12 -4"},
+                            {"kind": "command", "text": "Running pnpm test --filter worker"},
+                        ],
+                    }
+                )
+            )
+        )
+
+        self.assertIn('data-role="live-activity"', markup)
+        self.assertIn("Investigating failing typecheck in the PR worktree", markup)
+        self.assertIn("Updated src/worker.ts +12 -4", markup)
+        self.assertIn("Running pnpm test --filter worker", markup)
+
+    def test_update_live_activity_from_codex_event_tracks_headline_and_files(self):
+        activity = pr_review_coordinator.empty_live_activity()
+        stream_state = {"message": "", "plan": "", "reasoning": ""}
+
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(
+            activity,
+            {"type": "agent_message_delta", "delta": "Investigating module resolution."},
+            stream_state,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(activity["headline"], "Investigating module resolution.")
+
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(
+            activity,
+            {
+                "type": "patch_apply_begin",
+                "changes": {
+                    "src/graph.ts": {"type": "add", "unified_diff": "@@ -0,0 +1,2 @@\n+one\n+two\n"},
+                },
+            },
+            stream_state,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(activity["items"][0]["kind"], "file")
+        self.assertIn("Created src/graph.ts +2 -0", activity["items"][0]["text"])
+
 
 class ProjectImportRenderingTests(unittest.TestCase):
     def test_tracked_rows_are_selectable_and_offer_fresh_thread(self):
@@ -1175,6 +1223,118 @@ class ThreadPolicyTests(unittest.TestCase):
         self.assertEqual(result[0]["in_use_by"], "repo #1")
         self.assertTrue(result[0]["conflict"])
         self.assertIsNone(result[1]["in_use_by"])
+
+
+class RefreshRecordStateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+
+    def tearDown(self):
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        self.temp_dir.cleanup()
+
+    def add_record(self, **overrides):
+        payload = {
+            "key": "repo-pr-42",
+            "repo_root": "/tmp/repo",
+            "repo_owner": "owner",
+            "repo_name": "repo",
+            "pr_number": 42,
+            "pr_url": "https://example.com/pr/42",
+            "pr_title": "Example PR",
+            "pr_state": "OPEN",
+            "branch": "feature/example",
+            "base_branch": "main",
+            "worktree_path": "/tmp/worktree",
+            "worktree_managed": 1,
+            "thread_id": "thread-42",
+            "thread_title": "Thread",
+            "status": "needs_review",
+            "active": 1,
+            "last_review_signature": "sig-1",
+            "last_handled_signature": None,
+            "last_review_status": "needs_review",
+            "last_review_comment_at": None,
+            "pending_copilot_review": 0,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+            "unresolved_threads_json": "[]",
+            "actionable_comments_json": "[]",
+            "failing_checks_json": "[]",
+            "ci_summary": None,
+            "run_state": "running",
+            "run_reason": "codex",
+            "current_job_id": 100,
+            "lock_started_at": 111,
+            "lock_owner_pid": 222,
+            "last_polled_at": None,
+            "last_prompted_at": None,
+            "last_run_started_at": 111,
+            "last_run_finished_at": None,
+            "last_run_status": "running",
+            "last_run_summary": "Launching codex follow-up",
+            "last_error": None,
+            "provider": "codex",
+            "live_activity_json": json.dumps({"headline": "Launching codex follow-up", "items": []}),
+            "live_activity_updated_at": 111,
+        }
+        payload.update(overrides)
+        return pr_review_coordinator.upsert_tracked_pr(payload)
+
+    def snapshot(self):
+        return {
+            "status": "needs_review",
+            "signature": "sig-2",
+            "latest_comment_at": None,
+            "pending_copilot_review": False,
+            "unresolved_threads": [],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "pr": {"state": "OPEN", "title": "Example PR", "url": "https://example.com/pr/42"},
+        }
+
+    def test_foreign_job_does_not_overwrite_active_run_state(self):
+        stale_record = self.add_record(current_job_id=100)
+
+        updated = pr_review_coordinator.refresh_record_state(
+            stale_record,
+            self.snapshot(),
+            run_status="busy",
+            run_summary="Worktree has local changes",
+            finished=True,
+            job_id=200,
+        )
+
+        self.assertEqual(updated.run_state, "running")
+        self.assertEqual(updated.current_job_id, 100)
+        self.assertEqual(updated.last_run_summary, "Launching codex follow-up")
+        self.assertIsNotNone(updated.live_activity_json)
+
+    def test_current_job_finish_clears_live_activity(self):
+        record = self.add_record(current_job_id=100)
+
+        updated = pr_review_coordinator.refresh_record_state(
+            record,
+            self.snapshot(),
+            run_status="busy",
+            run_summary="Worktree has local changes",
+            finished=True,
+            job_id=100,
+        )
+
+        self.assertIsNone(updated.run_state)
+        self.assertIsNone(updated.current_job_id)
+        self.assertEqual(updated.last_run_summary, "Worktree has local changes")
+        self.assertIsNone(updated.live_activity_json)
 
 
 class RegisterTrackingTests(unittest.TestCase):

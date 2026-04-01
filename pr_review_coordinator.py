@@ -8,6 +8,7 @@ import errno
 import html
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -54,6 +55,9 @@ DEFAULT_POLL_SECONDS = 300
 DEFAULT_WORKER_COUNT = 4
 NEW_CODEX_THREAD_SENTINEL = "__new_codex_thread__"
 COPILOT_RETRY_COOLDOWN_MS = 15 * 60 * 1000
+DEFAULT_REFRESH_INTERVAL_SECONDS = 5
+ACTIVE_REFRESH_INTERVAL_SECONDS = 2
+MAX_LIVE_ACTIVITY_ITEMS = 6
 ACTIVE_STATUSES = {"needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "needs_review": 0,
@@ -127,6 +131,8 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     last_run_status TEXT,
     last_run_summary TEXT,
     last_error TEXT,
+    live_activity_json TEXT,
+    live_activity_updated_at INTEGER,
     last_copilot_rerequested_at INTEGER,
     provider TEXT NOT NULL DEFAULT 'codex',
     created_at INTEGER NOT NULL,
@@ -214,6 +220,8 @@ class TrackedPR:
     provider: str
     created_at: int
     updated_at: int
+    live_activity_json: str | None = None
+    live_activity_updated_at: int | None = None
     last_copilot_rerequested_at: int | None = None
 
 
@@ -272,6 +280,162 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+def normalize_event_type(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+
+
+def empty_live_activity(*, headline: str = "") -> dict[str, Any]:
+    return {
+        "headline": compact_thread_text(headline, limit=280, empty="") if headline else "",
+        "items": [],
+    }
+
+
+def load_live_activity(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return empty_live_activity()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty_live_activity()
+    if not isinstance(payload, dict):
+        return empty_live_activity()
+    headline = compact_thread_text(str(payload.get("headline") or ""), limit=280, empty="")
+    items: list[dict[str, str]] = []
+    for item in payload.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        text = compact_thread_text(str(item.get("text") or ""), limit=180, empty="")
+        if not text:
+            continue
+        kind = str(item.get("kind") or "info")
+        key = str(item.get("key") or f"{kind}:{text}")
+        items.append({"key": key, "kind": kind, "text": text})
+    return {"headline": headline, "items": items[-MAX_LIVE_ACTIVITY_ITEMS:]}
+
+
+def summarize_live_activity(activity: dict[str, Any]) -> str:
+    headline = compact_thread_text(str(activity.get("headline") or ""), limit=220, empty="")
+    if headline:
+        return headline
+    items = activity.get("items") or []
+    if items:
+        return compact_thread_text(str(items[-1].get("text") or ""), limit=220, empty="")
+    return "Codex agent is running"
+
+
+def set_live_activity_headline(activity: dict[str, Any], text: str) -> bool:
+    headline = compact_thread_text(text, limit=280, empty="")
+    if not headline or activity.get("headline") == headline:
+        return False
+    activity["headline"] = headline
+    return True
+
+
+def upsert_live_activity_item(activity: dict[str, Any], *, key: str, kind: str, text: str) -> bool:
+    normalized_text = compact_thread_text(text, limit=180, empty="")
+    if not normalized_text:
+        return False
+    items = [item for item in (activity.get("items") or []) if item.get("key") != key]
+    items.append({"key": key, "kind": kind, "text": normalized_text})
+    activity["items"] = items[-MAX_LIVE_ACTIVITY_ITEMS:]
+    return True
+
+
+def diff_line_counts(unified_diff: str | None) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in (unified_diff or "").splitlines():
+        if line.startswith(("+++", "---", "@@")):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
+
+
+def summarize_patch_change(path: str, change: Any) -> str:
+    relative_path = compact_thread_text(path, limit=120, empty="<unknown file>")
+    if not isinstance(change, dict):
+        return f"Updated {relative_path}"
+    change_type = normalize_event_type(str(change.get("type") or change.get("changeType") or "update"))
+    verb = {
+        "add": "Created",
+        "added": "Created",
+        "delete": "Deleted",
+        "deleted": "Deleted",
+        "remove": "Deleted",
+        "removed": "Deleted",
+        "update": "Updated",
+        "updated": "Updated",
+    }.get(change_type, "Updated")
+    additions, deletions = diff_line_counts(str(change.get("unified_diff") or change.get("unifiedDiff") or ""))
+    stats = f" +{additions} -{deletions}" if additions or deletions else ""
+    return f"{verb} {relative_path}{stats}"
+
+
+def summarize_command(argv: Any) -> str:
+    if not isinstance(argv, list):
+        return ""
+    command = " ".join(str(part) for part in argv if part is not None).strip()
+    return compact_thread_text(command, limit=160, empty="")
+
+
+def update_live_activity_from_codex_event(activity: dict[str, Any], event: dict[str, Any], stream_state: dict[str, str]) -> bool:
+    event_type = normalize_event_type(str(event.get("type") or ""))
+    changed = False
+    if event_type in {"agent_message_delta", "agent_message_content_delta"}:
+        delta = str(event.get("delta") or "")
+        if delta:
+            stream_state["message"] = f"{stream_state.get('message', '')}{delta}"
+            changed = set_live_activity_headline(activity, stream_state["message"]) or changed
+    elif event_type == "agent_message":
+        message = str(event.get("message") or "")
+        if message:
+            stream_state["message"] = message
+            changed = set_live_activity_headline(activity, message) or changed
+    elif event_type in {"plan_delta", "plan_update"}:
+        delta = str(event.get("delta") or event.get("message") or "")
+        if delta:
+            stream_state["plan"] = f"{stream_state.get('plan', '')}{delta}"
+            changed = set_live_activity_headline(activity, stream_state["plan"]) or changed
+    elif event_type in {"agent_reasoning", "agent_reasoning_delta", "reasoning_content_delta"}:
+        delta = str(event.get("delta") or event.get("text") or "")
+        if delta:
+            stream_state["reasoning"] = f"{stream_state.get('reasoning', '')}{delta}"
+            if not activity.get("headline"):
+                changed = set_live_activity_headline(activity, stream_state["reasoning"]) or changed
+    elif event_type == "patch_apply_begin":
+        changes = event.get("changes") or {}
+        if isinstance(changes, dict):
+            for path, change in changes.items():
+                changed = upsert_live_activity_item(
+                    activity,
+                    key=f"file:{path}",
+                    kind="file",
+                    text=summarize_patch_change(str(path), change),
+                ) or changed
+    elif event_type == "patch_apply_end":
+        if not bool(event.get("success", True)):
+            message = str(event.get("stderr") or event.get("stdout") or "Patch apply failed")
+            changed = upsert_live_activity_item(activity, key=f"patch:{event.get('call_id') or 'unknown'}", kind="error", text=message) or changed
+    elif event_type == "exec_command_begin":
+        command = summarize_command(event.get("command"))
+        if command:
+            changed = upsert_live_activity_item(
+                activity,
+                key=f"command:{event.get('call_id') or command}",
+                kind="command",
+                text=f"Running {command}",
+            ) or changed
+    elif event_type in {"background_event", "warning", "stream_error", "error"}:
+        message = str(event.get("message") or "")
+        if message:
+            changed = set_live_activity_headline(activity, message) or changed
+    return changed
+
+
 def connect_db() -> sqlite3.Connection:
     VAR_DIR.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(COORDINATOR_DB)
@@ -300,6 +464,8 @@ def connect_db() -> sqlite3.Connection:
             "last_run_finished_at": "INTEGER",
             "last_copilot_rerequested_at": "INTEGER",
             "provider": "TEXT NOT NULL DEFAULT 'codex'",
+            "live_activity_json": "TEXT",
+            "live_activity_updated_at": "INTEGER",
         },
     )
     connection.commit()
@@ -363,6 +529,8 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "last_run_status": record.last_run_status,
         "last_run_summary": record.last_run_summary,
         "last_error": record.last_error,
+        "live_activity_json": record.live_activity_json,
+        "live_activity_updated_at": record.live_activity_updated_at,
         "last_copilot_rerequested_at": record.last_copilot_rerequested_at,
         "provider": record.provider,
         "created_at": record.created_at,
@@ -416,6 +584,7 @@ def thread_option_to_dict(thread: dict[str, Any]) -> dict[str, Any]:
 def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None = None, recent_threads: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     pending_jobs = pending_jobs or []
     recent_threads = recent_threads or []
+    live_activity = load_live_activity(record.live_activity_json)
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
@@ -446,6 +615,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "detail_text": " | ".join(details),
         "run_status": record.run_state or record.last_run_status or "unknown",
         "run_summary": record.last_run_summary or "",
+        "live_activity": live_activity,
         "last_polled_at": record.last_polled_at,
         "last_polled_label": format_timestamp(record.last_polled_at),
         "actions_disabled": bool(pending_jobs),
@@ -590,6 +760,8 @@ def cleanup_stale_runtime_state() -> None:
                 current_job_id=None,
                 run_state=None,
                 run_reason=None,
+                live_activity_json=None,
+                live_activity_updated_at=None,
             )
     connection = connect_db()
     try:
@@ -1307,8 +1479,18 @@ def finish_job(job_id: int, status: str, summary: str, *, error: str | None = No
 
 
 def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_status: str | None = None, run_summary: str | None = None, error: str | None = None, run_reason: str | None = None, prompted: bool = False, finished: bool = False, job_id: int | None = None) -> TrackedPR:
-    prompted_at = now_ms() if prompted else record.last_prompted_at
+    current = get_tracked_pr(record.key)
+    prompted_at = now_ms() if prompted else current.last_prompted_at
     changes = state_payload(snapshot, last_prompted_at=prompted_at)
+    active_foreign_run = bool(
+        current.run_state == "running"
+        and current.current_job_id
+        and (job_id is None or current.current_job_id != job_id)
+    )
+    if active_foreign_run:
+        if prompted:
+            changes["last_prompted_at"] = prompted_at
+        return update_tracked_pr(record.key, **changes)
     if run_status is not None:
         changes["last_run_status"] = run_status
     if run_summary is not None:
@@ -1322,6 +1504,8 @@ def refresh_record_state(record: TrackedPR, snapshot: dict[str, Any], *, run_sta
         changes["last_run_finished_at"] = now_ms()
         changes["run_state"] = None
         changes["current_job_id"] = None
+        changes["live_activity_json"] = None
+        changes["live_activity_updated_at"] = None
     elif job_id is not None:
         changes["current_job_id"] = job_id
     return update_tracked_pr(record.key, **changes)
@@ -1611,7 +1795,33 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool)
     with tempfile.NamedTemporaryFile(prefix="codex-pr-followup-", suffix=".txt", delete=False) as output_file:
         output_path = output_file.name
     try:
-        result = subprocess.run(
+        stderr_lines: list[str] = []
+        stdout_lines: list[str] = []
+        activity = empty_live_activity(headline="Launching Codex follow-up")
+        stream_state = {"message": "", "plan": "", "reasoning": ""}
+        last_persist_at = 0
+
+        def persist_live_activity(*, force: bool = False) -> None:
+            nonlocal last_persist_at
+            timestamp = now_ms()
+            if not force and timestamp - last_persist_at < 700:
+                return
+            update_tracked_pr(
+                record.key,
+                live_activity_json=json_dumps(activity),
+                live_activity_updated_at=timestamp,
+                last_run_summary=summarize_live_activity(activity),
+            )
+            last_persist_at = timestamp
+
+        def read_stderr(stream: Any) -> None:
+            try:
+                for line in stream:
+                    stderr_lines.append(line)
+            finally:
+                stream.close()
+
+        process = subprocess.Popen(
             [
                 codex_bin,
                 "exec",
@@ -1619,19 +1829,40 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool)
                 record.thread_id,
                 prompt,
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--json",
                 "--output-last-message",
                 output_path,
             ],
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
         )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stderr_thread = threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True)
+        stderr_thread.start()
+        for line in process.stdout:
+            stdout_lines.append(line)
+            stripped = line.strip()
+            if not stripped or not stripped.startswith("{"):
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if update_live_activity_from_codex_event(activity, event, stream_state):
+                persist_live_activity()
+        process.stdout.close()
+        return_code = process.wait()
+        stderr_thread.join(timeout=2)
+        persist_live_activity(force=True)
         last_message = Path(output_path).read_text(encoding="utf-8").strip() if Path(output_path).exists() else ""
         return {
-            "status": "ok" if result.returncode == 0 else "error",
-            "exit_code": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
+            "status": "ok" if return_code == 0 else "error",
+            "exit_code": return_code,
+            "stdout": "".join(stdout_lines).strip(),
+            "stderr": "".join(stderr_lines).strip(),
             "last_message": last_message,
         }
     finally:
@@ -1990,6 +2221,11 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
         sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
         provider = (record.provider or "codex").strip().lower()
         refresh_record_state(record, snapshot, run_status="running", run_summary=f"Resuming {provider} agent", run_reason=provider, job_id=job_id)
+        update_tracked_pr(
+            record.key,
+            live_activity_json=json_dumps(empty_live_activity(headline=f"Launching {provider} follow-up")),
+            live_activity_updated_at=now_ms(),
+        )
         record_event("info", "agent_resume", f"Launching {provider} follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run, "provider": provider})
         agent_result = run_agent_resume(record, snapshot, dry_run)
         updated = refresh_record_state(
@@ -2002,7 +2238,9 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
             finished=True,
         )
         if agent_result["status"] in {"ok", "dry_run"}:
-            updated = update_tracked_pr(record.key, **execution_payload(snapshot))
+            updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None, **execution_payload(snapshot))
+        else:
+            updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None)
         level = "info" if agent_result["status"] in {"ok", "dry_run"} else "error"
         record_event(level, "agent_finished", f"Agent follow-up finished with status {agent_result['status']}", tracked_pr_key=record.key, details={"job_id": job_id, "provider": provider})
         return {
@@ -2133,6 +2371,8 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
                     last_run_status="error",
                     last_run_summary=str(exc),
                     last_error=str(exc),
+                    live_activity_json=None,
+                    live_activity_updated_at=None,
                 )
             except ScriptError:
                 pass
@@ -2201,9 +2441,23 @@ def describe_pending_jobs(record: TrackedPR, jobs: list[Job]) -> str:
     return f"{label} {verb}{suffix}"
 
 
+def render_live_activity_markup(activity: dict[str, Any]) -> str:
+    headline = str(activity.get("headline") or "").strip()
+    items = [item for item in (activity.get("items") or []) if str(item.get("text") or "").strip()]
+    if not headline and not items:
+        return ""
+    headline_markup = f'<div class="live-activity-headline">{html.escape(headline)}</div>' if headline else ""
+    items_markup = "".join(
+        f'<div class="live-activity-line live-activity-{html.escape(str(item.get("kind") or "info"))}">{html.escape(str(item.get("text") or ""))}</div>'
+        for item in items
+    )
+    return f'<div class="live-activity" data-role="live-activity">{headline_markup}{items_markup}</div>'
+
+
 def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, recent_threads: list[dict[str, Any]] | None = None) -> str:
     pending_jobs = pending_jobs or []
     recent_threads = recent_threads or []
+    live_activity = load_live_activity(record.live_activity_json)
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
@@ -2304,7 +2558,7 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
           <td><code>{html.escape(record.branch)}</code>{thread_controls}</td>
           <td><code>{html.escape(record.provider or "codex")}</code></td>
           <td><code>{html.escape(record.worktree_path)}</code><div class="small" data-role="detail-text">{html.escape(detail_text)}</div></td>
-          <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div></td>
+          <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div>{render_live_activity_markup(live_activity)}</td>
           <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
           <td>
             <form method="post" action="/run-one?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'run now queued')"><button {actions_disabled}>Run now</button></form>
@@ -2825,7 +3079,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
         <script>
           const DASHBOARD_API_URL = '/api/dashboard';
           const ACTION_API_BASE = '/api/actions';
-          const REFRESH_INTERVAL_SECONDS = 5;
+          const DEFAULT_REFRESH_INTERVAL_SECONDS = {DEFAULT_REFRESH_INTERVAL_SECONDS};
+          const ACTIVE_REFRESH_INTERVAL_SECONDS = {ACTIVE_REFRESH_INTERVAL_SECONDS};
           const REFRESH_PAUSE_KEY = 'pr-review-coordinator.refresh-paused';
           const NEW_THREAD_SENTINEL = {json.dumps(NEW_CODEX_THREAD_SENTINEL)};
           const state = {{
@@ -2835,7 +3090,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
               sort: {json.dumps(normalized_sort_key)},
             }},
             refreshPaused: sessionStorage.getItem(REFRESH_PAUSE_KEY) === '1',
-            secondsRemaining: REFRESH_INTERVAL_SECONDS,
+            refreshIntervalSeconds: DEFAULT_REFRESH_INTERVAL_SECONDS,
+            secondsRemaining: DEFAULT_REFRESH_INTERVAL_SECONDS,
             loading: false,
           }};
 
@@ -2961,6 +3217,25 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             `;
           }}
 
+          function liveActivityMarkup(activity) {{
+            const headline = String(activity?.headline || '').trim();
+            const items = Array.isArray(activity?.items) ? activity.items.filter((item) => String(item?.text || '').trim()) : [];
+            if (!headline && !items.length) {{
+              return '';
+            }}
+            const headlineMarkup = headline ? `<div class="live-activity-headline">${{escapeHtml(headline)}}</div>` : '';
+            const itemMarkup = items.map((item) => `<div class="live-activity-line live-activity-${{escapeHtml(item.kind || 'info')}}">${{escapeHtml(item.text || '')}}</div>`).join('');
+            return `<div class="live-activity" data-role="live-activity">${{headlineMarkup}}${{itemMarkup}}</div>`;
+          }}
+
+          function nextRefreshInterval(records) {{
+            return (records || []).some((record) => {{
+              const runStatus = record.run_status || '';
+              const hasLiveActivity = !!((record.live_activity && record.live_activity.headline) || (record.live_activity && Array.isArray(record.live_activity.items) && record.live_activity.items.length));
+              return hasLiveActivity || ['running', 'busy'].includes(runStatus);
+            }}) ? ACTIVE_REFRESH_INTERVAL_SECONDS : DEFAULT_REFRESH_INTERVAL_SECONDS;
+          }}
+
           function renderTrackedPrs(records) {{
             const tbody = document.getElementById('tracked-pr-body');
             if (!tbody) return;
@@ -2977,7 +3252,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   <td><code>${{escapeHtml(record.branch)}}</code>${{threadControlsMarkup(record)}}</td>
                   <td><code>${{escapeHtml(record.provider)}}</code></td>
                   <td><code>${{escapeHtml(record.worktree_path)}}</code><div class="small" data-role="detail-text">${{escapeHtml(record.detail_text || '')}}</div></td>
-                  <td>${{statusBadge(record.run_status)}}<div class="small stack" data-role="run-summary">${{escapeHtml(record.run_summary || '')}}</div></td>
+                  <td>${{statusBadge(record.run_status)}}<div class="small stack" data-role="run-summary">${{escapeHtml(record.run_summary || '')}}</div>${{liveActivityMarkup(record.live_activity)}}</td>
                   <td>${{escapeHtml(record.last_polled_label || '')}}</td>
                   <td>
                     <div class="button-stack">
@@ -3039,7 +3314,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
               if (!options.preserveFlash) {{
                 showFlash('');
               }}
-              state.secondsRemaining = REFRESH_INTERVAL_SECONDS;
+              state.refreshIntervalSeconds = nextRefreshInterval(data.records || []);
+              state.secondsRemaining = state.refreshIntervalSeconds;
             }} catch (error) {{
               showFlash(error.message || 'Failed to load dashboard.', 'error');
             }} finally {{
@@ -3096,7 +3372,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
               refreshToggle.addEventListener('click', () => {{
                 state.refreshPaused = !state.refreshPaused;
                 sessionStorage.setItem(REFRESH_PAUSE_KEY, state.refreshPaused ? '1' : '0');
-                state.secondsRemaining = REFRESH_INTERVAL_SECONDS;
+                state.secondsRemaining = state.refreshIntervalSeconds;
                 updateRefreshControls();
               }});
             }}
@@ -3788,6 +4064,12 @@ def html_page(title: str, body: str) -> bytes:
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
     .thread-panel {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 12px 14px; }}
     .thread-mode {{ display: grid; gap: 6px; }}
+    .live-activity {{ margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: linear-gradient(180deg, rgba(13,115,119,0.1), rgba(13,115,119,0.04)); border: 1px solid rgba(13,115,119,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }}
+    .live-activity-headline {{ color: var(--ink); font-size: 12px; font-weight: 600; line-height: 1.5; margin-bottom: 6px; }}
+    .live-activity-line {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
+    .live-activity-line + .live-activity-line {{ margin-top: 4px; }}
+    .live-activity-file {{ color: var(--accent); }}
+    .live-activity-error {{ color: var(--bad); }}
     .button-stack {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: start; }}
     form {{ display: inline; }}
     label {{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }}
