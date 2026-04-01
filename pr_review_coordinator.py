@@ -376,10 +376,69 @@ def summarize_patch_change(path: str, change: Any) -> str:
 
 
 def summarize_command(argv: Any) -> str:
+    if isinstance(argv, str):
+        return compact_thread_text(argv, limit=160, empty="")
     if not isinstance(argv, list):
         return ""
     command = " ".join(str(part) for part in argv if part is not None).strip()
     return compact_thread_text(command, limit=160, empty="")
+
+
+def summarize_command_execution(item: dict[str, Any], *, started: bool) -> tuple[str, str]:
+    command = summarize_command(item.get("command"))
+    if not command:
+        return "", ""
+    status = normalize_event_type(str(item.get("status") or ""))
+    exit_code = item.get("exit_code")
+    failed = status in {"failed", "error", "cancelled"} or (exit_code not in (None, 0))
+    if started or status in {"in_progress", "running", "queued"}:
+        return "command", f"Running {command}"
+    if failed:
+        return "error", f"Command failed: {command}"
+    return "command", f"Ran {command}"
+
+
+def update_live_activity_from_codex_item(activity: dict[str, Any], item: dict[str, Any], *, started: bool, stream_state: dict[str, str]) -> bool:
+    item_type = normalize_event_type(str(item.get("type") or ""))
+    item_id = str(item.get("id") or item_type or "unknown")
+    changed = False
+    if item_type == "agent_message":
+        message = str(item.get("text") or "")
+        if message:
+            stream_state["message"] = message
+            changed = set_live_activity_headline(activity, message) or changed
+    elif item_type == "command_execution":
+        kind, text = summarize_command_execution(item, started=started)
+        if text:
+            changed = upsert_live_activity_item(
+                activity,
+                key=f"command:{item_id}",
+                kind=kind,
+                text=text,
+            ) or changed
+    elif item_type in {"file_change", "patch_apply"}:
+        changes = item.get("changes") or []
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                path = str(change.get("path") or change.get("file") or "")
+                if not path:
+                    continue
+                changed = upsert_live_activity_item(
+                    activity,
+                    key=f"file:{path}",
+                    kind="file",
+                    text=summarize_patch_change(path, {"type": change.get("kind") or change.get("type")}),
+                ) or changed
+    elif item_type in {"reasoning", "reasoning_summary", "plan"}:
+        text = str(item.get("text") or item.get("summary") or item.get("message") or "")
+        if text:
+            state_key = "plan" if item_type == "plan" else "reasoning"
+            stream_state[state_key] = text
+            if state_key == "plan" or not activity.get("headline"):
+                changed = set_live_activity_headline(activity, text) or changed
+    return changed
 
 
 def update_live_activity_from_codex_event(activity: dict[str, Any], event: dict[str, Any], stream_state: dict[str, str]) -> bool:
@@ -433,6 +492,15 @@ def update_live_activity_from_codex_event(activity: dict[str, Any], event: dict[
         message = str(event.get("message") or "")
         if message:
             changed = set_live_activity_headline(activity, message) or changed
+    elif event_type in {"item_started", "item_completed"}:
+        item = event.get("item")
+        if isinstance(item, dict):
+            changed = update_live_activity_from_codex_item(
+                activity,
+                item,
+                started=event_type == "item_started",
+                stream_state=stream_state,
+            ) or changed
     return changed
 
 

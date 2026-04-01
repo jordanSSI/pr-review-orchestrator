@@ -999,6 +999,59 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertEqual(activity["items"][0]["kind"], "file")
         self.assertIn("Created src/graph.ts +2 -0", activity["items"][0]["text"])
 
+    def test_update_live_activity_from_current_codex_item_events(self):
+        activity = pr_review_coordinator.empty_live_activity()
+        stream_state = {"message": "", "plan": "", "reasoning": ""}
+
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(
+            activity,
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "agent_message",
+                    "text": "I'm checking repo-local instructions before editing.",
+                },
+            },
+            stream_state,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(activity["headline"], "I'm checking repo-local instructions before editing.")
+
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(
+            activity,
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_1",
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc pwd",
+                    "status": "in_progress",
+                },
+            },
+            stream_state,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(activity["items"][0]["kind"], "command")
+        self.assertEqual(activity["items"][0]["text"], "Running /bin/zsh -lc pwd")
+
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(
+            activity,
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_2",
+                    "type": "file_change",
+                    "changes": [{"path": "/tmp/hello.txt", "kind": "add"}],
+                    "status": "completed",
+                },
+            },
+            stream_state,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(activity["items"][1]["kind"], "file")
+        self.assertEqual(activity["items"][1]["text"], "Created /tmp/hello.txt")
+
 
 class ProjectImportRenderingTests(unittest.TestCase):
     def test_tracked_rows_are_selectable_and_offer_fresh_thread(self):
