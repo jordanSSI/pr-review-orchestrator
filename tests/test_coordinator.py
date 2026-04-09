@@ -179,6 +179,110 @@ class PullRequestSnapshotTests(unittest.TestCase):
         snapshot = self.snapshot(make_pull_request())
         self.assertEqual(snapshot["status"], "awaiting_final_test")
 
+
+class PullRequestPaginationTests(unittest.TestCase):
+    def snapshot(self, pull_request):
+        original = pr_review_common.fetch_pull_request_state
+        pr_review_common.fetch_pull_request_state = lambda repo_root, repo_name, pr_number: pull_request
+        try:
+            return pr_review_common.pull_request_snapshot("/tmp/repo", "repo", 42)
+        finally:
+            pr_review_common.fetch_pull_request_state = original
+
+    def test_second_page_review_threads_are_included_in_snapshot(self):
+        responses = [
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "number": 42,
+                            "url": "https://example.com/pr/42",
+                            "title": "Example PR",
+                            "state": "OPEN",
+                            "reviewRequests": {"nodes": []},
+                            "reviewThreads": {
+                                "pageInfo": {"endCursor": "cursor-1", "hasNextPage": True},
+                                "nodes": [
+                                    {
+                                        "id": "thread-1",
+                                        "isResolved": True,
+                                        "isOutdated": False,
+                                        "path": "src/app.ts",
+                                        "line": 10,
+                                        "originalLine": 10,
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "id": "comment-1",
+                                                    "author": {"login": "github-copilot[bot]"},
+                                                    "body": "Already resolved.",
+                                                    "createdAt": "2026-03-09T00:00:00Z",
+                                                    "url": "https://example.com/comment-1",
+                                                    "path": "src/app.ts",
+                                                    "line": 10,
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            },
+                            "comments": {"nodes": []},
+                            "reviews": {"nodes": []},
+                            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                        }
+                    }
+                }
+            },
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"endCursor": None, "hasNextPage": False},
+                                "nodes": [
+                                    {
+                                        "id": "thread-2",
+                                        "isResolved": False,
+                                        "isOutdated": False,
+                                        "path": "src/other.ts",
+                                        "line": 22,
+                                        "originalLine": 22,
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "id": "comment-2",
+                                                    "author": {"login": "github-copilot[bot]"},
+                                                    "body": "This still needs a fix.",
+                                                    "createdAt": "2026-03-10T00:00:00Z",
+                                                    "url": "https://example.com/comment-2",
+                                                    "path": "src/other.ts",
+                                                    "line": 22,
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            },
+        ]
+        graphql_calls: list[dict[str, object]] = []
+
+        def fake_graphql(query, variables):
+            graphql_calls.append({"query": query, "variables": dict(variables)})
+            return responses.pop(0)
+
+        with mock.patch("pr_review_common.verify_repo_name", return_value=("example", "repo")):
+            with mock.patch("pr_review_common.github_graphql", side_effect=fake_graphql):
+                snapshot = pr_review_common.pull_request_snapshot("/tmp/repo", "repo", 42)
+
+        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual([thread["id"] for thread in snapshot["unresolved_threads"]], ["thread-2"])
+        self.assertEqual(len(graphql_calls), 2)
+        self.assertEqual(graphql_calls[1]["variables"]["threadCursor"], "cursor-1")
+
     def test_top_level_pr_comment_triggers_needs_review(self):
         snapshot = self.snapshot(
             make_pull_request(

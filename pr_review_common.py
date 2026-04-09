@@ -271,21 +271,18 @@ def verify_gh_auth() -> None:
 
 
 def github_graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
-    result = run(
-        [
-            "gh",
-            "api",
-            "graphql",
-            "-f",
-            f"query={query}",
-            "-F",
-            f"owner={variables['owner']}",
-            "-F",
-            f"repo={variables['repo']}",
-            "-F",
-            f"pr={variables['pr']}",
-        ]
-    )
+    command = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={query}",
+    ]
+    for key, value in variables.items():
+        if value is None:
+            continue
+        command.extend(["-F", f"{key}={value}"])
+    result = run(command)
     data = json.loads(result.stdout)
     if "errors" in data:
         raise ScriptError(f"GitHub GraphQL errors: {json.dumps(data['errors'], indent=2)}")
@@ -314,7 +311,7 @@ def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) 
 
 def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     owner, repo = verify_repo_name(repo_root, repo_name)
-    query = textwrap.dedent(
+    initial_query = textwrap.dedent(
         """
         query($owner: String!, $repo: String!, $pr: Int!) {
           repository(owner: $owner, name: $repo) {
@@ -337,6 +334,10 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
                 }
               }
               reviewThreads(first: 100) {
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                }
                 nodes {
                   id
                   isResolved
@@ -413,10 +414,66 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
         }
         """
     ).strip()
-    payload = github_graphql(query, {"owner": owner, "repo": repo, "pr": pr_number})
+    thread_page_query = textwrap.dedent(
+        """
+        query($owner: String!, $repo: String!, $pr: Int!, $threadCursor: String!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pr) {
+              reviewThreads(first: 100, after: $threadCursor) {
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                }
+                nodes {
+                  id
+                  isResolved
+                  isOutdated
+                  path
+                  line
+                  originalLine
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      author {
+                        login
+                      }
+                      body
+                      createdAt
+                      url
+                      path
+                      line
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+    ).strip()
+    payload = github_graphql(initial_query, {"owner": owner, "repo": repo, "pr": pr_number})
     pull_request = payload["data"]["repository"]["pullRequest"]
     if not pull_request:
         raise ScriptError(f"pull request #{pr_number} not found for {owner}/{repo}")
+
+    review_threads = pull_request.get("reviewThreads") or {}
+    page_info = review_threads.get("pageInfo") or {}
+    while page_info.get("hasNextPage"):
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            raise ScriptError("GitHub reviewThreads pagination reported hasNextPage without an endCursor")
+        page_payload = github_graphql(
+            thread_page_query,
+            {"owner": owner, "repo": repo, "pr": pr_number, "threadCursor": cursor},
+        )
+        page_pull_request = page_payload["data"]["repository"]["pullRequest"]
+        if not page_pull_request:
+            raise ScriptError(f"pull request #{pr_number} not found for {owner}/{repo}")
+        page_review_threads = page_pull_request.get("reviewThreads") or {}
+        review_threads.setdefault("nodes", []).extend(page_review_threads.get("nodes") or [])
+        page_info = page_review_threads.get("pageInfo") or {}
+
+    review_threads.pop("pageInfo", None)
     return pull_request
 
 
