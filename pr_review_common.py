@@ -849,7 +849,8 @@ def ensure_worktree(
     other_path = branch_checked_out_elsewhere(repo_root, branch)
     if other_path:
         raise ScriptError(
-            f"branch {branch!r} is already checked out in another worktree: {other_path}"
+            f"branch {branch!r} is already checked out in another worktree: {other_path}. "
+            f"Switch the canonical checkout off that branch or reuse the existing checkout with --worktree-path."
         )
 
     run(
@@ -878,7 +879,40 @@ def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str,
     existing = tracked.get(str(target))
 
     if not existing:
-        raise ScriptError(f"worktree is not registered in repo {repo_root}: {target}")
+        try:
+            checkout_root = Path(
+                run(["git", "-C", str(target), "rev-parse", "--show-toplevel"]).stdout.strip()
+            ).resolve()
+        except ScriptError as exc:
+            raise ScriptError(
+                f"worktree is not registered in repo {repo_root}: {target}. "
+                f"Pass a registered git worktree or a clean checkout/worktree root of the same repository."
+            ) from exc
+        if checkout_root != target:
+            raise ScriptError(
+                f"--worktree-path must point at the checkout root, got nested path {target} inside {checkout_root}"
+            )
+        owner, actual_repo_name = repo_owner_and_name(target)
+        expected_owner, _ = verify_repo_name(repo_root, repo_name)
+        if (owner, actual_repo_name) != (expected_owner, repo_name):
+            raise ScriptError(
+                f"--worktree-path points at {owner}/{actual_repo_name}, expected {expected_owner}/{repo_name}"
+            )
+        checked_out_branch = run(["git", "-C", str(target), "branch", "--show-current"]).stdout.strip()
+        if checked_out_branch != branch:
+            raise ScriptError(
+                f"worktree {target} is on {checked_out_branch or 'unknown branch'}, expected {branch!r}"
+            )
+        if not git_status_is_clean(target):
+            raise ScriptError(f"existing worktree is dirty: {target}")
+        ensure_worktree_node_modules_symlink(target, repo_root)
+        return {
+            "status": "ready",
+            "worktree": str(target),
+            "created": False,
+            "managed": False,
+            "registered": False,
+        }
 
     checked_out_branch = existing.get("branch", "")
     if not checked_out_branch.endswith(f"/{branch}"):

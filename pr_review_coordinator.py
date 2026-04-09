@@ -42,6 +42,7 @@ from pr_review_common import (
     run,
     slugify,
     sync_worktree_to_remote,
+    tracked_worktrees,
     verify_gh_auth,
 )
 
@@ -103,6 +104,8 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     base_branch TEXT,
     worktree_path TEXT NOT NULL,
     worktree_managed INTEGER NOT NULL DEFAULT 1,
+    worktree_root TEXT,
+    worktree_layout TEXT,
     thread_id TEXT NOT NULL,
     thread_title TEXT,
     status TEXT NOT NULL,
@@ -217,12 +220,14 @@ class TrackedPR:
     last_run_status: str | None
     last_run_summary: str | None
     last_error: str | None
-    provider: str
-    created_at: int
-    updated_at: int
     live_activity_json: str | None = None
     live_activity_updated_at: int | None = None
     last_copilot_rerequested_at: int | None = None
+    worktree_root: str | None = None
+    worktree_layout: str | None = None
+    provider: str = "codex"
+    created_at: int = 0
+    updated_at: int = 0
 
 
 @dataclass
@@ -514,6 +519,8 @@ def connect_db() -> sqlite3.Connection:
         "tracked_prs",
         {
             "worktree_managed": "INTEGER NOT NULL DEFAULT 1",
+            "worktree_root": "TEXT",
+            "worktree_layout": "TEXT",
             "pending_copilot_review": "INTEGER NOT NULL DEFAULT 0",
             "last_handled_signature": "TEXT",
             "unresolved_thread_count": "INTEGER NOT NULL DEFAULT 0",
@@ -575,6 +582,8 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "base_branch": record.base_branch,
         "worktree_path": record.worktree_path,
         "worktree_managed": bool(record.worktree_managed),
+        "worktree_root": record.worktree_root,
+        "worktree_layout": record.worktree_layout,
         "thread_id": record.thread_id,
         "thread_title": record.thread_title,
         "status": record.status,
@@ -947,8 +956,19 @@ def resolve_thread(repo_root: str, explicit_thread_id: str | None, provider: str
 
 def ensure_repo_name(repo_root: str, repo_name: str | None) -> tuple[str, str]:
     owner, detected_repo = repo_owner_and_name(repo_root)
-    if repo_name and repo_name != detected_repo:
-        raise ScriptError(f"--repo-name mismatch: expected {detected_repo!r}, got {repo_name!r}")
+    if repo_name:
+        normalized = repo_name.strip()
+        expected = detected_repo
+        if "/" in normalized:
+            provided_owner, _, provided_repo = normalized.partition("/")
+            if provided_owner != owner or provided_repo != detected_repo:
+                raise ScriptError(
+                    f"--repo-name mismatch: expected {owner}/{detected_repo!r} or {detected_repo!r}, got {repo_name!r}"
+                )
+        elif normalized != expected:
+            raise ScriptError(
+                f"--repo-name mismatch: expected {owner}/{detected_repo!r} or {detected_repo!r}, got {repo_name!r}"
+            )
     return owner, detected_repo
 
 
@@ -974,6 +994,28 @@ def has_uncommitted_changes(repo_root: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def working_tree_changes(repo_root: str) -> dict[str, list[str]]:
+    result = run(["git", "-C", repo_root, "status", "--porcelain", "--untracked-files=normal"])
+    staged: list[str] = []
+    unstaged: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        if not raw_line:
+            continue
+        index_status = raw_line[0]
+        worktree_status = raw_line[1]
+        path = raw_line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if index_status not in {" ", "?"}:
+            staged.append(path)
+        if worktree_status != " " or index_status == "?":
+            unstaged.append(path)
+    return {
+        "staged": sorted(set(staged)),
+        "unstaged": sorted(set(unstaged)),
+    }
+
+
 def ensure_branch(repo_root: str, branch: str) -> dict[str, Any]:
     branch_before = current_branch(repo_root)
     if branch_before == branch:
@@ -987,12 +1029,21 @@ def ensure_branch(repo_root: str, branch: str) -> dict[str, Any]:
 
 
 def commit_all_changes(repo_root: str, message: str) -> dict[str, Any]:
-    if not has_uncommitted_changes(repo_root):
+    changes = working_tree_changes(repo_root)
+    if not changes["staged"] and not changes["unstaged"]:
         return {"status": "ready", "committed": False}
-    run(["git", "-C", repo_root, "add", "-A"])
+    if not changes["staged"]:
+        run(["git", "-C", repo_root, "add", "-A"])
+        changes = working_tree_changes(repo_root)
     run(["git", "-C", repo_root, "commit", "-m", message])
     sha = run(["git", "-C", repo_root, "rev-parse", "HEAD"]).stdout.strip()
-    return {"status": "ready", "committed": True, "sha": sha}
+    return {
+        "status": "ready",
+        "committed": True,
+        "sha": sha,
+        "committed_paths": changes["staged"],
+        "preserved_paths": changes["unstaged"],
+    }
 
 
 def push_branch(repo_root: str, branch: str) -> dict[str, Any]:
@@ -1199,6 +1250,11 @@ def switch_repo_to_base_branch(repo_root: str, base_branch: str, feature_branch:
     current = current_branch(repo_root)
     if current != feature_branch:
         return {"status": "ready", "switched": False, "branch": current}
+    if not git_status_is_clean(repo_root):
+        raise ScriptError(
+            f"branch {feature_branch!r} is currently checked out in {repo_root} with local changes; "
+            f"switch the canonical checkout back to {base_branch!r} or use --worktree-path"
+        )
     run(["git", "-C", repo_root, "fetch", "origin", base_branch])
     local_exists = bool(run(["git", "-C", repo_root, "branch", "--list", base_branch]).stdout.strip())
     if local_exists:
@@ -1206,6 +1262,85 @@ def switch_repo_to_base_branch(repo_root: str, base_branch: str, feature_branch:
     else:
         run(["git", "-C", repo_root, "switch", "-C", base_branch, f"origin/{base_branch}"])
     return {"status": "ready", "switched": True, "branch": base_branch}
+
+
+def resolve_checkout_root(repo_root: str, repo_name: str | None, worktree_path: str | None) -> str:
+    if not worktree_path:
+        return repo_root
+    checkout_root = canonical_repo_root(worktree_path)
+    if not checkout_root:
+        raise ScriptError(f"--worktree-path is not a git checkout: {worktree_path}")
+    normalized_repo_root = str(Path(repo_root).resolve())
+    normalized_checkout_root = str(Path(checkout_root).resolve())
+    expected_owner, expected_repo = ensure_repo_name(normalized_repo_root, repo_name)
+    checkout_owner, checkout_repo = ensure_repo_name(normalized_checkout_root, repo_name)
+    if (checkout_owner, checkout_repo) != (expected_owner, expected_repo):
+        raise ScriptError(
+            f"--worktree-path points at {checkout_owner}/{checkout_repo}, expected {expected_owner}/{expected_repo}"
+        )
+    return normalized_checkout_root
+
+
+def infer_managed_worktree_layout(record: TrackedPR) -> str:
+    if record.worktree_layout in {"nested", "sibling"}:
+        return record.worktree_layout
+    expected_name = f"{slugify(record.repo_name)}-pr-{record.pr_number}"
+    if Path(record.worktree_path).resolve().name == expected_name:
+        return "sibling"
+    return DEFAULT_WORKTREE_LAYOUT
+
+
+def infer_managed_worktree_root(record: TrackedPR) -> str:
+    if record.worktree_root:
+        return record.worktree_root
+    worktree_path = Path(record.worktree_path).resolve()
+    layout = infer_managed_worktree_layout(record)
+    if layout == "sibling":
+        return str(worktree_path.parent)
+    return str(worktree_path.parent.parent)
+
+
+def find_orphaned_managed_worktrees(records: list[TrackedPR]) -> list[dict[str, Any]]:
+    orphaned: list[dict[str, Any]] = []
+    records_by_repo: dict[str, list[TrackedPR]] = {}
+    for record in records:
+        records_by_repo.setdefault(record.repo_root, []).append(record)
+
+    for repo_root, repo_records in records_by_repo.items():
+        tracked_paths = {
+            str(Path(record.worktree_path).resolve())
+            for record in repo_records
+            if record.worktree_managed
+        }
+        managed_roots = {str(DEFAULT_WORKTREE_ROOT.resolve())}
+        managed_roots.update(
+            str(Path(infer_managed_worktree_root(record)).resolve())
+            for record in repo_records
+            if record.worktree_managed
+        )
+        try:
+            actual_worktrees = tracked_worktrees(repo_root)
+        except ScriptError:
+            continue
+        repo_path = str(Path(repo_root).resolve())
+        for path, entry in actual_worktrees.items():
+            resolved = str(Path(path).resolve())
+            if resolved == repo_path or resolved in tracked_paths:
+                continue
+            resolved_path = Path(resolved)
+            if not any(Path(root) in resolved_path.parents for root in managed_roots):
+                continue
+            orphaned.append(
+                {
+                    "repo_root": repo_root,
+                    "worktree_path": resolved,
+                    "branch": entry.get("branch", ""),
+                    "head": entry.get("HEAD", ""),
+                }
+            )
+
+    orphaned.sort(key=lambda item: (item["repo_root"], item["worktree_path"]))
+    return orphaned
 
 
 def summarize_failing_checks(failing_checks: list[dict[str, Any]]) -> str:
@@ -1642,7 +1777,10 @@ def register_tracking(
     if worktree_path:
         worktree = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
         worktree_managed = 0
+        managed_worktree_root = None
+        managed_worktree_layout = None
     else:
+        switch_repo_to_base_branch(repo_root, pr_info.get("baseRefName") or repo_default_branch(repo_root), branch)
         worktree = ensure_worktree(
             repo_root,
             detected_repo_name,
@@ -1652,6 +1790,8 @@ def register_tracking(
             layout=worktree_layout,
         )
         worktree_managed = 1
+        managed_worktree_root = str(Path(worktree_root).resolve())
+        managed_worktree_layout = worktree_layout
     snapshot = pull_request_snapshot(repo_root, detected_repo_name, pr_number)
     record = upsert_tracked_pr(
         {
@@ -1667,6 +1807,8 @@ def register_tracking(
             "base_branch": pr_info.get("baseRefName"),
             "worktree_path": worktree["worktree"],
             "worktree_managed": worktree_managed,
+            "worktree_root": managed_worktree_root,
+            "worktree_layout": managed_worktree_layout,
             "thread_id": thread["id"],
             "thread_title": thread.get("title"),
             "active": 1,
@@ -1699,18 +1841,24 @@ def register_tracking(
 def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None, worktree_layout: str, provider: str = "codex") -> dict[str, Any]:
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
+    checkout_root = resolve_checkout_root(repo_root, repo_name, worktree_path)
     base = base_branch or repo_default_branch(repo_root)
-    branch_result = ensure_branch(repo_root, branch)
-    commit_result = commit_all_changes(repo_root, commit_message)
-    push_result = push_branch(repo_root, branch)
-    pr_result = create_or_reuse_pr(repo_root, branch, base, pr_title, pr_body, draft)
-    repo_reset = switch_repo_to_base_branch(repo_root, base, branch)
+    branch_result = ensure_branch(checkout_root, branch)
+    commit_result = commit_all_changes(checkout_root, commit_message)
+    push_result = push_branch(checkout_root, branch)
+    pr_result = create_or_reuse_pr(checkout_root, branch, base, pr_title, pr_body, draft)
+    if checkout_root == str(Path(repo_root).resolve()):
+        repo_reset = switch_repo_to_base_branch(repo_root, base, branch)
+    else:
+        repo_reset = {"status": "ready", "switched": False, "branch": current_branch(repo_root)}
     thread = resolve_thread(repo_root, thread_id, provider=provider)
     key = tracked_pr_key(detected_repo_name, pr_result["number"])
     assert_thread_available(thread["id"], key)
     if worktree_path:
         worktree_result = ensure_existing_worktree(repo_root, detected_repo_name, branch, worktree_path)
         worktree_managed = 0
+        managed_worktree_root = None
+        managed_worktree_layout = None
     else:
         worktree_result = ensure_worktree(
             repo_root,
@@ -1721,6 +1869,8 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
             layout=worktree_layout,
         )
         worktree_managed = 1
+        managed_worktree_root = str(Path(worktree_root).resolve())
+        managed_worktree_layout = worktree_layout
     snapshot = pull_request_snapshot(repo_root, detected_repo_name, pr_result["number"])
     record = upsert_tracked_pr(
         {
@@ -1736,6 +1886,8 @@ def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branc
             "base_branch": pr_result.get("baseRefName"),
             "worktree_path": worktree_result["worktree"],
             "worktree_managed": worktree_managed,
+            "worktree_root": managed_worktree_root,
+            "worktree_layout": managed_worktree_layout,
             "thread_id": thread["id"],
             "thread_title": thread.get("title"),
             "active": 1,
@@ -2279,7 +2431,8 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
                 record.repo_name,
                 record.pr_number,
                 record.branch,
-                str(Path(record.worktree_path).parent.parent),
+                infer_managed_worktree_root(record),
+                layout=infer_managed_worktree_layout(record),
             )
         else:
             refresh_record_state(record, snapshot, run_status="running", run_summary="Validating tracked PR worktree", run_reason="prepare", job_id=job_id)
@@ -4350,10 +4503,12 @@ def main() -> None:
         return
 
     if args.command == "status":
+        records = list_tracked_prs(active_only=not args.all)
         emit(
             {
                 "status": "ready",
-                "tracked_prs": [tracked_pr_to_dict(record) for record in list_tracked_prs(active_only=not args.all)],
+                "tracked_prs": [tracked_pr_to_dict(record) for record in records],
+                "orphaned_worktrees": find_orphaned_managed_worktrees(list_tracked_prs(active_only=False)),
                 "jobs": list_recent_jobs(10),
                 "events": list_recent_events(10),
             },

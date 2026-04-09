@@ -104,6 +104,10 @@ prc handoff \
   --pr-body "## Summary\n- add example change"
 ```
 
+If you already have the change in a dedicated worktree, pass `--worktree-path /absolute/path/to/checkout`. In that mode, `handoff` performs branch/commit/push/PR operations in the adopted checkout and only uses `--repo-root` as the stable canonical root for tracking metadata.
+
+If you have intentionally staged only part of a dirty checkout before running `handoff`, the coordinator now commits just the staged changes and leaves unstaged files alone.
+
 ### Register an existing PR
 
 Use `track` when the PR and worktree already exist and you only need to attach them to the current agent thread (Codex by default; use `--provider cursor` for Cursor):
@@ -200,7 +204,7 @@ prc handoff \
 
 Common options:
 - `--repo-root`: absolute path to the main repo checkout
-- `--repo-name`: optional explicit repo name; otherwise inferred from `origin`
+- `--repo-name`: optional explicit repo name; otherwise inferred from `origin`. Both `repo-name` and `owner/repo-name` forms are accepted.
 - `--branch`: PR branch name
 - `--base-branch`: optional PR base branch
 - `--thread-id`: optional explicit Codex thread id (Codex only; ignored when `--provider cursor`)
@@ -236,6 +240,8 @@ Lists tracked PRs and current stored state.
 ```bash
 prc status --all
 ```
+
+The JSON output also includes `orphaned_worktrees` for managed PR worktrees that still exist on disk but are no longer tracked in the coordinator database.
 
 ### `serve`
 

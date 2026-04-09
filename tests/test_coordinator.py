@@ -471,6 +471,86 @@ class WorktreePathTests(unittest.TestCase):
                 "/Users/jordan/source/starshipit-wms/pr-418-feat-putaway-split-lines-and-serial-scan",
             )
 
+    def test_ensure_existing_worktree_accepts_clean_checkout_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            checkout = Path(tmp) / "checkout"
+            repo_root.mkdir()
+            checkout.mkdir()
+            resolved_repo_root = repo_root.resolve()
+            resolved_checkout = checkout.resolve()
+            repo_root_variants = {str(repo_root), str(resolved_repo_root)}
+            checkout_variants = {str(checkout), str(resolved_checkout)}
+
+            def fake_run(cmd, *, cwd=None, check=True, capture_output=True):
+                if cmd[:2] == ["git", "-C"] and cmd[2] in repo_root_variants and cmd[3:] == ["remote", "get-url", "origin"]:
+                    return mock.Mock(stdout="git@github.com:Starshipit-Product/starshipit-wms.git\n")
+                if cmd[:2] == ["git", "-C"] and cmd[2] in repo_root_variants and cmd[3:] == ["worktree", "list", "--porcelain"]:
+                    return mock.Mock(stdout="")
+                if cmd[:2] == ["git", "-C"] and cmd[2] in checkout_variants and cmd[3:] == ["rev-parse", "--show-toplevel"]:
+                    return mock.Mock(stdout=f"{resolved_checkout}\n")
+                if cmd[:2] == ["git", "-C"] and cmd[2] in checkout_variants and cmd[3:] == ["remote", "get-url", "origin"]:
+                    return mock.Mock(stdout="git@github.com:Starshipit-Product/starshipit-wms.git\n")
+                if cmd[:2] == ["git", "-C"] and cmd[2] in checkout_variants and cmd[3:] == ["branch", "--show-current"]:
+                    return mock.Mock(stdout="feature/example\n")
+                if cmd[:2] == ["git", "-C"] and cmd[2] in checkout_variants and cmd[3:] == ["status", "--porcelain", "--untracked-files=normal"]:
+                    return mock.Mock(stdout="")
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            with mock.patch.object(pr_review_common, "run", side_effect=fake_run):
+                result = pr_review_common.ensure_existing_worktree(
+                    repo_root,
+                    "starshipit-wms",
+                    "feature/example",
+                    checkout,
+                )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["worktree"], str(resolved_checkout))
+        self.assertFalse(result["registered"])
+
+
+class RepoNameAndCommitTests(unittest.TestCase):
+    def test_ensure_repo_name_accepts_owner_qualified_input(self):
+        with mock.patch.object(
+            pr_review_coordinator,
+            "repo_owner_and_name",
+            return_value=("Starshipit-Product", "starshipit-wms"),
+        ):
+            owner, repo = pr_review_coordinator.ensure_repo_name(
+                "/tmp/repo",
+                "Starshipit-Product/starshipit-wms",
+            )
+
+        self.assertEqual(owner, "Starshipit-Product")
+        self.assertEqual(repo, "starshipit-wms")
+
+    def test_commit_all_changes_preserves_unstaged_when_index_is_prepared(self):
+        commands: list[list[str]] = []
+
+        def fake_run(cmd, *, cwd=None, check=True, capture_output=True):
+            commands.append(cmd)
+            if cmd[:4] == ["git", "-C", "/tmp/repo", "status"]:
+                return mock.Mock(
+                    stdout="M  lib/business/starshipit/update.ts\n M components/process-logs-view.tsx\n"
+                )
+            if cmd[:4] == ["git", "-C", "/tmp/repo", "commit"]:
+                return mock.Mock(stdout="")
+            if cmd[:4] == ["git", "-C", "/tmp/repo", "rev-parse"]:
+                return mock.Mock(stdout="abc123\n")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with mock.patch.object(pr_review_coordinator, "run", side_effect=fake_run):
+            result = pr_review_coordinator.commit_all_changes("/tmp/repo", "Example")
+
+        self.assertEqual(result["sha"], "abc123")
+        self.assertEqual(result["committed_paths"], ["lib/business/starshipit/update.ts"])
+        self.assertEqual(
+            result["preserved_paths"],
+            ["components/process-logs-view.tsx"],
+        )
+        self.assertNotIn(["git", "-C", "/tmp/repo", "add", "-A"], commands)
+
 
 class OpenPullRequestListingTests(unittest.TestCase):
     def test_list_open_pull_requests_marks_existing_tracked_prs(self):
@@ -1408,6 +1488,7 @@ class RegisterTrackingTests(unittest.TestCase):
         self.original_ensure_worktree = pr_review_coordinator.ensure_worktree
         self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
         self.original_record_event = pr_review_coordinator.record_event
+        self.original_switch_repo_to_base_branch = pr_review_coordinator.switch_repo_to_base_branch
 
     def tearDown(self):
         pr_review_coordinator.VAR_DIR = self.original_var_dir
@@ -1421,6 +1502,7 @@ class RegisterTrackingTests(unittest.TestCase):
         pr_review_coordinator.ensure_worktree = self.original_ensure_worktree
         pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
         pr_review_coordinator.record_event = self.original_record_event
+        pr_review_coordinator.switch_repo_to_base_branch = self.original_switch_repo_to_base_branch
         self.temp_dir.cleanup()
 
     def test_register_tracking_stores_sibling_managed_worktree(self):
@@ -1437,6 +1519,11 @@ class RegisterTrackingTests(unittest.TestCase):
         )()
         pr_review_coordinator.resolve_thread = lambda repo_root, thread_id, provider=None: {"id": "thread-418", "title": "PR 418 thread"}
         pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+        pr_review_coordinator.switch_repo_to_base_branch = lambda repo_root, base_branch, feature_branch: {
+            "status": "ready",
+            "switched": True,
+            "branch": base_branch,
+        }
 
         def fake_ensure_worktree(repo_root, repo_name, pr_number, branch, worktree_root, *, layout):
             captured["repo_root"] = repo_root
@@ -1487,6 +1574,8 @@ class RegisterTrackingTests(unittest.TestCase):
         self.assertEqual(captured["layout"], "sibling")
         self.assertEqual(result["tracked_pr"]["worktree_path"], "/Users/jordan/source/starshipit-wms-pr-418")
         self.assertEqual(result["tracked_pr"]["worktree_managed"], True)
+        self.assertEqual(result["tracked_pr"]["worktree_root"], "/Users/jordan/source")
+        self.assertEqual(result["tracked_pr"]["worktree_layout"], "sibling")
 
 
 class QueueBehaviorTests(unittest.TestCase):
@@ -1891,6 +1980,349 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(updated.thread_id, "thread-new")
         self.assertEqual(updated.thread_title, "Fresh thread")
         self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
+
+
+class HandoffAdoptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        self.original_verify_gh_auth = pr_review_coordinator.verify_gh_auth
+        self.original_ensure_repo_name = pr_review_coordinator.ensure_repo_name
+        self.original_resolve_checkout_root = pr_review_coordinator.resolve_checkout_root
+        self.original_ensure_branch = pr_review_coordinator.ensure_branch
+        self.original_commit_all_changes = pr_review_coordinator.commit_all_changes
+        self.original_push_branch = pr_review_coordinator.push_branch
+        self.original_create_or_reuse_pr = pr_review_coordinator.create_or_reuse_pr
+        self.original_current_branch = pr_review_coordinator.current_branch
+        self.original_resolve_thread = pr_review_coordinator.resolve_thread
+        self.original_assert_thread_available = pr_review_coordinator.assert_thread_available
+        self.original_ensure_existing_worktree = pr_review_coordinator.ensure_existing_worktree
+        self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
+        self.original_record_event = pr_review_coordinator.record_event
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+
+    def tearDown(self):
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.verify_gh_auth = self.original_verify_gh_auth
+        pr_review_coordinator.ensure_repo_name = self.original_ensure_repo_name
+        pr_review_coordinator.resolve_checkout_root = self.original_resolve_checkout_root
+        pr_review_coordinator.ensure_branch = self.original_ensure_branch
+        pr_review_coordinator.commit_all_changes = self.original_commit_all_changes
+        pr_review_coordinator.push_branch = self.original_push_branch
+        pr_review_coordinator.create_or_reuse_pr = self.original_create_or_reuse_pr
+        pr_review_coordinator.current_branch = self.original_current_branch
+        pr_review_coordinator.resolve_thread = self.original_resolve_thread
+        pr_review_coordinator.assert_thread_available = self.original_assert_thread_available
+        pr_review_coordinator.ensure_existing_worktree = self.original_ensure_existing_worktree
+        pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
+        pr_review_coordinator.record_event = self.original_record_event
+        self.temp_dir.cleanup()
+
+    def test_handoff_uses_adopted_checkout_for_git_operations(self):
+        captured: dict[str, object] = {}
+        pr_review_coordinator.verify_gh_auth = lambda: None
+        pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
+        pr_review_coordinator.resolve_checkout_root = lambda repo_root, repo_name, worktree_path: "/tmp/adopted"
+        def fake_ensure_branch(repo_root, branch):
+            captured["ensure_branch_root"] = repo_root
+            return {"status": "ready", "branch": branch, "created": False}
+
+        def fake_commit_all_changes(repo_root, message):
+            captured["commit_root"] = repo_root
+            return {"status": "ready", "committed": True, "sha": "abc123"}
+
+        def fake_push_branch(repo_root, branch):
+            captured["push_root"] = repo_root
+            return {"status": "ready", "branch": branch, "sha": "abc123"}
+
+        def fake_create_or_reuse_pr(repo_root, branch, base_branch, title, body, draft):
+            captured["pr_root"] = repo_root
+            return {
+                "status": "ready",
+                "created": True,
+                "number": 42,
+                "url": "https://example.com/pr/42",
+                "title": title,
+                "state": "OPEN",
+                "headRefName": branch,
+                "baseRefName": base_branch,
+            }
+
+        pr_review_coordinator.ensure_branch = fake_ensure_branch
+        pr_review_coordinator.commit_all_changes = fake_commit_all_changes
+        pr_review_coordinator.push_branch = fake_push_branch
+        pr_review_coordinator.create_or_reuse_pr = fake_create_or_reuse_pr
+        pr_review_coordinator.current_branch = lambda repo_root: "master"
+        pr_review_coordinator.resolve_thread = lambda repo_root, thread_id, provider=None: {"id": "thread-42", "title": "Thread"}
+        pr_review_coordinator.assert_thread_available = lambda thread_id, key: None
+        pr_review_coordinator.ensure_existing_worktree = lambda repo_root, repo_name, branch, worktree_path: {
+            "status": "ready",
+            "worktree": worktree_path,
+            "created": False,
+            "managed": False,
+        }
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "pending_copilot_review",
+            "pr": {
+                "number": pr_number,
+                "url": "https://example.com/pr/42",
+                "title": "PR 42",
+                "state": "OPEN",
+            },
+            "signature": "sig",
+            "latest_comment_at": None,
+            "pending_copilot_review": True,
+            "unresolved_threads": [],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 0,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+
+        result = pr_review_coordinator.handoff_pr(
+            repo_root="/tmp/repo",
+            repo_name="repo",
+            branch="feature/example",
+            base_branch="master",
+            commit_message="Example",
+            pr_title="Example",
+            pr_body="Body",
+            draft=False,
+            worktree_root="/tmp/worktrees",
+            worktree_path="/tmp/adopted",
+            thread_id="thread-42",
+            worktree_layout="nested",
+            provider="codex",
+        )
+
+        self.assertEqual(captured["ensure_branch_root"], "/tmp/adopted")
+        self.assertEqual(captured["commit_root"], "/tmp/adopted")
+        self.assertEqual(captured["push_root"], "/tmp/adopted")
+        self.assertEqual(captured["pr_root"], "/tmp/adopted")
+        self.assertEqual(result["tracked_pr"]["worktree_path"], "/tmp/adopted")
+        self.assertFalse(result["tracked_pr"]["worktree_managed"])
+
+
+class FollowUpWorktreeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_var_dir = pr_review_coordinator.VAR_DIR
+        self.original_locks_dir = pr_review_coordinator.LOCKS_DIR
+        self.original_db = pr_review_coordinator.COORDINATOR_DB
+        self.original_acquire_lock = pr_review_coordinator.acquire_lock
+        self.original_release_lock = pr_review_coordinator.release_lock
+        self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
+        self.original_should_trigger_follow_up = pr_review_coordinator.should_trigger_follow_up
+        self.original_git_status_is_clean = pr_review_coordinator.git_status_is_clean
+        self.original_refresh_record_state = pr_review_coordinator.refresh_record_state
+        self.original_update_tracked_pr = pr_review_coordinator.update_tracked_pr
+        self.original_record_event = pr_review_coordinator.record_event
+        self.original_ensure_worktree = pr_review_coordinator.ensure_worktree
+        self.original_sync_worktree_to_remote = pr_review_coordinator.sync_worktree_to_remote
+        self.original_run_agent_resume = pr_review_coordinator.run_agent_resume
+        pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
+        pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
+        pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
+
+    def tearDown(self):
+        pr_review_coordinator.VAR_DIR = self.original_var_dir
+        pr_review_coordinator.LOCKS_DIR = self.original_locks_dir
+        pr_review_coordinator.COORDINATOR_DB = self.original_db
+        pr_review_coordinator.acquire_lock = self.original_acquire_lock
+        pr_review_coordinator.release_lock = self.original_release_lock
+        pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
+        pr_review_coordinator.should_trigger_follow_up = self.original_should_trigger_follow_up
+        pr_review_coordinator.git_status_is_clean = self.original_git_status_is_clean
+        pr_review_coordinator.refresh_record_state = self.original_refresh_record_state
+        pr_review_coordinator.update_tracked_pr = self.original_update_tracked_pr
+        pr_review_coordinator.record_event = self.original_record_event
+        pr_review_coordinator.ensure_worktree = self.original_ensure_worktree
+        pr_review_coordinator.sync_worktree_to_remote = self.original_sync_worktree_to_remote
+        pr_review_coordinator.run_agent_resume = self.original_run_agent_resume
+        self.temp_dir.cleanup()
+
+    def make_record(self, **overrides):
+        payload = {
+            "key": "repo-pr-42",
+            "repo_root": "/tmp/repo",
+            "repo_owner": "owner",
+            "repo_name": "repo",
+            "pr_number": 42,
+            "pr_url": "https://example.com/pr/42",
+            "pr_title": "Example PR",
+            "pr_state": "OPEN",
+            "branch": "feature/example",
+            "base_branch": "main",
+            "worktree_path": "/tmp/worktrees/repo-pr-42",
+            "worktree_managed": 1,
+            "worktree_root": "/tmp/worktrees",
+            "worktree_layout": "sibling",
+            "thread_id": "thread-42",
+            "thread_title": "Thread",
+            "status": "needs_review",
+            "active": 1,
+            "last_review_signature": "sig",
+            "last_handled_signature": None,
+            "last_review_status": "needs_review",
+            "last_review_comment_at": None,
+            "pending_copilot_review": 0,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+            "unresolved_threads_json": "[]",
+            "actionable_comments_json": "[]",
+            "failing_checks_json": "[]",
+            "ci_summary": None,
+            "run_state": None,
+            "run_reason": None,
+            "current_job_id": None,
+            "lock_started_at": None,
+            "lock_owner_pid": None,
+            "last_polled_at": None,
+            "last_prompted_at": None,
+            "last_run_started_at": None,
+            "last_run_finished_at": None,
+            "last_run_status": "ready",
+            "last_run_summary": "Idle",
+            "last_error": None,
+            "provider": "codex",
+            "created_at": 0,
+            "updated_at": 0,
+        }
+        payload.update(overrides)
+        return pr_review_coordinator.TrackedPR(**payload)
+
+    def test_run_follow_up_uses_stored_managed_worktree_root_and_layout(self):
+        captured: dict[str, object] = {}
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda record: None
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "needs_review",
+            "pr": {
+                "number": pr_number,
+                "url": "https://example.com/pr/42",
+                "title": "PR 42",
+                "state": "OPEN",
+            },
+            "signature": "sig-next",
+            "latest_comment_at": None,
+            "pending_copilot_review": False,
+            "unresolved_threads": [{"id": "thread-1"}],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
+        pr_review_coordinator.git_status_is_clean = lambda path: True
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        pr_review_coordinator.update_tracked_pr = lambda key, **changes: self.make_record()
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+
+        def fake_ensure_worktree(repo_root, repo_name, pr_number, branch, worktree_root, *, layout):
+            captured["worktree_root"] = worktree_root
+            captured["layout"] = layout
+            return {"status": "ready", "worktree": "/tmp/worktrees/repo-pr-42", "created": False}
+
+        pr_review_coordinator.ensure_worktree = fake_ensure_worktree
+        pr_review_coordinator.sync_worktree_to_remote = lambda repo_root, branch, worktree: {
+            "status": "ready",
+            "worktree": worktree,
+            "head": "abc123",
+            "changed": False,
+        }
+        pr_review_coordinator.run_agent_resume = lambda record, snapshot, dry_run: {
+            "status": "ok",
+            "last_message": "done",
+        }
+
+        result = pr_review_coordinator.run_follow_up(
+            self.make_record(),
+            dry_run=False,
+            force_run=False,
+            job_id=7,
+        )
+
+        self.assertEqual(captured["worktree_root"], "/tmp/worktrees")
+        self.assertEqual(captured["layout"], "sibling")
+        self.assertEqual(result["status"], "ok")
+
+
+class OrphanedWorktreeTests(unittest.TestCase):
+    def test_find_orphaned_managed_worktrees_reports_untracked_managed_paths(self):
+        record = pr_review_coordinator.TrackedPR(
+            key="repo-pr-42",
+            repo_root="/tmp/repo",
+            repo_owner="owner",
+            repo_name="repo",
+            pr_number=42,
+            pr_url="https://example.com/pr/42",
+            pr_title="PR 42",
+            pr_state="OPEN",
+            branch="feature/example",
+            base_branch="main",
+            worktree_path="/tmp/worktrees/repo/pr-42-feature-example",
+            worktree_managed=1,
+            thread_id="thread-42",
+            thread_title="Thread",
+            status="needs_review",
+            active=1,
+            last_review_signature=None,
+            last_handled_signature=None,
+            last_review_status="needs_review",
+            last_review_comment_at=None,
+            pending_copilot_review=0,
+            unresolved_thread_count=0,
+            actionable_comment_count=0,
+            failing_check_count=0,
+            unresolved_threads_json="[]",
+            actionable_comments_json="[]",
+            failing_checks_json="[]",
+            ci_summary=None,
+            run_state=None,
+            run_reason=None,
+            current_job_id=None,
+            lock_started_at=None,
+            lock_owner_pid=None,
+            last_polled_at=None,
+            last_prompted_at=None,
+            last_run_started_at=None,
+            last_run_finished_at=None,
+            last_run_status="registered",
+            last_run_summary="registered",
+            last_error=None,
+            worktree_root="/tmp/worktrees",
+            worktree_layout="nested",
+        )
+
+        with mock.patch.object(
+            pr_review_coordinator,
+            "tracked_worktrees",
+            return_value={
+                "/tmp/repo": {"path": "/tmp/repo"},
+                "/tmp/worktrees/repo/pr-42-feature-example": {"path": "/tmp/worktrees/repo/pr-42-feature-example"},
+                "/tmp/worktrees/repo/pr-99-old-branch": {
+                    "path": "/tmp/worktrees/repo/pr-99-old-branch",
+                    "branch": "refs/heads/old-branch",
+                    "HEAD": "deadbeef",
+                },
+            },
+        ):
+            orphaned = pr_review_coordinator.find_orphaned_managed_worktrees([record])
+
+        self.assertEqual(len(orphaned), 1)
+        self.assertEqual(orphaned[0]["worktree_path"], str(Path("/tmp/worktrees/repo/pr-99-old-branch").resolve()))
 
 
 class CliHelpTests(unittest.TestCase):
