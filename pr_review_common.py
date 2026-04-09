@@ -36,6 +36,15 @@ COPILOT_RETRYABLE_ERROR_SNIPPETS = (
     "copilot encountered an error and was unable to review this pull request",
     "try again by re-requesting a review",
 )
+MERGE_CONFLICT_COMMENT_SNIPPETS = (
+    "resolve merge conflicts",
+    "resolve merge conflict",
+    "merge conflicts with",
+    "merge conflict with",
+    "has merge conflicts",
+    "has conflicts that must be resolved",
+    "cannot be merged cleanly",
+)
 
 
 class ScriptError(RuntimeError):
@@ -305,6 +314,13 @@ def is_retryable_copilot_review_error(author_login: str | None, body: str | None
     return all(snippet in normalized_body for snippet in COPILOT_RETRYABLE_ERROR_SNIPPETS)
 
 
+def is_merge_conflict_comment(body: str | None) -> bool:
+    normalized_body = " ".join((body or "").lower().split())
+    if not normalized_body:
+        return False
+    return any(snippet in normalized_body for snippet in MERGE_CONFLICT_COMMENT_SNIPPETS)
+
+
 def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     return fetch_pull_request_state(repo_root, repo_name, pr_number)
 
@@ -320,6 +336,8 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
               url
               title
               state
+              mergeable
+              mergeStateStatus
               reviewRequests(first: 20) {
                 nodes {
                   requestedReviewer {
@@ -655,11 +673,57 @@ def serialize_failing_checks(pull_request: dict[str, Any]) -> list[dict[str, Any
     return failing
 
 
+def serialize_merge_conflicts(
+    pull_request: dict[str, Any],
+    actionable_pr_comments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    mergeable = (pull_request.get("mergeable") or "").upper()
+    merge_state_status = (pull_request.get("mergeStateStatus") or "").upper()
+    if mergeable == "CONFLICTING" or merge_state_status == "DIRTY":
+        conflicts.append(
+            {
+                "source": "github",
+                "summary": "GitHub reports merge conflicts against the base branch.",
+                "mergeable": mergeable or None,
+                "mergeStateStatus": merge_state_status or None,
+            }
+        )
+
+    for comment in actionable_pr_comments:
+        if not is_merge_conflict_comment(comment.get("body")):
+            continue
+        body = (comment.get("body") or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(body) > 240:
+            body = body[:237] + "..."
+        conflicts.append(
+            {
+                "source": "comment",
+                "summary": body,
+                "id": comment.get("id"),
+                "author": comment.get("author"),
+                "createdAt": comment.get("createdAt"),
+                "updatedAt": comment.get("updatedAt"),
+                "url": comment.get("url"),
+            }
+        )
+
+    conflicts.sort(
+        key=lambda item: (
+            0 if item.get("source") == "github" else 1,
+            item.get("updatedAt") or item.get("createdAt") or "",
+            item.get("id") or "",
+        )
+    )
+    return conflicts
+
+
 def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     pull_request = fetch_pull_request_state(repo_root, repo_name, pr_number)
     unresolved = serialize_unresolved_threads(pull_request)
     actionable_pr_comments = serialize_actionable_pr_comments(pull_request)
     failing_checks = serialize_failing_checks(pull_request)
+    merge_conflicts = serialize_merge_conflicts(pull_request, actionable_pr_comments)
     copilot_review_error = serialize_retryable_copilot_review_error(pull_request)
     latest_comment_at = None
     latest_comment_candidates = [item["latest_comment_at"] or "" for item in unresolved]
@@ -673,7 +737,9 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         is_copilot_login((node.get("requestedReviewer") or {}).get("login"))
         for node in review_requests
     )
-    if unresolved or actionable_pr_comments:
+    if merge_conflicts:
+        status = "merge_conflicts"
+    elif unresolved or actionable_pr_comments:
         status = "needs_review"
     elif failing_checks:
         status = "needs_ci_fix"
@@ -685,6 +751,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         status = "awaiting_final_test"
     signature_payload = {
         "status": status,
+        "merge_conflicts": merge_conflicts,
         "unresolved_threads": unresolved,
         "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,
@@ -704,6 +771,7 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "latest_comment_at": latest_comment_at,
         "pending_copilot_review": pending_copilot_review,
         "copilot_review_error": copilot_review_error,
+        "merge_conflicts": merge_conflicts,
         "unresolved_threads": unresolved,
         "actionable_pr_comments": actionable_pr_comments,
         "failing_checks": failing_checks,

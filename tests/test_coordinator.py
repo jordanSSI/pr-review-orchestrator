@@ -20,6 +20,8 @@ def make_pull_request(
     pending_copilot=False,
     pending_reviewer_login="copilot-pull-request-reviewer[bot]",
     failing_check=False,
+    mergeable=None,
+    merge_state_status=None,
     review_author="github-copilot[bot]",
     pr_comments=None,
     reviews=None,
@@ -68,6 +70,8 @@ def make_pull_request(
         "url": "https://example.com/pr/42",
         "title": "Example PR",
         "state": "OPEN",
+        "mergeable": mergeable,
+        "mergeStateStatus": merge_state_status,
         "reviewRequests": {"nodes": review_requests},
         "reviewThreads": {"nodes": review_threads},
         "comments": {"nodes": pr_comments or []},
@@ -113,6 +117,11 @@ class PullRequestSnapshotTests(unittest.TestCase):
     def test_review_comments_take_priority_over_ci_failures(self):
         snapshot = self.snapshot(make_pull_request(unresolved=True, failing_check=True))
         self.assertEqual(snapshot["status"], "needs_review")
+
+    def test_github_mergeability_conflicts_get_distinct_status(self):
+        snapshot = self.snapshot(make_pull_request(mergeable="CONFLICTING", merge_state_status="DIRTY"))
+        self.assertEqual(snapshot["status"], "merge_conflicts")
+        self.assertEqual(snapshot["merge_conflicts"][0]["source"], "github")
 
     def test_retryable_copilot_error_review_enters_cooldown(self):
         snapshot = self.snapshot(
@@ -283,7 +292,7 @@ class PullRequestPaginationTests(unittest.TestCase):
         self.assertEqual(len(graphql_calls), 2)
         self.assertEqual(graphql_calls[1]["variables"]["threadCursor"], "cursor-1")
 
-    def test_top_level_pr_comment_triggers_needs_review(self):
+    def test_top_level_merge_conflict_comment_gets_distinct_status(self):
         snapshot = self.snapshot(
             make_pull_request(
                 pr_comments=[
@@ -298,7 +307,8 @@ class PullRequestPaginationTests(unittest.TestCase):
                 ]
             )
         )
-        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(snapshot["status"], "merge_conflicts")
+        self.assertEqual(snapshot["merge_conflicts"][0]["source"], "comment")
         self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
 
     def test_linear_linkback_comment_is_not_actionable(self):
@@ -386,7 +396,7 @@ class PullRequestPaginationTests(unittest.TestCase):
                 ]
             )
         )
-        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(snapshot["status"], "merge_conflicts")
         self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
 
     def test_handled_marker_uses_configured_prefix(self):
@@ -515,6 +525,7 @@ class PromptInstructionTests(unittest.TestCase):
     def test_resume_prompt_requires_jordanbot_prefix(self):
         record = self.make_record()
         snapshot = {
+            "merge_conflicts": [],
             "unresolved_threads": [],
             "actionable_pr_comments": [],
             "failing_checks": [],
@@ -524,6 +535,21 @@ class PromptInstructionTests(unittest.TestCase):
 
         self.assertIn("must begin with `[jordanBot]`", prompt)
         self.assertIn("handled-comment COMMENT_ID", prompt)
+
+    def test_resume_prompt_includes_merge_conflict_guidance(self):
+        record = self.make_record(status="merge_conflicts", last_review_status="merge_conflicts")
+        snapshot = {
+            "merge_conflicts": [{"source": "github", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}],
+            "unresolved_threads": [],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+        }
+
+        prompt = pr_review_coordinator.resume_prompt(record, snapshot)
+
+        self.assertIn("If merge conflicts are reported", prompt)
+        self.assertIn("Current merge conflict signals", prompt)
+        self.assertIn("mergeable=CONFLICTING", prompt)
 
 
 class WorktreePathTests(unittest.TestCase):

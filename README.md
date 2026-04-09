@@ -273,6 +273,7 @@ Stops tracking a PR record.
 ## Status Meanings
 
 - `needs_review`: unresolved GitHub review feedback or actionable top-level PR comments exist and follow-up work may be needed
+- `merge_conflicts`: GitHub reports the PR branch conflicts with the base branch, or an actionable PR comment explicitly asks for conflict resolution
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
 - `copilot_review_cooldown`: Copilot returned its transient "unable to review" error; the coordinator is cooling down before re-requesting review automatically

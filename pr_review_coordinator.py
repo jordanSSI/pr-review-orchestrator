@@ -59,22 +59,24 @@ COPILOT_RETRY_COOLDOWN_MS = 15 * 60 * 1000
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
-ACTIVE_STATUSES = {"needs_review", "needs_ci_fix"}
+ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
-    "needs_review": 0,
-    "needs_ci_fix": 1,
-    "pending_copilot_review": 2,
-    "copilot_review_cooldown": 3,
-    "awaiting_final_review": 4,
-    "awaiting_final_test": 5,
-    "busy": 6,
-    "running": 7,
-    "idle": 8,
-    "untracked": 9,
-    "closed": 10,
-    "error": 11,
+    "merge_conflicts": 0,
+    "needs_review": 1,
+    "needs_ci_fix": 2,
+    "pending_copilot_review": 3,
+    "copilot_review_cooldown": 4,
+    "awaiting_final_review": 5,
+    "awaiting_final_test": 6,
+    "busy": 7,
+    "running": 8,
+    "idle": 9,
+    "untracked": 10,
+    "closed": 11,
+    "error": 12,
 }
 WEB_STATUS_FILTERS = [
+    "merge_conflicts",
     "needs_review",
     "needs_ci_fix",
     "pending_copilot_review",
@@ -1954,6 +1956,31 @@ def summarize_pr_comments(actionable_comments: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def summarize_merge_conflicts(merge_conflicts: list[dict[str, Any]], *, base_branch: str | None) -> str:
+    if not merge_conflicts:
+        return "No merge conflicts are currently reported."
+    lines: list[str] = []
+    for conflict in merge_conflicts[:12]:
+        if conflict.get("source") == "github":
+            details: list[str] = []
+            if base_branch:
+                details.append(f"base={base_branch}")
+            if conflict.get("mergeable"):
+                details.append(f"mergeable={conflict['mergeable']}")
+            if conflict.get("mergeStateStatus"):
+                details.append(f"mergeStateStatus={conflict['mergeStateStatus']}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"- GitHub reports merge conflicts against the base branch{suffix}")
+            continue
+        author = conflict.get("author") or "unknown"
+        comment_id = conflict.get("id") or "<unknown>"
+        summary = conflict.get("summary") or "Merge conflict comment"
+        lines.append(f"- {comment_id} [{author}] {summary}")
+    if len(merge_conflicts) > 12:
+        lines.append(f"- ... {len(merge_conflicts) - 12} more merge conflict signals")
+    return "\n".join(lines)
+
+
 def summarize_ci_failures(failing_checks: list[dict[str, Any]]) -> str:
     if not failing_checks:
         return "No completed failing CI checks remain."
@@ -1980,11 +2007,13 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         PR: #{record.pr_number} {record.pr_title}
         PR URL: {record.pr_url}
         Branch: {record.branch}
+        Base branch: {record.base_branch or "<unknown>"}
         Dedicated PR worktree: {record.worktree_path}
 
         Work only against the dedicated PR worktree for code changes. Do not use the main checkout for edits.
-        Address GitHub review feedback, completed failing CI checks, or both, with minimal targeted fixes.
+        Address GitHub review feedback, merge conflicts, completed failing CI checks, or any combination of those, with minimal targeted fixes.
         Pull the latest PR branch state into that worktree before making changes.
+        If merge conflicts are reported, bring in the latest base branch in the dedicated PR worktree, resolve the conflicts there, validate the result, and push the updated PR branch.
         Run relevant validation for the touched files, including repo typecheck if available.
         Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
         Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
@@ -1992,6 +2021,9 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         {comment_instruction}
         If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
+
+        Current merge conflict signals:
+        {summarize_merge_conflicts(snapshot.get("merge_conflicts", []), base_branch=record.base_branch)}
 
         Current unresolved review threads:
         {summarize_threads(snapshot["unresolved_threads"])}
@@ -2134,8 +2166,8 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
         and record.last_prompted_at
         and record.last_run_status in {"ok", "dry_run"}
     ):
-        return False, "No new actionable review or CI changes since the last follow-up run"
-    return True, "Actionable review or CI state changed"
+        return False, "No new actionable review, merge-conflict, or CI changes since the last follow-up run"
+    return True, "Actionable review, merge-conflict, or CI state changed"
 
 
 def maybe_cleanup_closed_pr(record: TrackedPR) -> dict[str, Any]:
@@ -2645,7 +2677,7 @@ def status_badge(status: str | None) -> str:
     cls = "pill"
     if status in {"awaiting_final_review", "awaiting_final_test", "succeeded"}:
         cls = "pill good"
-    elif status in {"needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "running", "queued", "busy"}:
+    elif status in {"merge_conflicts", "needs_review", "needs_ci_fix", "pending_copilot_review", "copilot_review_cooldown", "running", "queued", "busy"}:
         cls = "pill warn"
     elif status in {"error", "closed"}:
         cls = "pill bad"
@@ -3324,7 +3356,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             if (['awaiting_final_review', 'awaiting_final_test', 'succeeded'].includes(status)) {{
               return 'pill good';
             }}
-            if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
+            if (['merge_conflicts', 'needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
               return 'pill warn';
             }}
             if (['error', 'closed'].includes(status)) {{
@@ -3707,7 +3739,7 @@ def render_import_shell(project_candidates: list[dict[str, Any]]) -> str:
             if (['awaiting_final_review', 'awaiting_final_test', 'succeeded'].includes(status)) {{
               return 'pill good';
             }}
-            if (['needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
+            if (['merge_conflicts', 'needs_review', 'needs_ci_fix', 'pending_copilot_review', 'copilot_review_cooldown', 'running', 'queued', 'busy'].includes(status)) {{
               return 'pill warn';
             }}
             if (['error', 'closed'].includes(status)) {{
