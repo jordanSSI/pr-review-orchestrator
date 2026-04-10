@@ -2815,7 +2815,6 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
           <td>{status_badge(record.run_state or record.last_run_status)}<div class="small stack" data-role="run-summary">{html.escape(record.last_run_summary or "")}</div>{render_live_activity_markup(live_activity)}</td>
           <td>{html.escape(format_timestamp(record.last_polled_at))}</td>
           <td>
-            <form method="post" action="/run-one?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'run now queued')"><button {actions_disabled}>Run now</button></form>
             <form method="post" action="/poll-one?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'poll queued')"><button {actions_disabled}>Poll</button></form>
             <form method="post" action="/untrack?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'untrack queued')"><button {actions_disabled}>Untrack</button></form>
             <form method="post" action="/untrack-cleanup?key={html.escape(record.key)}" onsubmit="return queueAction(this, 'untrack cleanup queued')"><button {actions_disabled}>Untrack + Cleanup</button></form>
@@ -3510,7 +3509,6 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   <td>${{escapeHtml(record.last_polled_label || '')}}</td>
                   <td>
                     <div class="button-stack">
-                      <button type="button" data-action="run-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Run now</button>
                       <button type="button" data-action="poll-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Poll</button>
                       <button type="button" data-action="untrack" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack</button>
                       <button type="button" data-action="untrack-cleanup" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack + Cleanup</button>
@@ -4280,8 +4278,8 @@ def html_page(title: str, body: str) -> bytes:
     button:hover:not([disabled]) {{ background: var(--surface); border-color: #c5beb3; }}
     button:active:not([disabled]) {{ transform: scale(0.98); }}
     button:focus-visible, select:focus-visible, input:focus-visible {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
-    button.primary, button[data-action="run-one"], button[data-action="poll-all"], #queue-selected-prs {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }}
-    button.primary:hover:not([disabled]), button[data-action="run-one"]:hover:not([disabled]), button[data-action="poll-all"]:hover:not([disabled]), #queue-selected-prs:hover:not([disabled]) {{ background: var(--accent-hover); border-color: var(--accent-hover); }}
+    button.primary, button[data-action="poll-all"], #queue-selected-prs {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }}
+    button.primary:hover:not([disabled]), button[data-action="poll-all"]:hover:not([disabled]), #queue-selected-prs:hover:not([disabled]) {{ background: var(--accent-hover); border-color: var(--accent-hover); }}
     button[data-action="untrack-cleanup"] {{ color: var(--bad); border-color: rgba(220,38,38,0.25); }}
     button[data-action="untrack-cleanup"]:hover:not([disabled]) {{ background: var(--bad-soft); border-color: var(--bad); }}
     input[type="text"] {{ min-width: 340px; cursor: text; }}
