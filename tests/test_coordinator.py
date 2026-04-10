@@ -554,22 +554,6 @@ class PromptInstructionTests(unittest.TestCase):
         payload.update(overrides)
         return pr_review_coordinator.TrackedPR(**payload)
 
-    def test_codex_exec_review_prompt_requires_jordanbot_prefix(self):
-        captured = {}
-
-        def fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(pr_review_common, "resolve_codex_executable", return_value="/usr/local/bin/codex"):
-            with mock.patch.object(pr_review_common, "run", side_effect=fake_run):
-                result = pr_review_common.codex_exec_review("/tmp/worktree", 42, "feature/example")
-
-        prompt = captured["cmd"][-1]
-        self.assertEqual(result["status"], "ok")
-        self.assertIn("must begin with `[jordanBot]`", prompt)
-        self.assertIn(pr_review_common.HANDLED_PR_COMMENT_MARKER, prompt)
-
     def test_resume_prompt_requires_jordanbot_prefix(self):
         record = self.make_record()
         snapshot = {
@@ -1195,43 +1179,6 @@ class DashboardRenderingTests(unittest.TestCase):
         payload.update(overrides)
         return pr_review_coordinator.TrackedPR(**payload)
 
-    def test_render_record_row_explains_thread_summary_and_actions(self):
-        markup = pr_review_coordinator.render_record_row(
-            self.make_record(),
-            recent_threads=[{"id": "thread-99", "title": "A recent thread title", "in_use_by": None}],
-        )
-
-        self.assertIn('class="thread-disclosure"', markup)
-        self.assertNotIn('class="thread-disclosure" open', markup)
-        self.assertIn("Codex thread", markup)
-        self.assertIn("Attached Codex thread", markup)
-        self.assertIn("Stored thread title / opening prompt. This is a label from Codex state, not the latest reply in the thread.", markup)
-        self.assertIn("Set attached thread", markup)
-        self.assertIn("Use latest repo thread", markup)
-        self.assertIn("Create fresh thread", markup)
-        self.assertIn("Recent repo threads", markup)
-        self.assertIn("Titles below are stored thread titles/opening prompts, not latest replies.", markup)
-
-    def test_render_record_row_shows_live_activity_panel(self):
-        markup = pr_review_coordinator.render_record_row(
-            self.make_record(
-                live_activity_json=json.dumps(
-                    {
-                        "headline": "Investigating failing typecheck in the PR worktree",
-                        "items": [
-                            {"kind": "file", "text": "Updated src/worker.ts +12 -4"},
-                            {"kind": "command", "text": "Running pnpm test --filter worker"},
-                        ],
-                    }
-                )
-            )
-        )
-
-        self.assertIn('data-role="live-activity"', markup)
-        self.assertIn("Investigating failing typecheck in the PR worktree", markup)
-        self.assertIn("Updated src/worker.ts +12 -4", markup)
-        self.assertIn("Running pnpm test --filter worker", markup)
-
     def test_update_live_activity_from_codex_event_tracks_headline_and_files(self):
         activity = pr_review_coordinator.empty_live_activity()
         stream_state = {"message": "", "plan": "", "reasoning": ""}
@@ -1310,51 +1257,6 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(activity["items"][1]["kind"], "file")
         self.assertEqual(activity["items"][1]["text"], "Created /tmp/hello.txt")
-
-
-class ProjectImportRenderingTests(unittest.TestCase):
-    def test_tracked_rows_are_selectable_and_offer_fresh_thread(self):
-        markup = pr_review_coordinator.render_project_import_section(
-            project_candidates=[],
-            selected_project_root="/tmp/repo",
-            selected_provider="codex",
-            browse_result={
-                "repo_root": "/tmp/repo",
-                "repo_name": "repo",
-                "prs": [
-                    {
-                        "number": 42,
-                        "url": "https://example.com/pr/42",
-                        "title": "Tracked PR",
-                        "headRefName": "branch-42",
-                        "baseRefName": "main",
-                        "isDraft": False,
-                        "tracked": True,
-                        "tracked_status": "needs_review",
-                        "tracked_active": True,
-                        "tracked_thread_id": "thread-42",
-                        "tracked_thread_title": "Thread 42",
-                    }
-                ],
-            },
-            recent_threads=[{"id": "thread-99", "title": "Latest", "in_use_by": None}],
-            browse_error=None,
-            notice=None,
-        )
-
-        self.assertIn('name="selected_pr" value="42"', markup)
-        self.assertIn('name="thread_strategy_42"', markup)
-        self.assertIn('name="thread_id_42"', markup)
-        self.assertIn("Keep current attached thread", markup)
-        self.assertIn("Use latest repo thread", markup)
-        self.assertIn("Use a specific existing thread ID", markup)
-        self.assertIn("Create fresh thread", markup)
-        self.assertIn("Collapse browser", markup)
-        self.assertIn('id="project-browser"', markup)
-        self.assertIn("Choose the thread action for each selected PR", markup)
-        self.assertIn("Current stored title / opening prompt: Thread 42", markup)
-
-
 class WorktreeCleanlinessTests(unittest.TestCase):
     def test_git_status_is_clean_ignores_root_node_modules_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:

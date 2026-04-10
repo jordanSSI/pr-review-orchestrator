@@ -3,23 +3,17 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
-import sys
 import textwrap
-import time
 from pathlib import Path
 from typing import Any
 
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-AUTOMATIONS_DIR = CODEX_HOME / "automations"
-AUTOMATIONS_DB = CODEX_HOME / "sqlite" / "codex-dev.db"
 DEFAULT_WORKTREE_ROOT = CODEX_HOME / "worktrees" / "pr-review"
 DEFAULT_WORKTREE_LAYOUT = "nested"
 PR_REVIEW_COORDINATOR_CONFIG = CODEX_HOME / "pr-review-coordinator.json"
@@ -100,22 +94,6 @@ def agent_github_comment_instruction() -> str:
         f"Any GitHub comment or review reply you post must begin with `{prefix}`. "
         "This includes handled-comment replies and rationale-only replies."
     )
-
-
-AGENT_COMMENT_PREFIX = resolve_agent_comment_prefix()
-AGENT_GITHUB_COMMENT_INSTRUCTION = agent_github_comment_instruction()
-
-
-def project_dir() -> Path:
-    return Path(__file__).resolve().parent
-
-
-def codex_skills_dir() -> Path:
-    return CODEX_HOME / "skills"
-
-
-def pr_review_executor_skill_path() -> Path:
-    return codex_skills_dir() / "pr-review-executor" / "SKILL.md"
 
 
 def resolve_codex_executable() -> str:
@@ -213,47 +191,6 @@ def slugify(value: str) -> str:
     return slug or "value"
 
 
-def json_print(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def parse_args_with_common(
-    description: str,
-    *,
-    include_automation_id: bool = False,
-    include_poll_minutes: bool = False,
-    require_branch: bool = True,
-) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--repo-root", required=True, help="Absolute path to the primary repo checkout.")
-    parser.add_argument("--repo-name", required=True, help="Repository name used for worktree/automation IDs.")
-    parser.add_argument("--pr", required=True, type=int, help="GitHub pull request number.")
-    if require_branch:
-        parser.add_argument("--branch", required=True, help="PR branch name.")
-    if include_automation_id:
-        parser.add_argument("--automation-id", help="Codex automation ID to update or remove.")
-    if include_poll_minutes:
-        parser.add_argument("--poll-minutes", type=int, default=5, help="Polling interval in minutes.")
-    parser.add_argument(
-        "--worktree-root",
-        default=str(DEFAULT_WORKTREE_ROOT),
-        help="Root directory under which PR-specific worktrees are created.",
-    )
-    parser.add_argument(
-        "--worktree-layout",
-        choices=("nested", "sibling"),
-        default=DEFAULT_WORKTREE_LAYOUT,
-        help="Layout used when creating managed PR worktrees.",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("json", "text"),
-        default="json",
-        help="Output format.",
-    )
-    return parser
-
-
 def repo_owner_and_name(repo_root: str | Path) -> tuple[str, str]:
     remote = run(
         ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
@@ -323,10 +260,6 @@ def is_merge_conflict_comment(body: str | None) -> bool:
     if not normalized_body:
         return False
     return any(snippet in normalized_body for snippet in MERGE_CONFLICT_COMMENT_SNIPPETS)
-
-
-def fetch_review_threads(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
-    return fetch_pull_request_state(repo_root, repo_name, pr_number)
 
 
 def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
@@ -813,64 +746,6 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
     }
 
 
-def classify_threads(pull_request: dict[str, Any]) -> dict[str, Any]:
-    threads = pull_request["reviewThreads"]["nodes"] or []
-    copilot_threads: list[dict[str, Any]] = []
-    unresolved_threads: list[dict[str, Any]] = []
-    unresolved_copilot_threads: list[dict[str, Any]] = []
-
-    for thread in threads:
-        comments = thread["comments"]["nodes"] or []
-        comment_logins = [comment.get("author", {}).get("login") for comment in comments]
-        summary = {
-            "id": thread["id"],
-            "isResolved": bool(thread["isResolved"]),
-            "isOutdated": bool(thread["isOutdated"]),
-            "path": thread.get("path"),
-            "line": thread.get("line"),
-            "originalLine": thread.get("originalLine"),
-            "authors": [login for login in comment_logins if login],
-            "comments": [
-                {
-                    "id": comment["id"],
-                    "author": comment.get("author", {}).get("login"),
-                    "body": comment.get("body"),
-                    "createdAt": comment.get("createdAt"),
-                    "url": comment.get("url"),
-                    "path": comment.get("path"),
-                    "line": comment.get("line"),
-                }
-                for comment in comments
-            ],
-        }
-        is_copilot_thread = any(is_copilot_login(login) for login in comment_logins)
-        if is_copilot_thread:
-            copilot_threads.append(summary)
-        if not thread["isResolved"]:
-            unresolved_threads.append(summary)
-            if is_copilot_thread:
-                unresolved_copilot_threads.append(summary)
-
-    status = "clean" if not unresolved_threads else "needs_work"
-    return {
-        "status": status,
-        "pr": {
-            "number": pull_request["number"],
-            "url": pull_request["url"],
-            "title": pull_request["title"],
-            "state": pull_request["state"],
-        },
-        "totals": {
-            "threads": len(threads),
-            "copilot_threads": len(copilot_threads),
-            "unresolved_threads": len(unresolved_threads),
-            "unresolved_copilot_threads": len(unresolved_copilot_threads),
-        },
-        "unresolved_threads": unresolved_threads,
-        "unresolved_copilot_threads": unresolved_copilot_threads,
-    }
-
-
 def validate_managed_worktree_root(repo_root: str | Path, worktree_root: str | Path) -> Path:
     repo = Path(repo_root).expanduser().resolve()
     root = Path(worktree_root).expanduser().resolve()
@@ -1103,174 +978,6 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
     return {"status": "ready", "worktree": str(worktree), "head": remote_head, "changed": local_head != remote_head}
 
 
-def codex_exec_review(worktree: str | Path, pr_number: int, branch: str) -> dict[str, Any]:
-    codex_bin = resolve_codex_executable()
-    comment_instruction = agent_github_comment_instruction()
-    prompt = textwrap.dedent(
-        f"""
-        You are working in a dedicated PR review worktree for PR #{pr_number} on branch {branch}.
-        Handle unresolved GitHub review feedback, actionable top-level PR comments, and completed failing CI checks on the current branch.
-        Apply only targeted fixes, run repo typecheck and any targeted validation needed for touched files, commit scoped changes, push, explicitly request reviewer chatgpt-codex-connector (or copilot-pull-request-reviewer where required) when more review is needed, and resolve threads only after the fix is pushed.
-        {comment_instruction}
-        If you addressed a top-level PR comment, reply on the PR after pushing with a short note that includes `<!-- {HANDLED_PR_COMMENT_MARKER} COMMENT_ID -->` for each handled comment ID.
-
-        If there is no actionable review or CI work when you inspect the PR, report that clearly and make no code changes.
-        """
-    ).strip()
-
-    result = run(
-        [
-            codex_bin,
-            "exec",
-            "--cd",
-            str(worktree),
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--add-dir",
-            str(project_dir()),
-            "--add-dir",
-            str(codex_skills_dir()),
-            prompt,
-        ],
-        check=False,
-    )
-
-    return {
-        "status": "ok" if result.returncode == 0 else "error",
-        "exit_code": result.returncode,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-    }
-
-
-def automation_dir(automation_id: str) -> Path:
-    return AUTOMATIONS_DIR / automation_id
-
-
-def automation_toml_text(
-    *,
-    automation_id: str,
-    name: str,
-    prompt: str,
-    status: str,
-    rrule: str,
-    cwds: list[str],
-    created_at_ms: int,
-    updated_at_ms: int,
-) -> str:
-    escaped_prompt = prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    cwd_items = ", ".join(f'"{cwd}"' for cwd in cwds)
-    return textwrap.dedent(
-        f"""
-        version = 1
-        id = "{automation_id}"
-        name = "{name}"
-        prompt = "{escaped_prompt}"
-        status = "{status}"
-        rrule = "{rrule}"
-        execution_environment = "local"
-        cwds = [{cwd_items}]
-        created_at = {created_at_ms}
-        updated_at = {updated_at_ms}
-        """
-    ).strip() + "\n"
-
-
-def upsert_automation_record(
-    *,
-    automation_id: str,
-    name: str,
-    prompt: str,
-    status: str,
-    rrule: str,
-    cwds: list[str],
-) -> dict[str, Any]:
-    now_ms = int(time.time() * 1000)
-    AUTOMATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    automation_path = automation_dir(automation_id)
-    automation_path.mkdir(parents=True, exist_ok=True)
-
-    if AUTOMATIONS_DB.exists():
-        connection = sqlite3.connect(AUTOMATIONS_DB)
-        try:
-            connection.execute(
-                """
-                INSERT INTO automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at)
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  name=excluded.name,
-                  prompt=excluded.prompt,
-                  status=excluded.status,
-                  cwds=excluded.cwds,
-                  rrule=excluded.rrule,
-                  updated_at=excluded.updated_at
-                """,
-                (
-                    automation_id,
-                    name,
-                    prompt,
-                    status,
-                    json.dumps(cwds),
-                    rrule,
-                    now_ms,
-                    now_ms,
-                ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
-    toml = automation_toml_text(
-        automation_id=automation_id,
-        name=name,
-        prompt=prompt,
-        status=status,
-        rrule=rrule,
-        cwds=cwds,
-        created_at_ms=now_ms,
-        updated_at_ms=now_ms,
-    )
-    (automation_path / "automation.toml").write_text(toml, encoding="utf-8")
-
-    memory_path = automation_path / "memory.md"
-    if not memory_path.exists():
-        memory_path.write_text(
-            f"# PR Review Automation\n\nThis automation is managed by shared tooling in {project_dir()}.\n",
-            encoding="utf-8",
-        )
-
-    return {"status": "ready", "automation_id": automation_id, "automation_dir": str(automation_path)}
-
-
-def disable_or_delete_automation(automation_id: str) -> dict[str, Any]:
-    deleted = False
-    paused = False
-    if AUTOMATIONS_DB.exists():
-        connection = sqlite3.connect(AUTOMATIONS_DB)
-        try:
-            update_cursor = connection.execute(
-                "UPDATE automations SET status = ?, updated_at = ? WHERE id = ?",
-                ("PAUSED", int(time.time() * 1000), automation_id),
-            )
-            paused = update_cursor.rowcount > 0
-            delete_cursor = connection.execute("DELETE FROM automations WHERE id = ?", (automation_id,))
-            deleted = delete_cursor.rowcount > 0
-            connection.commit()
-        finally:
-            connection.close()
-
-    automation_path = automation_dir(automation_id)
-    if automation_path.exists():
-        for child in sorted(automation_path.rglob("*"), reverse=True):
-            if child.is_file() or child.is_symlink():
-                child.unlink()
-            elif child.is_dir():
-                child.rmdir()
-        automation_path.rmdir()
-        deleted = True
-
-    return {"status": "ready", "paused": paused, "deleted": deleted, "automation_id": automation_id}
-
-
 def remove_worktree(repo_root: str | Path, worktree: str | Path) -> dict[str, Any]:
     worktree_path_obj = Path(worktree)
     if not worktree_path_obj.exists():
@@ -1282,30 +989,3 @@ def remove_worktree(repo_root: str | Path, worktree: str | Path) -> dict[str, An
     run(["git", "-C", str(repo_root), "worktree", "remove", str(worktree_path_obj)])
     run(["git", "-C", str(repo_root), "worktree", "prune"])
     return {"status": "ready", "removed": True, "worktree": str(worktree_path_obj)}
-
-
-def emit_payload(payload: dict[str, Any], output_format: str) -> None:
-    if output_format == "json":
-        json_print(payload)
-        return
-
-    status = payload.get("status", "unknown")
-    print(f"status={status}")
-    for key, value in payload.items():
-        if key == "status":
-            continue
-        if isinstance(value, (dict, list)):
-            print(f"{key}={json.dumps(value, sort_keys=True)}")
-        else:
-            print(f"{key}={value}")
-
-
-def handle_main(main_fn) -> None:
-    try:
-        main_fn()
-    except ScriptError as exc:
-        emit_payload({"status": "blocked", "error": str(exc)}, "json")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        emit_payload({"status": "error", "error": "interrupted"}, "json")
-        sys.exit(130)
