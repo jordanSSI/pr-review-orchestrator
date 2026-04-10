@@ -158,6 +158,54 @@ class PullRequestSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "copilot_review_cooldown")
         self.assertEqual(snapshot["actionable_pr_comments"], [])
 
+    def test_low_confidence_review_body_is_actionable(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "Low confidence comment: this path may still need a nil guard.",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T03:00:00Z",
+                        "url": "https://example.com/review-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "needs_review")
+        self.assertEqual(len(snapshot["actionable_pr_comments"]), 1)
+        self.assertEqual(snapshot["actionable_pr_comments"][0]["source"], "review")
+        self.assertEqual(snapshot["actionable_pr_comments"][0]["id"], "review-1")
+
+    def test_handled_marker_suppresses_low_confidence_review_body(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                pr_comments=[
+                    {
+                        "id": "issue-comment-1",
+                        "author": {"login": "jordanSSI"},
+                        "body": "[jordanBot] Inspected the low-confidence review and no code change was needed. <!-- pr-review-coordinator:handled-comment review-1 -->",
+                        "createdAt": "2026-03-09T04:00:00Z",
+                        "updatedAt": "2026-03-09T04:00:00Z",
+                        "url": "https://example.com/comment-1",
+                    }
+                ],
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "Comments suppressed due to low confidence (1)",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T03:00:00Z",
+                        "url": "https://example.com/review-1",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertEqual(snapshot["actionable_pr_comments"], [])
+
     def test_stale_copilot_error_is_ignored_after_newer_copilot_activity(self):
         snapshot = self.snapshot(
             make_pull_request(
@@ -535,6 +583,7 @@ class PromptInstructionTests(unittest.TestCase):
 
         self.assertIn("must begin with `[jordanBot]`", prompt)
         self.assertIn("handled-comment COMMENT_ID", prompt)
+        self.assertIn("low-confidence review body", prompt)
 
     def test_resume_prompt_includes_merge_conflict_guidance(self):
         record = self.make_record(status="merge_conflicts", last_review_status="merge_conflicts")

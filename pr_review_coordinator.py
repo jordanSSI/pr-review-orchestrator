@@ -668,7 +668,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
     if record.actionable_comment_count:
-        details.append(f"{record.actionable_comment_count} PR comment(s)")
+        details.append(f"{record.actionable_comment_count} top-level feedback item(s)")
     if record.failing_check_count:
         details.append(f"{record.failing_check_count} failing check(s)")
     if record.ci_summary:
@@ -1943,16 +1943,17 @@ def summarize_threads(unresolved_threads: list[dict[str, Any]]) -> str:
 
 def summarize_pr_comments(actionable_comments: list[dict[str, Any]]) -> str:
     if not actionable_comments:
-        return "No actionable top-level PR comments remain."
+        return "No actionable top-level feedback remains."
     lines: list[str] = []
     for comment in actionable_comments[:12]:
         body = (comment.get("body") or "").replace("\r", " ").replace("\n", " ").strip()
         if len(body) > 240:
             body = body[:237] + "..."
         author = comment.get("author") or "unknown"
-        lines.append(f"- {comment.get('id') or '<unknown>'} [{author}] {body}")
+        source = comment.get("source") or "comment"
+        lines.append(f"- {source} {comment.get('id') or '<unknown>'} [{author}] {body}")
     if len(actionable_comments) > 12:
-        lines.append(f"- ... {len(actionable_comments) - 12} more actionable PR comments")
+        lines.append(f"- ... {len(actionable_comments) - 12} more actionable top-level feedback items")
     return "\n".join(lines)
 
 
@@ -2019,7 +2020,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
         {comment_instruction}
-        If you address a top-level PR comment, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
+        If you address a top-level PR comment or low-confidence review body, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
         When review feedback is clear and CI is green, return to idle tracking for final testing.
 
         Current merge conflict signals:
@@ -2028,7 +2029,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         Current unresolved review threads:
         {summarize_threads(snapshot["unresolved_threads"])}
 
-        Current actionable top-level PR comments:
+        Current actionable top-level feedback:
         {summarize_pr_comments(snapshot.get("actionable_pr_comments", []))}
 
         Current completed failing CI checks/statuses:
@@ -2715,7 +2716,7 @@ def render_record_row(record: TrackedPR, pending_jobs: list[Job] | None = None, 
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
     if record.actionable_comment_count:
-        details.append(f"{record.actionable_comment_count} PR comment(s)")
+        details.append(f"{record.actionable_comment_count} top-level feedback item(s)")
     if record.failing_check_count:
         details.append(f"{record.failing_check_count} failing check(s)")
     if record.ci_summary:

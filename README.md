@@ -161,7 +161,7 @@ Agents using this tool should follow these rules:
 - If the coordinator reports `copilot_review_cooldown`, Copilot returned a transient review error; the coordinator will wait about 15 minutes and then re-request `copilot-pull-request-reviewer` automatically.
 - If the coordinator reports `awaiting_final_review`, the PR is clean and the orchestrator has already completed its follow-up pass; use that as the human handoff point instead of inspecting PR body text.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
-- Top-level PR conversation comments are also actionable follow-up. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that comment as pending.
+- Top-level PR conversation comments are also actionable follow-up, and low-confidence Copilot/Codex review bodies are surfaced through the same lane. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that feedback as pending.
 - Agent-authored PR replies should begin with the configured prefix from `~/.codex/pr-review-coordinator.json`, which the installer bootstraps to `[jordanBot]` by default.
 - `Untrack + Cleanup` may remove an externally created tracked worktree only after the PR is merged or closed, the worktree is clean, and Git accepts the removal.
 
@@ -272,7 +272,7 @@ Stops tracking a PR record.
 
 ## Status Meanings
 
-- `needs_review`: unresolved GitHub review feedback or actionable top-level PR comments exist and follow-up work may be needed
+- `needs_review`: unresolved GitHub review feedback or actionable top-level feedback items exist and follow-up work may be needed
 - `merge_conflicts`: GitHub reports the PR branch conflicts with the base branch, or an actionable PR comment explicitly asks for conflict resolution
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress

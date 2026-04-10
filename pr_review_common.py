@@ -45,6 +45,10 @@ MERGE_CONFLICT_COMMENT_SNIPPETS = (
     "has conflicts that must be resolved",
     "cannot be merged cleanly",
 )
+LOW_CONFIDENCE_REVIEW_SNIPPETS = (
+    "low confidence",
+    "suppressed due to low confidence",
+)
 
 
 class ScriptError(RuntimeError):
@@ -535,16 +539,25 @@ def is_linear_linkback_comment(author: str | None, body: str | None) -> bool:
     return body.lstrip().startswith("<!-- linear-linkback -->")
 
 
+def is_low_confidence_review(author: str | None, body: str | None) -> bool:
+    if not is_copilot_login(author) or not body:
+        return False
+    normalized = body.casefold()
+    return any(snippet in normalized for snippet in LOW_CONFIDENCE_REVIEW_SNIPPETS)
+
+
 def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
     comments = pull_request.get("comments", {}).get("nodes") or []
+    reviews = pull_request.get("reviews", {}).get("nodes") or []
     handled_ids: set[str] = set()
-    comment_summaries: list[dict[str, Any]] = []
+    feedback_summaries: list[dict[str, Any]] = []
     for comment in comments:
         body = (comment.get("body") or "").strip()
         author = (comment.get("author") or {}).get("login")
         handled_ids.update(extract_handled_pr_comment_ids(body))
-        comment_summaries.append(
+        feedback_summaries.append(
             {
+                "source": "comment",
                 "id": comment.get("id"),
                 "author": author,
                 "body": body,
@@ -556,21 +569,43 @@ def serialize_actionable_pr_comments(pull_request: dict[str, Any]) -> list[dict[
             }
         )
 
+    for review in reviews:
+        body = (review.get("body") or "").strip()
+        author = (review.get("author") or {}).get("login")
+        feedback_summaries.append(
+            {
+                "source": "review",
+                "id": review.get("id"),
+                "author": author,
+                "body": body,
+                "createdAt": review.get("submittedAt"),
+                "updatedAt": review.get("submittedAt"),
+                "url": review.get("url"),
+                "state": review.get("state"),
+                "is_handler_comment": False,
+                "is_linear_linkback": False,
+                "is_low_confidence_review": is_low_confidence_review(author, body),
+            }
+        )
+
     actionable = [
         {
+            "source": comment["source"],
             "id": comment["id"],
             "author": comment["author"],
             "body": comment["body"],
             "createdAt": comment["createdAt"],
             "updatedAt": comment["updatedAt"],
             "url": comment["url"],
+            "state": comment.get("state"),
         }
-        for comment in comment_summaries
+        for comment in feedback_summaries
         if comment["id"]
         and comment["body"]
         and not comment["is_handler_comment"]
         and not comment["is_linear_linkback"]
         and not is_retryable_copilot_review_error(comment["author"], comment["body"])
+        and (comment["source"] == "comment" or comment.get("is_low_confidence_review"))
         and comment["id"] not in handled_ids
     ]
     actionable.sort(key=lambda item: ((item["updatedAt"] or item["createdAt"] or ""), item["id"]))
