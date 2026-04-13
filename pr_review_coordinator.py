@@ -2936,54 +2936,60 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             </label>
             <button type="submit">Apply</button>
           </form>
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>PR</th>
-                <th>Branch / Thread</th>
-                <th>Provider</th>
-                <th>Worktree / CI</th>
-                <th>Run state</th>
-                <th>Last poll</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="tracked-pr-body">
-              <tr><td colspan="8">Loading tracked PRs…</td></tr>
-            </tbody>
-          </table>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>PR</th>
+                  <th>Branch / Thread</th>
+                  <th>Provider</th>
+                  <th>Worktree / CI</th>
+                  <th>Run state</th>
+                  <th>Last poll</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="tracked-pr-body">
+                <tr><td colspan="8">Loading tracked PRs…</td></tr>
+              </tbody>
+            </table>
+          </div>
           <h2>Recent Jobs</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Action</th>
-                <th>Status</th>
-                <th>Requested</th>
-                <th>Finished</th>
-                <th>Summary</th>
-              </tr>
-            </thead>
-            <tbody id="jobs-body">
-              <tr><td colspan="6">Loading jobs…</td></tr>
-            </tbody>
-          </table>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Action</th>
+                  <th>Status</th>
+                  <th>Requested</th>
+                  <th>Finished</th>
+                  <th>Summary</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-body">
+                <tr><td colspan="6">Loading jobs…</td></tr>
+              </tbody>
+            </table>
+          </div>
           <h2>Recent Events</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Level</th>
-                <th>Event</th>
-                <th>PR</th>
-                <th>Message</th>
-              </tr>
-            </thead>
-            <tbody id="events-body">
-              <tr><td colspan="5">Loading events…</td></tr>
-            </tbody>
-          </table>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Level</th>
+                  <th>Event</th>
+                  <th>PR</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="events-body">
+                <tr><td colspan="5">Loading events…</td></tr>
+              </tbody>
+            </table>
+          </div>
         </main>
         <script>
           const DASHBOARD_API_URL = '/api/dashboard';
@@ -3569,18 +3575,20 @@ def render_import_shell(project_candidates: list[dict[str, Any]]) -> str:
               </div>
               <datalist id="import-thread-options">${{threadOptions}}</datalist>
               <p class="small">Choose the thread action for each selected PR: keep its current attached thread, use the latest repo thread, attach a specific existing thread ID, or create a fresh thread.</p>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Add</th>
-                    <th>PR</th>
-                    <th>Branch</th>
-                    <th>Codex thread</th>
-                    <th>Tracking</th>
-                  </tr>
-                </thead>
-                <tbody>${{rows}}</tbody>
-              </table>
+              <div class="table-shell">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Add</th>
+                      <th>PR</th>
+                      <th>Branch</th>
+                      <th>Codex thread</th>
+                      <th>Tracking</th>
+                    </tr>
+                  </thead>
+                  <tbody>${{rows}}</tbody>
+                </table>
+              </div>
             `;
             browser.querySelectorAll('[data-thread-config]').forEach((config) => syncThreadStrategy(config));
           }}
@@ -3916,8 +3924,9 @@ def html_page(title: str, body: str) -> bytes:
     input[type="text"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
     input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; accent-color: var(--accent); }}
     button[disabled], select[disabled], input[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
-    table {{ width: 100%; border-collapse: separate; border-spacing: 0; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-bottom: 24px; box-shadow: var(--shadow); }}
-    th, td {{ padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }}
+    .table-shell {{ width: 100%; max-width: 100%; overflow-x: auto; overflow-y: hidden; margin-bottom: 24px; }}
+    table {{ width: 100%; max-width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-bottom: 0; box-shadow: var(--shadow); }}
+    th, td {{ padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; overflow-wrap: anywhere; }}
     th {{ background: var(--surface); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
     tr:last-child td {{ border-bottom: none; }}
     tbody tr:hover {{ background: rgba(13, 115, 119, 0.03); }}
@@ -3957,6 +3966,7 @@ def html_page(title: str, body: str) -> bytes:
     label {{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }}
     label select, label input {{ font-size: 13px; color: var(--ink); }}
     label.inline-option {{ display: inline-flex; flex-direction: row; align-items: center; gap: 6px; }}
+    td code, .thread-disclosure code, .thread-panel code {{ white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }}
   </style>
 </head>
 <body>

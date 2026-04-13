@@ -773,6 +773,13 @@ class HtmlPageTests(unittest.TestCase):
 
         self.assertNotIn('http-equiv="refresh"', page)
 
+    def test_html_page_constrains_tables_and_wraps_long_code_content(self):
+        page = pr_review_coordinator.html_page("Dashboard", "<main></main>").decode("utf-8")
+
+        self.assertIn(".table-shell { width: 100%; max-width: 100%; overflow-x: auto;", page)
+        self.assertIn("table-layout: fixed;", page)
+        self.assertIn("td code, .thread-disclosure code, .thread-panel code { white-space: pre-wrap;", page)
+
 
 class DashboardHttpTests(unittest.TestCase):
     def setUp(self):
