@@ -1304,6 +1304,20 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertEqual(payload["run_summary_line"], "Worktree has local changes")
         self.assertEqual(payload["run_detail_meta"], "")
         self.assertFalse(payload["has_run_details"])
+        self.assertFalse(payload["dirty_worktree_busy"])
+
+    def test_serialize_dashboard_record_marks_dirty_worktree_busy(self):
+        record = self.make_record(
+            run_state="busy",
+            last_run_status="busy",
+            last_run_summary="Worktree has local changes; treating this PR as busy: /tmp/worktree",
+            live_activity_json=None,
+            live_activity_updated_at=None,
+        )
+
+        payload = pr_review_coordinator.serialize_dashboard_record(record)
+
+        self.assertTrue(payload["dirty_worktree_busy"])
 
 
 class WorktreeCleanlinessTests(unittest.TestCase):
@@ -2006,10 +2020,11 @@ class QueueBehaviorTests(unittest.TestCase):
         claimed = pr_review_coordinator.claim_next_job()
         captured = {}
 
-        def fake_run_follow_up(record, *, dry_run, force_run, job_id):
+        def fake_run_follow_up(record, *, dry_run, force_run, allow_dirty_worktree=False, job_id):
             captured["record"] = record.key
             captured["dry_run"] = dry_run
             captured["force_run"] = force_run
+            captured["allow_dirty_worktree"] = allow_dirty_worktree
             captured["job_id"] = job_id
             return {"status": "ok"}
 
@@ -2017,7 +2032,32 @@ class QueueBehaviorTests(unittest.TestCase):
 
         pr_review_coordinator.process_job(claimed)
 
-        self.assertEqual(captured, {"record": "repo-pr-1", "dry_run": False, "force_run": True, "job_id": claimed.id})
+        self.assertEqual(
+            captured,
+            {"record": "repo-pr-1", "dry_run": False, "force_run": True, "allow_dirty_worktree": False, "job_id": claimed.id},
+        )
+
+    def test_process_use_worktree_anyway_uses_dirty_override_path(self):
+        pr_review_coordinator.enqueue_job("use-worktree-anyway", tracked_pr_key="repo-pr-1", requested_by="test")
+        claimed = pr_review_coordinator.claim_next_job()
+        captured = {}
+
+        def fake_run_follow_up(record, *, dry_run, force_run, allow_dirty_worktree=False, job_id):
+            captured["record"] = record.key
+            captured["dry_run"] = dry_run
+            captured["force_run"] = force_run
+            captured["allow_dirty_worktree"] = allow_dirty_worktree
+            captured["job_id"] = job_id
+            return {"status": "ok"}
+
+        pr_review_coordinator.run_follow_up = fake_run_follow_up
+
+        pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(
+            captured,
+            {"record": "repo-pr-1", "dry_run": False, "force_run": True, "allow_dirty_worktree": True, "job_id": claimed.id},
+        )
 
     def test_process_track_existing_job_uses_register_tracking(self):
         captured = {}
@@ -2257,7 +2297,9 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.original_update_tracked_pr = pr_review_coordinator.update_tracked_pr
         self.original_record_event = pr_review_coordinator.record_event
         self.original_ensure_worktree = pr_review_coordinator.ensure_worktree
+        self.original_ensure_existing_worktree = pr_review_coordinator.ensure_existing_worktree
         self.original_sync_worktree_to_remote = pr_review_coordinator.sync_worktree_to_remote
+        self.original_clear_worktree_to_remote = pr_review_coordinator.clear_worktree_to_remote
         self.original_run_agent_resume = pr_review_coordinator.run_agent_resume
         pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
         pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
@@ -2276,7 +2318,9 @@ class FollowUpWorktreeTests(unittest.TestCase):
         pr_review_coordinator.update_tracked_pr = self.original_update_tracked_pr
         pr_review_coordinator.record_event = self.original_record_event
         pr_review_coordinator.ensure_worktree = self.original_ensure_worktree
+        pr_review_coordinator.ensure_existing_worktree = self.original_ensure_existing_worktree
         pr_review_coordinator.sync_worktree_to_remote = self.original_sync_worktree_to_remote
+        pr_review_coordinator.clear_worktree_to_remote = self.original_clear_worktree_to_remote
         pr_review_coordinator.run_agent_resume = self.original_run_agent_resume
         self.temp_dir.cleanup()
 
@@ -2387,6 +2431,100 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.assertEqual(captured["worktree_root"], "/tmp/worktrees")
         self.assertEqual(captured["layout"], "sibling")
         self.assertEqual(result["status"], "ok")
+
+    def test_run_follow_up_can_use_dirty_worktree_anyway_without_sync(self):
+        captured: dict[str, object] = {}
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda record: None
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "needs_review",
+            "pr": {
+                "number": pr_number,
+                "url": "https://example.com/pr/42",
+                "title": "PR 42",
+                "state": "OPEN",
+            },
+            "signature": "sig-next",
+            "latest_comment_at": None,
+            "pending_copilot_review": False,
+            "unresolved_threads": [{"id": "thread-1"}],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
+        pr_review_coordinator.git_status_is_clean = lambda path: False
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        pr_review_coordinator.update_tracked_pr = lambda key, **changes: self.make_record()
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+        pr_review_coordinator.ensure_existing_worktree = lambda repo_root, repo_name, branch, worktree_path, allow_dirty=False: captured.update(
+            {"repo_root": repo_root, "repo_name": repo_name, "branch": branch, "worktree_path": worktree_path, "allow_dirty": allow_dirty}
+        ) or {"status": "ready", "worktree": worktree_path, "created": False, "managed": False, "dirty": True}
+
+        def fail_sync(*args, **kwargs):
+            raise AssertionError("sync_worktree_to_remote should not run when dirty worktree override is requested")
+
+        pr_review_coordinator.sync_worktree_to_remote = fail_sync
+        pr_review_coordinator.run_agent_resume = lambda record, snapshot, dry_run: {
+            "status": "ok",
+            "last_message": "done",
+        }
+
+        result = pr_review_coordinator.run_follow_up(
+            self.make_record(worktree_managed=0),
+            dry_run=False,
+            force_run=True,
+            allow_dirty_worktree=True,
+            job_id=7,
+        )
+
+        self.assertTrue(captured["allow_dirty"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sync"]["status"], "skipped")
+
+    def test_clear_tracked_worktree_resets_and_updates_summary(self):
+        dirty_worktree = Path(self.temp_dir.name) / "dirty-worktree"
+        dirty_worktree.mkdir()
+        captured: dict[str, object] = {}
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda key: captured.setdefault("released", key)
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "needs_review",
+            "pr": {
+                "number": pr_number,
+                "url": "https://example.com/pr/42",
+                "title": "PR 42",
+                "state": "OPEN",
+            },
+            "signature": "sig-next",
+            "latest_comment_at": None,
+            "pending_copilot_review": False,
+            "unresolved_threads": [{"id": "thread-1"}],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: self.make_record(worktree_path=str(dirty_worktree), last_run_summary=kwargs.get("run_summary"))
+        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+        pr_review_coordinator.clear_worktree_to_remote = lambda repo_root, branch, worktree: captured.update(
+            {"repo_root": repo_root, "branch": branch, "worktree": str(worktree)}
+        ) or {"status": "ready", "worktree": str(worktree), "head": "abc123", "cleared": True}
+
+        result = pr_review_coordinator.clear_tracked_worktree(
+            self.make_record(worktree_path=str(dirty_worktree)),
+            job_id=99,
+        )
+
+        self.assertEqual(captured["branch"], "feature/example")
+        self.assertEqual(captured["worktree"], str(dirty_worktree))
+        self.assertEqual(captured["released"], "repo-pr-42")
+        self.assertEqual(result["status"], "ready")
 
 
 class OrphanedWorktreeTests(unittest.TestCase):

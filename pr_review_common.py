@@ -907,7 +907,14 @@ def ensure_worktree(
     return {"status": "ready", "worktree": str(target), "created": True}
 
 
-def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str, worktree_path: str | Path) -> dict[str, Any]:
+def ensure_existing_worktree(
+    repo_root: str | Path,
+    repo_name: str,
+    branch: str,
+    worktree_path: str | Path,
+    *,
+    allow_dirty: bool = False,
+) -> dict[str, Any]:
     verify_repo_name(repo_root, repo_name)
     target = validate_worktree_target(repo_root, worktree_path)
     tracked = tracked_worktrees(repo_root)
@@ -938,7 +945,7 @@ def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str,
             raise ScriptError(
                 f"worktree {target} is on {checked_out_branch or 'unknown branch'}, expected {branch!r}"
             )
-        if not git_status_is_clean(target):
+        if not allow_dirty and not git_status_is_clean(target):
             raise ScriptError(f"existing worktree is dirty: {target}")
         ensure_worktree_node_modules_symlink(target, repo_root)
         return {
@@ -947,6 +954,7 @@ def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str,
             "created": False,
             "managed": False,
             "registered": False,
+            "dirty": not git_status_is_clean(target),
         }
 
     checked_out_branch = existing.get("branch", "")
@@ -955,11 +963,17 @@ def ensure_existing_worktree(repo_root: str | Path, repo_name: str, branch: str,
             f"worktree {target} is on {checked_out_branch or 'unknown branch'}, expected {branch!r}"
         )
 
-    if not git_status_is_clean(target):
+    if not allow_dirty and not git_status_is_clean(target):
         raise ScriptError(f"existing worktree is dirty: {target}")
 
     ensure_worktree_node_modules_symlink(target, repo_root)
-    return {"status": "ready", "worktree": str(target), "created": False, "managed": False}
+    return {
+        "status": "ready",
+        "worktree": str(target),
+        "created": False,
+        "managed": False,
+        "dirty": not git_status_is_clean(target),
+    }
 
 
 def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | Path) -> dict[str, Any]:
@@ -976,6 +990,16 @@ def sync_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | 
     run(["git", "-C", str(worktree), "clean", "-fd"])
     ensure_worktree_node_modules_symlink(worktree, repo_root)
     return {"status": "ready", "worktree": str(worktree), "head": remote_head, "changed": local_head != remote_head}
+
+
+def clear_worktree_to_remote(repo_root: str | Path, branch: str, worktree: str | Path) -> dict[str, Any]:
+    run(["git", "-C", str(repo_root), "fetch", "origin", branch])
+    remote_ref = f"origin/{branch}"
+    remote_head = run(["git", "-C", str(repo_root), "rev-parse", remote_ref]).stdout.strip()
+    run(["git", "-C", str(worktree), "reset", "--hard", remote_ref])
+    run(["git", "-C", str(worktree), "clean", "-fd"])
+    ensure_worktree_node_modules_symlink(worktree, repo_root)
+    return {"status": "ready", "worktree": str(worktree), "head": remote_head, "cleared": True}
 
 
 def remove_worktree(repo_root: str | Path, worktree: str | Path) -> dict[str, Any]:

@@ -31,6 +31,7 @@ from pr_review_common import (
     DEFAULT_WORKTREE_ROOT,
     ScriptError,
     agent_github_comment_instruction,
+    clear_worktree_to_remote,
     ensure_existing_worktree,
     ensure_worktree,
     git_status_is_clean,
@@ -90,6 +91,7 @@ WEB_STATUS_FILTERS = [
 ]
 WEB_SORT_KEYS = {"updated", "status", "pr", "last_poll"}
 WEB_SCOPE_VALUES = {"active", "archived", "all"}
+DIRTY_WORKTREE_SUMMARY_PREFIX = "Worktree has local changes; treating this PR as busy:"
 
 
 SCHEMA = """
@@ -685,6 +687,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
     pending_text = describe_pending_jobs(record, pending_jobs)
     if pending_text:
         details.append(f"pending: {pending_text}")
+    dirty_worktree_busy = (record.last_run_status == "busy") and (record.last_run_summary or "").startswith(DIRTY_WORKTREE_SUMMARY_PREFIX)
     thread_summary = compact_thread_text(
         record.thread_title,
         limit=72,
@@ -719,6 +722,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "last_polled_at": record.last_polled_at,
         "last_polled_label": format_timestamp(record.last_polled_at),
         "actions_disabled": bool(pending_jobs),
+        "dirty_worktree_busy": dirty_worktree_busy,
         "thread": {
             "id": record.thread_id,
             "short_id": record.thread_id[:8],
@@ -1548,9 +1552,9 @@ def get_job(job_id: int) -> Job:
 
 
 def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by: str = "cli", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if action not in {"poll-all", "poll-one", "run-one", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"}:
+    if action not in {"poll-all", "poll-one", "run-one", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"}:
         raise ScriptError(f"unsupported job action: {action}")
-    if action in {"poll-one", "run-one", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
+    if action in {"poll-one", "run-one", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
         raise ScriptError(f"job action {action!r} requires a tracked PR key")
     connection = connect_db()
     try:
@@ -1585,8 +1589,12 @@ def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by:
 def job_priority(action: str) -> int:
     if action in {"untrack", "untrack-cleanup"}:
         return 0
+    if action == "clear-worktree":
+        return 1
     if action in {"track-existing", "retarget-thread"}:
         return 1
+    if action == "use-worktree-anyway":
+        return 2
     if action in {"poll-one", "poll-all"}:
         return 2
     if action == "run-one":
@@ -1607,8 +1615,10 @@ def claim_next_job() -> Job | None:
                 CASE action
                     WHEN 'untrack' THEN 0
                     WHEN 'untrack-cleanup' THEN 0
+                    WHEN 'clear-worktree' THEN 1
                     WHEN 'track-existing' THEN 1
                     WHEN 'retarget-thread' THEN 1
+                    WHEN 'use-worktree-anyway' THEN 2
                     WHEN 'poll-one' THEN 2
                     WHEN 'poll-all' THEN 2
                     WHEN 'run-one' THEN 3
@@ -1657,8 +1667,10 @@ def list_pending_jobs() -> list[Job]:
                 CASE action
                     WHEN 'untrack' THEN 0
                     WHEN 'untrack-cleanup' THEN 0
+                    WHEN 'clear-worktree' THEN 1
                     WHEN 'track-existing' THEN 1
                     WHEN 'retarget-thread' THEN 1
+                    WHEN 'use-worktree-anyway' THEN 2
                     WHEN 'poll-one' THEN 2
                     WHEN 'poll-all' THEN 2
                     WHEN 'run-one' THEN 3
@@ -2203,6 +2215,55 @@ def maybe_cleanup_managed_active(record: TrackedPR) -> dict[str, Any]:
         return {"status": "skipped", "removed": False, "reason": str(exc)}
 
 
+def clear_tracked_worktree(record: TrackedPR, *, job_id: int) -> dict[str, Any]:
+    existing_lock = acquire_lock(record, job_id)
+    if existing_lock:
+        started_at = format_timestamp(existing_lock.get("started_at"))
+        summary = "Another orchestrator run is active for this PR"
+        if started_at:
+            summary += f" since {started_at}"
+        updated = update_tracked_pr(
+            record.key,
+            current_job_id=None,
+            last_run_finished_at=now_ms(),
+            last_run_status="busy",
+            last_run_summary=summary,
+            last_error=None,
+        )
+        record_event("info", "busy", summary, tracked_pr_key=record.key)
+        return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "triggered": False}
+
+    try:
+        worktree_path = Path(record.worktree_path)
+        if not worktree_path.exists():
+            raise ScriptError(f"tracked worktree is missing: {record.worktree_path}")
+        refresh_record_state(
+            record,
+            pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number),
+            run_status="running",
+            run_summary="Clearing dirty tracked worktree",
+            run_reason="clear-worktree",
+            job_id=job_id,
+        )
+        cleared = clear_worktree_to_remote(record.repo_root, record.branch, worktree_path)
+        snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+        summary = f"Cleared worktree and synced to origin/{record.branch}: {record.worktree_path}"
+        updated = refresh_record_state(
+            record,
+            snapshot,
+            run_status="ok",
+            run_summary=summary,
+            error=None,
+            run_reason=None,
+            finished=True,
+            job_id=job_id,
+        )
+        record_event("info", "worktree_cleared", summary, tracked_pr_key=record.key, details=cleared)
+        return {"status": "ready", "tracked_pr": tracked_pr_to_dict(updated), "worktree": cleared}
+    finally:
+        release_lock(record.key)
+
+
 def cleanup_external_worktree(record: TrackedPR) -> dict[str, Any]:
     if record.pr_state == "OPEN":
         return {"status": "skipped", "removed": False, "reason": "external worktrees are only removed after the PR is merged or closed"}
@@ -2337,7 +2398,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
 
     worktree_path = Path(record.worktree_path)
     if worktree_path.exists() and not git_status_is_clean(worktree_path):
-        summary = f"Worktree has local changes; treating this PR as busy: {record.worktree_path}"
+        summary = f"{DIRTY_WORKTREE_SUMMARY_PREFIX} {record.worktree_path}"
         updated = update_tracked_pr(
             record.key,
             last_run_finished_at=now_ms(),
@@ -2370,7 +2431,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
     return {"status": "queued", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True, "job": job}
 
 
-def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int) -> dict[str, Any]:
+def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_dirty_worktree: bool = False, job_id: int) -> dict[str, Any]:
     existing_lock = acquire_lock(record, job_id)
     if existing_lock:
         started_at = format_timestamp(existing_lock.get("started_at"))
@@ -2421,8 +2482,8 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
             return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
 
         worktree_path = Path(record.worktree_path)
-        if worktree_path.exists() and not git_status_is_clean(worktree_path):
-            summary = f"Worktree has local changes; treating this PR as busy: {record.worktree_path}"
+        if worktree_path.exists() and not git_status_is_clean(worktree_path) and not allow_dirty_worktree:
+            summary = f"{DIRTY_WORKTREE_SUMMARY_PREFIX} {record.worktree_path}"
             updated = refresh_record_state(
                 record,
                 snapshot,
@@ -2435,7 +2496,24 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
             record_event("info", "worktree_busy", summary, tracked_pr_key=record.key)
             return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
 
-        if record.worktree_managed:
+        if allow_dirty_worktree:
+            refresh_record_state(
+                record,
+                snapshot,
+                run_status="running",
+                run_summary="Using tracked worktree with local changes",
+                run_reason="prepare",
+                job_id=job_id,
+            )
+            worktree = ensure_existing_worktree(
+                record.repo_root,
+                record.repo_name,
+                record.branch,
+                record.worktree_path,
+                allow_dirty=True,
+            )
+            sync_result = {"status": "skipped", "worktree": worktree["worktree"], "changed": False, "reason": "dirty worktree override"}
+        elif record.worktree_managed:
             refresh_record_state(record, snapshot, run_status="running", run_summary="Ensuring managed PR worktree is ready", run_reason="prepare", job_id=job_id)
             worktree = ensure_worktree(
                 record.repo_root,
@@ -2445,12 +2523,13 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: 
                 infer_managed_worktree_root(record),
                 layout=infer_managed_worktree_layout(record),
             )
+            refresh_record_state(record, snapshot, run_status="running", run_summary="Syncing worktree to latest remote branch state", run_reason="sync", job_id=job_id)
+            sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
         else:
             refresh_record_state(record, snapshot, run_status="running", run_summary="Validating tracked PR worktree", run_reason="prepare", job_id=job_id)
             worktree = ensure_existing_worktree(record.repo_root, record.repo_name, record.branch, record.worktree_path)
-
-        refresh_record_state(record, snapshot, run_status="running", run_summary="Syncing worktree to latest remote branch state", run_reason="sync", job_id=job_id)
-        sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
+            refresh_record_state(record, snapshot, run_status="running", run_summary="Syncing worktree to latest remote branch state", run_reason="sync", job_id=job_id)
+            sync_result = sync_worktree_to_remote(record.repo_root, record.branch, worktree["worktree"])
         provider = (record.provider or "codex").strip().lower()
         refresh_record_state(record, snapshot, run_status="running", run_summary=f"Resuming {provider} agent", run_reason=provider, job_id=job_id)
         update_tracked_pr(
@@ -2574,7 +2653,11 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
             if job.action == "poll-one":
                 result = poll_record(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
             elif job.action == "run-one":
-                result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
+                result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), allow_dirty_worktree=bool(payload.get("allow_dirty_worktree")), job_id=job.id)
+            elif job.action == "use-worktree-anyway":
+                result = run_follow_up(record, dry_run=dry_run, force_run=True, allow_dirty_worktree=True, job_id=job.id)
+            elif job.action == "clear-worktree":
+                result = clear_tracked_worktree(record, job_id=job.id)
             elif job.action == "retarget-thread":
                 result = retarget_tracked_pr_thread(
                     record,
@@ -3246,6 +3329,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   <td>
                     <div class="button-stack">
                       <button type="button" data-action="poll-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Poll</button>
+                      ${{record.dirty_worktree_busy ? `<button type="button" data-action="clear-worktree" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Clear worktree</button>` : ''}}
+                      ${{record.dirty_worktree_busy ? `<button type="button" data-action="use-worktree-anyway" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Use worktree anyway</button>` : ''}}
                       <button type="button" data-action="untrack" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack</button>
                       <button type="button" data-action="untrack-cleanup" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack + Cleanup</button>
                     </div>
@@ -3893,6 +3978,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status, payload = queue_simple_web_action("run-one", key=params.get("key", [None])[0], payload={"force_run": True}, requested_by="web")
             self._send_json(payload, status=status)
             return
+        if parsed.path == "/api/actions/use-worktree-anyway":
+            status, payload = queue_simple_web_action("use-worktree-anyway", key=params.get("key", [None])[0], requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/clear-worktree":
+            status, payload = queue_simple_web_action("clear-worktree", key=params.get("key", [None])[0], requested_by="web")
+            self._send_json(payload, status=status)
+            return
         if parsed.path == "/api/actions/untrack":
             status, payload = queue_simple_web_action("untrack", key=params.get("key", [None])[0], requested_by="web")
             self._send_json(payload, status=status)
@@ -3923,6 +4016,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             key = params.get("key", [None])[0]
             if key:
                 enqueue_job("run-one", tracked_pr_key=key, requested_by="web", payload={"force_run": True})
+            self._redirect("/")
+            return
+        if parsed.path == "/use-worktree-anyway":
+            key = params.get("key", [None])[0]
+            if key:
+                enqueue_job("use-worktree-anyway", tracked_pr_key=key, requested_by="web")
+            self._redirect("/")
+            return
+        if parsed.path == "/clear-worktree":
+            key = params.get("key", [None])[0]
+            if key:
+                enqueue_job("clear-worktree", tracked_pr_key=key, requested_by="web")
             self._redirect("/")
             return
         if parsed.path == "/untrack":
