@@ -1264,6 +1264,48 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(activity["items"][1]["kind"], "file")
         self.assertEqual(activity["items"][1]["text"], "Created /tmp/hello.txt")
+
+    def test_serialize_dashboard_record_prefers_compact_codex_summary_line(self):
+        record = self.make_record(
+            run_state="running",
+            last_run_status="running",
+            last_run_summary="Launching codex follow-up",
+            live_activity_json=json.dumps(
+                {
+                    "headline": "Tracing support-ticket parsing",
+                    "items": [
+                        {"kind": "command", "text": "Running rg -n supportTicket src"},
+                        {"kind": "file", "text": "Updated src/routes/support_ticket.ts"},
+                    ],
+                }
+            ),
+            live_activity_updated_at=123456,
+        )
+
+        payload = pr_review_coordinator.serialize_dashboard_record(record)
+
+        self.assertEqual(payload["run_summary_line"], "Codex running: Tracing support-ticket parsing")
+        self.assertEqual(payload["live_activity_updated_label"], pr_review_coordinator.format_timestamp(123456))
+        self.assertEqual(payload["run_detail_meta"], f"2 update(s) | latest activity {payload['live_activity_updated_label']}")
+        self.assertTrue(payload["has_run_details"])
+
+    def test_serialize_dashboard_record_falls_back_to_last_run_summary_without_live_activity(self):
+        record = self.make_record(
+            provider="cursor",
+            run_state="busy",
+            last_run_status="busy",
+            last_run_summary="Worktree has local changes",
+            live_activity_json=None,
+            live_activity_updated_at=None,
+        )
+
+        payload = pr_review_coordinator.serialize_dashboard_record(record)
+
+        self.assertEqual(payload["run_summary_line"], "Worktree has local changes")
+        self.assertEqual(payload["run_detail_meta"], "")
+        self.assertFalse(payload["has_run_details"])
+
+
 class WorktreeCleanlinessTests(unittest.TestCase):
     def test_git_status_is_clean_ignores_root_node_modules_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:

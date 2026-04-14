@@ -664,6 +664,15 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
     pending_jobs = pending_jobs or []
     recent_threads = recent_threads or []
     live_activity = load_live_activity(record.live_activity_json)
+    run_status = record.run_state or record.last_run_status or "unknown"
+    activity_summary = summarize_live_activity(live_activity)
+    has_live_activity = bool(live_activity.get("headline") or live_activity.get("items"))
+    live_update_count = len(live_activity.get("items") or [])
+    run_summary_line = (
+        f"Codex {run_status}: {activity_summary}"
+        if (record.provider or "codex") == "codex" and has_live_activity and run_status in {"running", "busy", "queued"}
+        else (record.last_run_summary or "")
+    )
     details = []
     if record.unresolved_thread_count:
         details.append(f"{record.unresolved_thread_count} review thread(s)")
@@ -692,9 +701,21 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "provider": record.provider or "codex",
         "worktree_path": record.worktree_path,
         "detail_text": " | ".join(details),
-        "run_status": record.run_state or record.last_run_status or "unknown",
+        "run_status": run_status,
         "run_summary": record.last_run_summary or "",
+        "run_summary_line": run_summary_line,
+        "run_detail_meta": " | ".join(
+            part
+            for part in [
+                f"{live_update_count} update(s)" if live_update_count else "",
+                f"latest activity {format_timestamp(record.live_activity_updated_at)}" if record.live_activity_updated_at else "",
+            ]
+            if part
+        ),
+        "has_run_details": bool(has_live_activity or ((record.last_run_summary or "") and (record.last_run_summary or "") != run_summary_line)),
         "live_activity": live_activity,
+        "live_activity_updated_at": record.live_activity_updated_at,
+        "live_activity_updated_label": format_timestamp(record.live_activity_updated_at),
         "last_polled_at": record.last_polled_at,
         "last_polled_label": format_timestamp(record.last_polled_at),
         "actions_disabled": bool(pending_jobs),
@@ -3008,6 +3029,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             refreshIntervalSeconds: DEFAULT_REFRESH_INTERVAL_SECONDS,
             secondsRemaining: DEFAULT_REFRESH_INTERVAL_SECONDS,
             loading: false,
+            expandedKey: null,
+            records: [],
           }};
 
           function escapeHtml(value) {{
@@ -3143,6 +3166,38 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             return `<div class="live-activity" data-role="live-activity">${{headlineMarkup}}${{itemMarkup}}</div>`;
           }}
 
+          function detailRowMarkup(record) {{
+            const lastSummary = String(record.run_summary || '').trim();
+            const detailMeta = String(record.run_detail_meta || '').trim();
+            const updatedLabel = String(record.live_activity_updated_label || '').trim();
+            const liveMarkup = liveActivityMarkup(record.live_activity);
+            const metaMarkup = detailMeta ? `<div class="small">${{escapeHtml(detailMeta)}}</div>` : '';
+            const updatedMarkup = updatedLabel ? ` <span class="small">(${{escapeHtml(updatedLabel)}})</span>` : '';
+            const summaryMarkup = lastSummary ? `
+              <div class="detail-section">
+                <div class="detail-label">Latest run summary</div>
+                <div class="small stack">${{escapeHtml(lastSummary)}}</div>
+              </div>
+            ` : '';
+            const activityMarkup = liveMarkup ? `
+              <div class="detail-section">
+                <div class="detail-label">Recent Codex activity${{updatedMarkup}}</div>
+                ${{liveMarkup}}
+              </div>
+            ` : '<div class="small">No live Codex activity is currently available for this PR.</div>';
+            return `
+              <tr class="details-row" data-details-for="${{escapeHtml(record.key)}}">
+                <td colspan="8">
+                  <div class="details-panel">
+                    ${{metaMarkup}}
+                    ${{summaryMarkup}}
+                    ${{activityMarkup}}
+                  </div>
+                </td>
+              </tr>
+            `;
+          }}
+
           function nextRefreshInterval(records) {{
             return (records || []).some((record) => {{
               const runStatus = record.run_status || '';
@@ -3155,19 +3210,30 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
             const tbody = document.getElementById('tracked-pr-body');
             if (!tbody) return;
             if (!records.length) {{
+              state.expandedKey = null;
               tbody.innerHTML = '<tr><td colspan="8">No matching tracked PRs</td></tr>';
               return;
             }}
+            if (state.expandedKey && !(records || []).some((record) => record.key === state.expandedKey && record.has_run_details)) {{
+              state.expandedKey = null;
+            }}
             tbody.innerHTML = records.map((record) => {{
               const disabled = record.actions_disabled ? 'disabled' : '';
-              return `
+              const hasDetails = !!record.has_run_details;
+              const isExpanded = hasDetails && state.expandedKey === record.key;
+              const toggleLabel = isExpanded ? 'Hide details' : 'Show details';
+              const toggleButton = hasDetails
+                ? `<button type="button" class="link-button" data-action="toggle-details" data-key="${{escapeHtml(record.key)}}" aria-expanded="${{isExpanded ? 'true' : 'false'}}">${{toggleLabel}}</button>`
+                : '';
+              const runMeta = record.run_detail_meta ? `<div class="small">${{escapeHtml(record.run_detail_meta)}}</div>` : '';
+              const mainRow = `
                 <tr data-pr-key="${{escapeHtml(record.key)}}">
                   <td>${{statusBadge(record.status)}}</td>
                   <td><a href="${{escapeHtml(record.pr_url)}}">${{escapeHtml(record.repo_name)}} #${{escapeHtml(record.pr_number)}}</a><div class="small">${{escapeHtml(record.pr_title)}}</div></td>
                   <td><code>${{escapeHtml(record.branch)}}</code>${{threadControlsMarkup(record)}}</td>
                   <td><code>${{escapeHtml(record.provider)}}</code></td>
                   <td><code>${{escapeHtml(record.worktree_path)}}</code><div class="small" data-role="detail-text">${{escapeHtml(record.detail_text || '')}}</div></td>
-                  <td>${{statusBadge(record.run_status)}}<div class="small stack" data-role="run-summary">${{escapeHtml(record.run_summary || '')}}</div>${{liveActivityMarkup(record.live_activity)}}</td>
+                  <td>${{statusBadge(record.run_status)}}<div class="small stack run-summary-line" data-role="run-summary">${{escapeHtml(record.run_summary_line || record.run_summary || '')}}</div>${{runMeta}}${{toggleButton}}</td>
                   <td>${{escapeHtml(record.last_polled_label || '')}}</td>
                   <td>
                     <div class="button-stack">
@@ -3178,6 +3244,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   </td>
                 </tr>
               `;
+              return isExpanded ? `${{mainRow}}${{detailRowMarkup(record)}}` : mainRow;
             }}).join('');
           }}
 
@@ -3221,14 +3288,15 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 throw new Error(data.message || 'Failed to load dashboard.');
               }}
               state.filters = data.filters;
+              state.records = data.records || [];
               updateUrl();
-              renderTrackedPrs(data.records || []);
+              renderTrackedPrs(state.records);
               renderJobs(data.jobs || []);
               renderEvents(data.events || []);
               if (!options.preserveFlash) {{
                 showFlash('');
               }}
-              state.refreshIntervalSeconds = nextRefreshInterval(data.records || []);
+              state.refreshIntervalSeconds = nextRefreshInterval(state.records);
               state.secondsRemaining = state.refreshIntervalSeconds;
             }} catch (error) {{
               showFlash(error.message || 'Failed to load dashboard.', 'error');
@@ -3308,6 +3376,11 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 if (!row) return;
                 const key = button.dataset.key;
                 if (!key) return;
+                if (action === 'toggle-details') {{
+                  state.expandedKey = state.expandedKey === key ? null : key;
+                  renderTrackedPrs(state.records || []);
+                  return;
+                }}
                 if (action === 'set-thread') {{
                   const input = row.querySelector('[data-role="thread-id-input"]');
                   markRowPending(row, 'thread update queued');
@@ -3955,6 +4028,13 @@ def html_page(title: str, body: str) -> bytes:
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
     .thread-panel {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 12px 14px; }}
     .thread-mode {{ display: grid; gap: 6px; }}
+    .run-summary-line {{ margin-top: 8px; }}
+    .link-button {{ margin-top: 8px; padding: 0; border: 0; background: none; color: var(--accent); font-size: 12px; font-weight: 500; cursor: pointer; }}
+    .link-button:hover:not([disabled]) {{ color: var(--accent-hover); text-decoration: underline; }}
+    .details-row td {{ background: rgba(13, 115, 119, 0.035); }}
+    .details-panel {{ display: grid; gap: 12px; }}
+    .detail-section {{ display: grid; gap: 6px; }}
+    .detail-label {{ color: var(--ink); font-size: 12px; font-weight: 600; }}
     .live-activity {{ margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: linear-gradient(180deg, rgba(13,115,119,0.1), rgba(13,115,119,0.04)); border: 1px solid rgba(13,115,119,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }}
     .live-activity-headline {{ color: var(--ink); font-size: 12px; font-weight: 600; line-height: 1.5; margin-bottom: 6px; }}
     .live-activity-line {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
