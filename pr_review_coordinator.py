@@ -2916,47 +2916,55 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
     normalized_status_filter = normalize_dashboard_status_filter(status_filter)
     normalized_sort_key = normalize_dashboard_sort_key(sort_key)
     return f"""
-        <header>
-          <h1>PR Review Coordinator</h1>
-          <p>Tracked PR dashboard with fetch-based refresh. Filters stay in the URL; queued actions update data without reloading the page.</p>
-          {render_web_navigation("/")}
-          <div class="toolbar refresh-controls">
-            <div class="small" id="refresh-status">Loading dashboard…</div>
-            <div class="button-row">
-              <button type="button" id="refresh-toggle">Pause auto-refresh</button>
-              <button type="button" id="refresh-now">Refresh now</button>
+        <header class="page-header">
+          <div class="header-row">
+            <div class="header-copy">
+              <h1>PR Review Coordinator</h1>
+              <p>Tracked PR dashboard with fetch-based refresh. Filters stay in the URL; queued actions update data without reloading the page.</p>
+            </div>
+            <div class="header-controls">
+              <div class="small" id="refresh-status">Loading dashboard…</div>
+              <div class="button-row compact">
+                <button type="button" id="refresh-toggle">Pause auto-refresh</button>
+                <button type="button" id="refresh-now">Refresh now</button>
+              </div>
             </div>
           </div>
-          <div id="flash" class="flash hidden"></div>
+          <div class="header-row header-row-secondary">
+            {render_web_navigation("/")}
+            <div id="flash" class="flash hidden"></div>
+          </div>
         </header>
         <main id="dashboard-root">
-          <div class="actions">
-            <button type="button" data-action="poll-all">Poll all now</button>
-          </div>
-          <form id="dashboard-filters" class="filters">
-            <label>Scope
-              <select name="scope">
-                <option value="active" {"selected" if normalized_scope == "active" else ""}>Active</option>
-                <option value="archived" {"selected" if normalized_scope == "archived" else ""}>Archived</option>
-                <option value="all" {"selected" if normalized_scope == "all" else ""}>All</option>
-              </select>
-            </label>
-            <label>Status
-              <select name="status">
-                <option value="all" {"selected" if normalized_status_filter == "all" else ""}>All</option>
-                {"".join(f'<option value="{name}" {"selected" if normalized_status_filter == name else ""}>{name}</option>' for name in WEB_STATUS_FILTERS)}
-              </select>
-            </label>
-            <label>Sort
-              <select name="sort">
-                <option value="updated" {"selected" if normalized_sort_key == "updated" else ""}>Updated</option>
-                <option value="status" {"selected" if normalized_sort_key == "status" else ""}>Status</option>
-                <option value="pr" {"selected" if normalized_sort_key == "pr" else ""}>PR number/repo</option>
-                <option value="last_poll" {"selected" if normalized_sort_key == "last_poll" else ""}>Last poll</option>
-              </select>
-            </label>
-            <button type="submit">Apply</button>
-          </form>
+          <section class="control-strip">
+            <div class="actions compact">
+              <button type="button" data-action="poll-all">Poll all now</button>
+            </div>
+            <form id="dashboard-filters" class="filters compact">
+              <label>Scope
+                <select name="scope">
+                  <option value="active" {"selected" if normalized_scope == "active" else ""}>Active</option>
+                  <option value="archived" {"selected" if normalized_scope == "archived" else ""}>Archived</option>
+                  <option value="all" {"selected" if normalized_scope == "all" else ""}>All</option>
+                </select>
+              </label>
+              <label>Status
+                <select name="status">
+                  <option value="all" {"selected" if normalized_status_filter == "all" else ""}>All</option>
+                  {"".join(f'<option value="{name}" {"selected" if normalized_status_filter == name else ""}>{name}</option>' for name in WEB_STATUS_FILTERS)}
+                </select>
+              </label>
+              <label>Sort
+                <select name="sort">
+                  <option value="updated" {"selected" if normalized_sort_key == "updated" else ""}>Updated</option>
+                  <option value="status" {"selected" if normalized_sort_key == "status" else ""}>Status</option>
+                  <option value="pr" {"selected" if normalized_sort_key == "pr" else ""}>PR number/repo</option>
+                  <option value="last_poll" {"selected" if normalized_sort_key == "last_poll" else ""}>Last poll</option>
+                </select>
+              </label>
+              <button type="submit">Apply</button>
+            </form>
+          </section>
           <div class="table-shell">
             <table>
               <thead>
@@ -3972,20 +3980,27 @@ def html_page(title: str, body: str) -> bytes:
     }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     body {{ margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }}
-    header {{ padding: 28px 32px 16px; background: var(--card); border-bottom: 1px solid var(--line); box-shadow: var(--shadow); }}
-    h1 {{ margin: 0 0 4px; font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }}
-    h2 {{ margin: 0 0 10px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }}
+    header {{ padding: 18px 24px 14px; background: var(--card); border-bottom: 1px solid var(--line); box-shadow: var(--shadow); }}
+    h1 {{ margin: 0 0 2px; font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }}
+    h2 {{ margin: 0 0 8px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }}
     p {{ margin: 4px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }}
-    main {{ padding: 24px 32px 40px; max-width: 1600px; }}
-    code {{ font: 13px/1.4 Menlo, Monaco, 'Cascadia Code', monospace; }}
+    main {{ padding: 16px 24px 24px; max-width: 100%; }}
+    code {{ font: 12px/1.4 Menlo, Monaco, 'Cascadia Code', monospace; }}
     a {{ color: var(--accent); }}
     a:hover {{ color: var(--accent-hover); }}
-    .nav-bar {{ display: flex; gap: 6px; margin: 16px 0 0; }}
-    .nav-link {{ display: inline-block; padding: 7px 16px; border-radius: 999px; background: var(--surface); color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }}
+    .page-header {{ position: sticky; top: 0; z-index: 10; }}
+    .header-row {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }}
+    .header-row + .header-row {{ margin-top: 10px; }}
+    .header-row-secondary {{ align-items: center; }}
+    .header-copy {{ min-width: 0; flex: 1 1 auto; }}
+    .header-controls {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
+    .nav-bar {{ display: flex; gap: 6px; margin: 0; flex-wrap: wrap; }}
+    .nav-link {{ display: inline-block; padding: 6px 14px; border-radius: 999px; background: var(--surface); color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }}
     .nav-link:hover {{ background: var(--line); color: var(--ink); }}
     .nav-link.current {{ background: var(--accent); color: #fff; }}
-    .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 10px; margin: 16px 0 20px; align-items: end; flex-wrap: wrap; }}
-    button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 7px 14px; border-radius: var(--radius-sm); cursor: pointer; font: inherit; font-size: 13px; color: var(--ink); transition: all 0.15s ease; }}
+    .actions, .filters, .toolbar, .button-row {{ display: flex; gap: 8px; margin: 12px 0 16px; align-items: end; flex-wrap: wrap; }}
+    .compact {{ margin: 0; }}
+    button, select, input {{ border: 1px solid var(--line); background: var(--card); padding: 6px 12px; border-radius: var(--radius-sm); cursor: pointer; font: inherit; font-size: 13px; color: var(--ink); transition: all 0.15s ease; }}
     button:hover:not([disabled]) {{ background: var(--surface); border-color: #c5beb3; }}
     button:active:not([disabled]) {{ transform: scale(0.98); }}
     button:focus-visible, select:focus-visible, input:focus-visible {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
@@ -3997,21 +4012,24 @@ def html_page(title: str, body: str) -> bytes:
     input[type="text"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
     input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; accent-color: var(--accent); }}
     button[disabled], select[disabled], input[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
-    .table-shell {{ width: 100%; max-width: 100%; overflow-x: auto; overflow-y: hidden; margin-bottom: 24px; }}
+    .control-strip {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; padding: 12px 14px; background: rgba(255,252,247,0.7); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }}
+    .filters.compact {{ flex: 1 1 auto; justify-content: flex-end; }}
+    .filters.compact label {{ min-width: 132px; }}
+    .table-shell {{ width: 100%; max-width: 100%; overflow-x: auto; overflow-y: hidden; margin-bottom: 16px; }}
     table {{ width: 100%; max-width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-bottom: 0; box-shadow: var(--shadow); }}
-    th, td {{ padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; overflow-wrap: anywhere; }}
-    th {{ background: var(--surface); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; overflow-wrap: anywhere; }}
+    th {{ background: var(--surface); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }}
     tr:last-child td {{ border-bottom: none; }}
     tbody tr:hover {{ background: rgba(13, 115, 119, 0.03); }}
-    .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; background: var(--surface); color: var(--muted); white-space: nowrap; }}
+    .pill {{ display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 500; background: var(--surface); color: var(--muted); white-space: nowrap; }}
     .pill.good {{ background: var(--good-soft); color: var(--good); }}
     .pill.warn {{ background: var(--warn-soft); color: var(--warn); }}
     .pill.bad {{ background: var(--bad-soft); color: var(--bad); }}
-    .small {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
+    .small {{ color: var(--muted); font-size: 12px; line-height: 1.35; }}
     .stack {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
     .muted {{ opacity: 0.6; }}
     .panel {{ background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 24px; margin: 0 0 20px; box-shadow: var(--shadow); }}
-    .flash {{ margin: 14px 0 0; padding: 10px 16px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; border: 1px solid transparent; animation: flashIn 0.25s ease; }}
+    .flash {{ margin: 0; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 500; border: 1px solid transparent; animation: flashIn 0.25s ease; max-width: min(560px, 100%); }}
     .flash.success {{ background: var(--accent-soft); color: var(--accent); border-color: rgba(13,115,119,0.2); }}
     .flash.error {{ background: var(--bad-soft); color: var(--bad); border-color: rgba(220,38,38,0.2); }}
     .hidden {{ display: none; }}
@@ -4020,22 +4038,22 @@ def html_page(title: str, body: str) -> bytes:
     .bulk-track {{ display: block; }}
     .browser-panel summary {{ cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-weight: 500; }}
     .browser-panel[open] summary {{ margin-bottom: 12px; }}
-    .thread-disclosure {{ margin-top: 8px; }}
-    .thread-disclosure summary {{ cursor: pointer; display: flex; flex-direction: column; gap: 4px; padding: 4px 0; border-radius: var(--radius-sm); }}
+    .thread-disclosure {{ margin-top: 6px; }}
+    .thread-disclosure summary {{ cursor: pointer; display: flex; flex-direction: column; gap: 2px; padding: 2px 0; border-radius: var(--radius-sm); }}
     .thread-disclosure summary:hover {{ color: var(--accent); }}
-    .thread-disclosure[open] summary {{ margin-bottom: 8px; }}
-    .thread-controls {{ display: grid; gap: 10px; margin-top: 8px; }}
+    .thread-disclosure[open] summary {{ margin-bottom: 6px; }}
+    .thread-controls {{ display: grid; gap: 8px; margin-top: 6px; }}
     .thread-controls form {{ display: grid; gap: 6px; justify-items: start; }}
-    .thread-panel {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 12px 14px; }}
+    .thread-panel {{ border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 10px 12px; }}
     .thread-mode {{ display: grid; gap: 6px; }}
-    .run-summary-line {{ margin-top: 8px; }}
-    .link-button {{ margin-top: 8px; padding: 0; border: 0; background: none; color: var(--accent); font-size: 12px; font-weight: 500; cursor: pointer; }}
+    .run-summary-line {{ margin-top: 6px; }}
+    .link-button {{ margin-top: 6px; padding: 0; border: 0; background: none; color: var(--accent); font-size: 12px; font-weight: 500; cursor: pointer; }}
     .link-button:hover:not([disabled]) {{ color: var(--accent-hover); text-decoration: underline; }}
     .details-row td {{ background: rgba(13, 115, 119, 0.035); }}
-    .details-panel {{ display: grid; gap: 12px; }}
-    .detail-section {{ display: grid; gap: 6px; }}
+    .details-panel {{ display: grid; gap: 10px; }}
+    .detail-section {{ display: grid; gap: 4px; }}
     .detail-label {{ color: var(--ink); font-size: 12px; font-weight: 600; }}
-    .live-activity {{ margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: linear-gradient(180deg, rgba(13,115,119,0.1), rgba(13,115,119,0.04)); border: 1px solid rgba(13,115,119,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }}
+    .live-activity {{ margin-top: 8px; padding: 8px 10px; border-radius: 9px; background: linear-gradient(180deg, rgba(13,115,119,0.1), rgba(13,115,119,0.04)); border: 1px solid rgba(13,115,119,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }}
     .live-activity-headline {{ color: var(--ink); font-size: 12px; font-weight: 600; line-height: 1.5; margin-bottom: 6px; }}
     .live-activity-line {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
     .live-activity-line + .live-activity-line {{ margin-top: 4px; }}
@@ -4047,6 +4065,18 @@ def html_page(title: str, body: str) -> bytes:
     label select, label input {{ font-size: 13px; color: var(--ink); }}
     label.inline-option {{ display: inline-flex; flex-direction: row; align-items: center; gap: 6px; }}
     td code, .thread-disclosure code, .thread-panel code {{ white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }}
+    @media (max-width: 1100px) {{
+      header {{ padding: 16px 18px 12px; }}
+      main {{ padding: 14px 18px 20px; }}
+      .header-row, .header-controls, .header-row-secondary, .control-strip {{ flex-direction: column; align-items: stretch; }}
+      .filters.compact {{ justify-content: flex-start; }}
+    }}
+    @media (max-width: 720px) {{
+      input[type="text"] {{ min-width: 100%; }}
+      .filters.compact label {{ min-width: 0; width: 100%; }}
+      .button-stack {{ flex-direction: column; }}
+      th, td {{ padding: 8px; }}
+    }}
   </style>
 </head>
 <body>
