@@ -101,12 +101,43 @@ prc handoff \
   --branch feat/example-change \
   --commit-message "Add example change" \
   --pr-title "Add example change" \
-  --pr-body "## Summary\n- add example change"
+  --summary "add example change" \
+  --validation "npm test"
 ```
 
 If you already have the change in a dedicated worktree, pass `--worktree-path /absolute/path/to/checkout`. In that mode, `handoff` performs branch/commit/push/PR operations in the adopted checkout and only uses `--repo-root` as the stable canonical root for tracking metadata.
 
 If you have intentionally staged only part of a dirty checkout before running `handoff`, the coordinator now commits just the staged changes and leaves unstaged files alone.
+
+Branch names for new handoffs must use work-type prefixes such as `feat/`, `bugfix/`, `fix/`, `chore/`, `refactor/`, `test/`, `docs/`, `ci/`, `perf/`, `build/`, `style/`, or `revert/`. Personal, agent, and tool prefixes such as `jordan/`, `codex/`, `agent/`, and `bot/` are rejected.
+
+When `--pr-body` is omitted, `handoff` generates the standard PR body:
+
+```md
+## Summary
+- ...
+
+## Validation
+- ...
+
+## Notes
+- ...
+```
+
+Use `--summary`, `--validation`, and `--notes` to fill those sections. Use the phrase `no handoff` in agent instructions when a completed local change should not be handed off.
+
+### Completed local work shortcut
+
+Use `complete` from the checkout containing finished local changes when you want the coordinator to infer the checkout, title, commit message, and PR body:
+
+```bash
+prc complete \
+  --branch feat/example-change \
+  --summary "add example change" \
+  --validation "npm test"
+```
+
+`complete` defaults `--repo-root` to the current checkout, or to the primary non-Codex worktree when the command is run from a Codex scratch worktree. In the latter case it adopts the current checkout as `--worktree-path`.
 
 ### Register an existing PR
 
@@ -199,18 +230,35 @@ prc handoff \
   --branch feat/example-change \
   --commit-message "Add example change" \
   --pr-title "Add example change" \
-  --pr-body "## Summary\n- add example change"
+  --summary "add example change" \
+  --validation "npm test"
 ```
 
 Common options:
 - `--repo-root`: absolute path to the main repo checkout
 - `--repo-name`: optional explicit repo name; otherwise inferred from `origin`. Both `repo-name` and `owner/repo-name` forms are accepted.
 - `--branch`: PR branch name
+- `--summary`: summary bullet for the generated PR body; can be repeated
+- `--validation`: validation bullet for the generated PR body; can be repeated
+- `--notes`: notes bullet for the generated PR body; can be repeated
 - `--base-branch`: optional PR base branch
 - `--thread-id`: optional explicit Codex thread id (Codex only; ignored when `--provider cursor`)
 - `--provider`: agent for follow-up: `codex` (default) or `cursor`; when not provided, defaults to **codex**
 - `--worktree-root`: root directory for managed worktrees
 - `--worktree-path`: use an existing registered git worktree instead of creating one
+
+### `complete`
+
+Infers common handoff metadata from the current checkout and then runs the same branch/commit/PR/worktree/tracking lifecycle as `handoff`.
+
+```bash
+prc complete \
+  --branch feat/example-change \
+  --summary "add example change" \
+  --validation "npm test"
+```
+
+Common options match `handoff`; `--repo-root`, `--commit-message`, and `--pr-title` are optional because `complete` can infer them.
 
 ### `track`
 
