@@ -1526,6 +1526,14 @@ def request_copilot_review(record: TrackedPR) -> dict[str, Any]:
     return {"status": "ready", "reviewer": COPILOT_REVIEW_REQUEST_LOGIN}
 
 
+def remote_branch_sha(repo_root: str, branch: str) -> str | None:
+    try:
+        run(["git", "-C", repo_root, "fetch", "origin", branch])
+        return run(["git", "-C", repo_root, "rev-parse", f"origin/{branch}"]).stdout.strip()
+    except ScriptError:
+        return None
+
+
 def tracked_status_for_snapshot(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> str:
     if snapshot["status"] == "awaiting_final_test" and last_prompted_at:
         return "awaiting_final_review"
@@ -2669,6 +2677,7 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
             live_activity_updated_at=now_ms(),
         )
         record_event("info", "agent_resume", f"Launching {provider} follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run, "provider": provider})
+        remote_sha_before = None if dry_run else remote_branch_sha(record.repo_root, record.branch)
         agent_result = run_agent_resume(record, snapshot, dry_run)
         updated = refresh_record_state(
             record,
@@ -2681,17 +2690,54 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
         )
         if agent_result["status"] in {"ok", "dry_run"}:
             updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None, **execution_payload(snapshot))
+            review_request_result = {"status": "skipped", "reason": "dry run"}
+            refreshed_snapshot = snapshot
+            if agent_result["status"] == "ok" and not dry_run:
+                remote_sha_after = remote_branch_sha(record.repo_root, record.branch)
+                if remote_sha_before and remote_sha_after and remote_sha_after != remote_sha_before:
+                    requested_at = now_ms()
+                    request_result = request_copilot_review(record)
+                    refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+                    updated = update_tracked_pr(
+                        record.key,
+                        last_copilot_rerequested_at=requested_at,
+                        **state_payload(refreshed_snapshot, last_prompted_at=updated.last_prompted_at),
+                    )
+                    review_request_result = {
+                        "status": "ready",
+                        "requested_at": requested_at,
+                        "reviewer": request_result["reviewer"],
+                        "before": remote_sha_before,
+                        "after": remote_sha_after,
+                    }
+                    record_event(
+                        "info",
+                        "copilot_review_rerequested",
+                        "Re-requested Copilot review after pushed follow-up changes",
+                        tracked_pr_key=record.key,
+                        details=review_request_result,
+                    )
+                else:
+                    review_request_result = {
+                        "status": "skipped",
+                        "reason": "remote branch unchanged",
+                        "before": remote_sha_before,
+                        "after": remote_sha_after,
+                    }
         else:
             updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None)
+            review_request_result = {"status": "skipped", "reason": "agent failed"}
+            refreshed_snapshot = snapshot
         level = "info" if agent_result["status"] in {"ok", "dry_run"} else "error"
         record_event(level, "agent_finished", f"Agent follow-up finished with status {agent_result['status']}", tracked_pr_key=record.key, details={"job_id": job_id, "provider": provider})
         return {
             "status": agent_result["status"],
             "tracked_pr": tracked_pr_to_dict(updated),
-            "review": snapshot,
+            "review": refreshed_snapshot,
             "worktree": worktree,
             "sync": sync_result,
             "agent": agent_result,
+            "review_request": review_request_result,
             "triggered": True,
         }
     finally:
