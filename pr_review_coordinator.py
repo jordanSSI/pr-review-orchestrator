@@ -92,6 +92,21 @@ WEB_STATUS_FILTERS = [
 WEB_SORT_KEYS = {"updated", "status", "pr", "last_poll"}
 WEB_SCOPE_VALUES = {"active", "archived", "all"}
 DIRTY_WORKTREE_SUMMARY_PREFIX = "Worktree has local changes; treating this PR as busy:"
+ALLOWED_HANDOFF_BRANCH_PREFIXES = (
+    "feat",
+    "bugfix",
+    "fix",
+    "chore",
+    "refactor",
+    "test",
+    "docs",
+    "ci",
+    "perf",
+    "build",
+    "style",
+    "revert",
+)
+FORBIDDEN_HANDOFF_BRANCH_PREFIXES = ("jordan", "codex", "agent", "bot")
 
 
 SCHEMA = """
@@ -1038,6 +1053,120 @@ def working_tree_changes(repo_root: str) -> dict[str, list[str]]:
     }
 
 
+def validate_handoff_branch_name(branch: str) -> str:
+    normalized = branch.strip()
+    if not normalized:
+        raise ScriptError("--branch must not be empty")
+    if normalized != branch:
+        raise ScriptError("--branch must not contain leading or trailing whitespace")
+    if "/" not in normalized:
+        allowed = ", ".join(f"{prefix}/" for prefix in ALLOWED_HANDOFF_BRANCH_PREFIXES)
+        raise ScriptError(f"--branch must use a work-type prefix ({allowed}); got {branch!r}")
+    prefix = normalized.split("/", 1)[0]
+    if prefix in FORBIDDEN_HANDOFF_BRANCH_PREFIXES:
+        forbidden = ", ".join(f"{value}/" for value in FORBIDDEN_HANDOFF_BRANCH_PREFIXES)
+        raise ScriptError(f"--branch must not use personal, agent, or tool prefixes ({forbidden}); got {branch!r}")
+    if prefix not in ALLOWED_HANDOFF_BRANCH_PREFIXES:
+        allowed = ", ".join(f"{value}/" for value in ALLOWED_HANDOFF_BRANCH_PREFIXES)
+        raise ScriptError(f"--branch must use a work-type prefix ({allowed}); got {branch!r}")
+    return normalized
+
+
+def bullet_lines(items: list[str]) -> list[str]:
+    return [f"- {item.strip()}" for item in items if item and item.strip()]
+
+
+def render_pr_body_template(*, summary: list[str] | None = None, validation: list[str] | None = None, notes: list[str] | None = None) -> str:
+    summary_lines = bullet_lines(summary or []) or ["- See commit for details."]
+    validation_lines = bullet_lines(validation or []) or ["- Not run (not specified)."]
+    notes_lines = bullet_lines(notes or [])
+    sections = [
+        "## Summary",
+        *summary_lines,
+        "",
+        "## Validation",
+        *validation_lines,
+    ]
+    if notes_lines:
+        sections.extend(["", "## Notes", *notes_lines])
+    return "\n".join(sections)
+
+
+def resolve_pr_body(pr_body: str | None, *, summary: list[str] | None = None, validation: list[str] | None = None, notes: list[str] | None = None) -> str:
+    if pr_body and pr_body.strip():
+        return pr_body
+    return render_pr_body_template(summary=summary, validation=validation, notes=notes)
+
+
+def title_from_branch(branch: str) -> str:
+    leaf = branch.split("/", 1)[1] if "/" in branch else branch
+    words = [word for word in re.split(r"[-_]+", leaf) if word]
+    return " ".join(words).capitalize() if words else branch
+
+
+def parse_git_worktree_list(repo_root: str) -> list[dict[str, str]]:
+    result = run(["git", "-C", repo_root, "worktree", "list", "--porcelain"])
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        entries.append(current)
+    return entries
+
+
+def infer_stable_repo_root(checkout_root: str) -> str:
+    checkout = Path(checkout_root).resolve()
+    codex_worktrees = (CODEX_HOME / "worktrees").resolve()
+    if not checkout.is_relative_to(codex_worktrees):
+        return str(checkout)
+
+    entries = parse_git_worktree_list(str(checkout))
+    candidates: list[Path] = []
+    for entry in entries:
+        raw_path = entry.get("worktree")
+        if raw_path:
+            candidates.append(Path(raw_path).resolve())
+
+    for candidate in candidates:
+        if candidate == checkout:
+            continue
+        if not candidate.exists():
+            continue
+        if not candidate.is_relative_to(codex_worktrees):
+            return str(candidate)
+    return str(checkout)
+
+
+def resolve_complete_defaults(*, repo_root: str | None, worktree_path: str | None, branch: str, commit_message: str | None, pr_title: str | None, pr_body: str | None, summary: list[str] | None, validation: list[str] | None, notes: list[str] | None) -> dict[str, str | None]:
+    checkout_root = canonical_repo_root(os.getcwd())
+    if not checkout_root:
+        raise ScriptError("unable to infer git checkout from current directory; pass --repo-root to handoff")
+    stable_repo_root = str(Path(repo_root).expanduser().resolve()) if repo_root else infer_stable_repo_root(checkout_root)
+    resolved_worktree_path = worktree_path
+    if not resolved_worktree_path and Path(stable_repo_root).resolve() != Path(checkout_root).resolve():
+        resolved_worktree_path = checkout_root
+
+    validated_branch = validate_handoff_branch_name(branch)
+    title = (pr_title or "").strip() or title_from_branch(validated_branch)
+    message = (commit_message or "").strip() or title
+    body = resolve_pr_body(pr_body, summary=summary or [title], validation=validation, notes=notes)
+    return {
+        "repo_root": stable_repo_root,
+        "worktree_path": resolved_worktree_path,
+        "branch": validated_branch,
+        "commit_message": message,
+        "pr_title": title,
+        "pr_body": body,
+    }
+
+
 def ensure_branch(repo_root: str, branch: str) -> dict[str, Any]:
     branch_before = current_branch(repo_root)
     if branch_before == branch:
@@ -1831,6 +1960,8 @@ def register_tracking(
 
 
 def handoff_pr(*, repo_root: str, repo_name: str | None, branch: str, base_branch: str | None, commit_message: str, pr_title: str, pr_body: str, draft: bool, worktree_root: str, worktree_path: str | None, thread_id: str | None, worktree_layout: str, provider: str = "codex") -> dict[str, Any]:
+    branch = validate_handoff_branch_name(branch)
+    pr_body = resolve_pr_body(pr_body, summary=[pr_title])
     verify_gh_auth()
     owner, detected_repo_name = ensure_repo_name(repo_root, repo_name)
     checkout_root = resolve_checkout_root(repo_root, repo_name, worktree_path)
@@ -4243,11 +4374,18 @@ def parse_args() -> argparse.ArgumentParser:
     )
     handoff.add_argument("--repo-root", required=True, help="Absolute path to the stable primary repo checkout.")
     handoff.add_argument("--repo-name")
-    handoff.add_argument("--branch", required=True)
+    handoff.add_argument(
+        "--branch",
+        required=True,
+        help="PR branch name. Must use a work-type prefix such as feat/, bugfix/, fix/, chore/, refactor/, test/, docs/, ci/, perf/, build/, style/, or revert/.",
+    )
     handoff.add_argument("--base-branch")
     handoff.add_argument("--commit-message", required=True)
     handoff.add_argument("--pr-title", required=True)
-    handoff.add_argument("--pr-body", default="")
+    handoff.add_argument("--pr-body", help="PR body. If omitted, a standard Summary/Validation/Notes template is generated.")
+    handoff.add_argument("--summary", action="append", default=[], help="Summary bullet for the generated PR body. Can be repeated.")
+    handoff.add_argument("--validation", action="append", default=[], help="Validation bullet for the generated PR body. Can be repeated.")
+    handoff.add_argument("--notes", action="append", default=[], help="Notes bullet for the generated PR body. Can be repeated.")
     handoff.add_argument("--draft", action="store_true")
     handoff.add_argument("--thread-id")
     handoff.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
@@ -4273,6 +4411,57 @@ def parse_args() -> argparse.ArgumentParser:
         help="Adopt an existing registered git worktree. This bypasses managed worktree creation.",
     )
     handoff.add_argument("--format", choices=("json", "text"), default="json")
+
+    complete = subparsers.add_parser(
+        "complete",
+        help="Infer common handoff metadata from cwd, then create branch/commit/PR/worktree and register tracking.",
+        description=(
+            "Convenience wrapper for completed local implementation work. It infers the current checkout, "
+            "uses the primary non-Codex worktree as --repo-root when possible, adopts the current worktree "
+            "with --worktree-path when needed, validates branch naming, and generates a standard PR body "
+            "when --pr-body is omitted."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    complete.add_argument("--repo-root", help="Absolute path to the stable primary repo checkout. Defaults to the inferred primary checkout for the current git worktree.")
+    complete.add_argument("--repo-name")
+    complete.add_argument(
+        "--branch",
+        required=True,
+        help="PR branch name. Must use a work-type prefix such as feat/, bugfix/, fix/, chore/, refactor/, test/, docs/, ci/, perf/, build/, style/, or revert/.",
+    )
+    complete.add_argument("--base-branch")
+    complete.add_argument("--commit-message", help="Commit message. Defaults to --pr-title, or a title inferred from --branch.")
+    complete.add_argument("--pr-title", help="PR title. Defaults to a title inferred from --branch.")
+    complete.add_argument("--pr-body", help="PR body. If omitted, a standard Summary/Validation/Notes template is generated.")
+    complete.add_argument("--summary", action="append", default=[], help="Summary bullet for the generated PR body. Can be repeated.")
+    complete.add_argument("--validation", action="append", default=[], help="Validation bullet for the generated PR body. Can be repeated.")
+    complete.add_argument("--notes", action="append", default=[], help="Notes bullet for the generated PR body. Can be repeated.")
+    complete.add_argument("--draft", action="store_true")
+    complete.add_argument("--thread-id")
+    complete.add_argument("--provider", choices=("codex", "cursor"), default="codex", help="Agent provider for follow-up (default: codex).")
+    complete.add_argument(
+        "--worktree-root",
+        default=str(DEFAULT_WORKTREE_ROOT),
+        help=(
+            f"Root for managed PR worktrees. Keep one canonical root across repos and runs "
+            f"(default: {DEFAULT_WORKTREE_ROOT})."
+        ),
+    )
+    complete.add_argument(
+        "--worktree-layout",
+        choices=("nested", "sibling"),
+        default=DEFAULT_WORKTREE_LAYOUT,
+        help=(
+            f"Layout for managed worktrees under --worktree-root. Keep this stable for a repo "
+            f"(default: {DEFAULT_WORKTREE_LAYOUT})."
+        ),
+    )
+    complete.add_argument(
+        "--worktree-path",
+        help="Adopt an existing registered git worktree. Defaults to the current checkout when --repo-root resolves to a different primary checkout.",
+    )
+    complete.add_argument("--format", choices=("json", "text"), default="json")
 
     track = subparsers.add_parser(
         "track",
@@ -4355,10 +4544,42 @@ def main() -> None:
                 base_branch=args.base_branch,
                 commit_message=args.commit_message,
                 pr_title=args.pr_title,
-                pr_body=args.pr_body,
+                pr_body=resolve_pr_body(args.pr_body, summary=args.summary or [args.pr_title], validation=args.validation, notes=args.notes),
                 draft=args.draft,
                 worktree_root=args.worktree_root,
                 worktree_path=args.worktree_path,
+                thread_id=args.thread_id,
+                worktree_layout=args.worktree_layout,
+                provider=getattr(args, "provider", "codex"),
+            ),
+            args.format,
+        )
+        return
+
+    if args.command == "complete":
+        defaults = resolve_complete_defaults(
+            repo_root=args.repo_root,
+            worktree_path=args.worktree_path,
+            branch=args.branch,
+            commit_message=args.commit_message,
+            pr_title=args.pr_title,
+            pr_body=args.pr_body,
+            summary=args.summary,
+            validation=args.validation,
+            notes=args.notes,
+        )
+        emit(
+            handoff_pr(
+                repo_root=str(defaults["repo_root"]),
+                repo_name=args.repo_name,
+                branch=str(defaults["branch"]),
+                base_branch=args.base_branch,
+                commit_message=str(defaults["commit_message"]),
+                pr_title=str(defaults["pr_title"]),
+                pr_body=str(defaults["pr_body"]),
+                draft=args.draft,
+                worktree_root=args.worktree_root,
+                worktree_path=defaults["worktree_path"],
                 thread_id=args.thread_id,
                 worktree_layout=args.worktree_layout,
                 provider=getattr(args, "provider", "codex"),

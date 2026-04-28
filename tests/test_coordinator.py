@@ -2152,6 +2152,61 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertEqual(pr_review_coordinator.get_job(claimed.id).status, "succeeded")
 
 
+class HandoffInputTests(unittest.TestCase):
+    def test_validate_handoff_branch_accepts_work_type_prefix(self):
+        self.assertEqual(
+            pr_review_coordinator.validate_handoff_branch_name("feat/example-change"),
+            "feat/example-change",
+        )
+
+    def test_validate_handoff_branch_rejects_agent_prefix(self):
+        with self.assertRaises(pr_review_common.ScriptError):
+            pr_review_coordinator.validate_handoff_branch_name("codex/example-change")
+
+    def test_validate_handoff_branch_rejects_unsupported_prefix(self):
+        with self.assertRaises(pr_review_common.ScriptError):
+            pr_review_coordinator.validate_handoff_branch_name("feature/example-change")
+
+    def test_render_pr_body_template_uses_canonical_sections(self):
+        body = pr_review_coordinator.render_pr_body_template(
+            summary=["add completion handoff"],
+            validation=["python3 -m unittest"],
+            notes=["uses Codex hooks"],
+        )
+
+        self.assertIn("## Summary\n- add completion handoff", body)
+        self.assertIn("## Validation\n- python3 -m unittest", body)
+        self.assertIn("## Notes\n- uses Codex hooks", body)
+
+    def test_complete_defaults_infer_checkout_title_commit_and_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pr_review_common.run(["git", "init"], cwd=tmp)
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                defaults = pr_review_coordinator.resolve_complete_defaults(
+                    repo_root=None,
+                    worktree_path=None,
+                    branch="feat/add-handoff-guard",
+                    commit_message=None,
+                    pr_title=None,
+                    pr_body=None,
+                    summary=[],
+                    validation=["python3 -m unittest tests/test_coordinator.py"],
+                    notes=[],
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(defaults["repo_root"], str(Path(tmp).resolve()))
+        self.assertIsNone(defaults["worktree_path"])
+        self.assertEqual(defaults["branch"], "feat/add-handoff-guard")
+        self.assertEqual(defaults["pr_title"], "Add handoff guard")
+        self.assertEqual(defaults["commit_message"], "Add handoff guard")
+        self.assertIn("## Summary\n- Add handoff guard", str(defaults["pr_body"]))
+        self.assertIn("## Validation\n- python3 -m unittest tests/test_coordinator.py", str(defaults["pr_body"]))
+
+
 class HandoffAdoptionTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2261,7 +2316,7 @@ class HandoffAdoptionTests(unittest.TestCase):
         result = pr_review_coordinator.handoff_pr(
             repo_root="/tmp/repo",
             repo_name="repo",
-            branch="feature/example",
+            branch="feat/example",
             base_branch="master",
             commit_message="Example",
             pr_title="Example",
