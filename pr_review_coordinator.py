@@ -1526,6 +1526,16 @@ def request_copilot_review(record: TrackedPR) -> dict[str, Any]:
     return {"status": "ready", "reviewer": COPILOT_REVIEW_REQUEST_LOGIN}
 
 
+def snapshot_has_final_copilot_review(snapshot: dict[str, Any]) -> bool:
+    return bool(snapshot.get("final_copilot_review"))
+
+
+def final_copilot_review_retry_after_ms(record: TrackedPR) -> int | None:
+    if not record.last_copilot_rerequested_at:
+        return None
+    return record.last_copilot_rerequested_at + COPILOT_RETRY_COOLDOWN_MS
+
+
 def remote_branch_sha(repo_root: str, branch: str) -> str | None:
     try:
         run(["git", "-C", repo_root, "fetch", "origin", branch])
@@ -1535,7 +1545,7 @@ def remote_branch_sha(repo_root: str, branch: str) -> str | None:
 
 
 def tracked_status_for_snapshot(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> str:
-    if snapshot["status"] == "awaiting_final_test" and last_prompted_at:
+    if snapshot["status"] == "awaiting_final_test" and last_prompted_at and snapshot_has_final_copilot_review(snapshot):
         return "awaiting_final_review"
     return snapshot["status"]
 
@@ -2287,6 +2297,8 @@ def priority_key(record: TrackedPR) -> tuple[int, str, int]:
 def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, force_run: bool) -> tuple[bool, str]:
     if snapshot["status"] not in ACTIVE_STATUSES:
         if snapshot["status"] == "awaiting_final_test" and record.last_prompted_at:
+            if not snapshot_has_final_copilot_review(snapshot):
+                return False, "PR is awaiting final Copilot no-comments review"
             return False, "PR is awaiting final review"
         return False, "PR is not currently actionable"
     if force_run:
@@ -2473,6 +2485,76 @@ def maybe_handle_copilot_review_cooldown(record: TrackedPR, snapshot: dict[str, 
     return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": refreshed_snapshot, "triggered": False, "request": request_result}
 
 
+def maybe_request_final_copilot_review(record: TrackedPR, snapshot: dict[str, Any], *, dry_run: bool, force_run: bool) -> dict[str, Any] | None:
+    if snapshot["status"] != "awaiting_final_test":
+        return None
+    if not record.last_prompted_at:
+        return None
+    if snapshot_has_final_copilot_review(snapshot):
+        return None
+
+    retry_after = final_copilot_review_retry_after_ms(record)
+    if retry_after is not None and now_ms() < retry_after and not force_run:
+        summary = f"Waiting for final Copilot no-comments review; next re-request after {format_timestamp(retry_after)}"
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="idle",
+            last_run_summary=summary,
+            last_error=None,
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
+        )
+        record_event(
+            "info",
+            "final_copilot_review_waiting",
+            summary,
+            tracked_pr_key=record.key,
+            details={"retry_after": retry_after, "latest_copilot_activity": snapshot.get("latest_copilot_activity")},
+        )
+        return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False, "retry_after": retry_after}
+
+    if dry_run:
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="dry_run",
+            last_run_summary="Would request final Copilot no-comments review",
+            last_error=None,
+            **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
+        )
+        return {"status": "dry_run", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True}
+
+    attempted_at = now_ms()
+    update_tracked_pr(
+        record.key,
+        last_run_status="running",
+        last_run_summary="Requesting final Copilot no-comments review",
+        last_error=None,
+    )
+    request_result = request_copilot_review(record)
+    refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+    summary = "Requested final Copilot no-comments review"
+    if refreshed_snapshot["status"] == "awaiting_final_test" and not snapshot_has_final_copilot_review(refreshed_snapshot):
+        summary += "; waiting for GitHub to reflect the new review request"
+    updated = update_tracked_pr(
+        record.key,
+        last_copilot_rerequested_at=attempted_at,
+        last_run_finished_at=now_ms(),
+        last_run_status="idle",
+        last_run_summary=summary,
+        last_error=None,
+        **state_payload(refreshed_snapshot, last_prompted_at=record.last_prompted_at),
+    )
+    record_event(
+        "info",
+        "final_copilot_review_requested",
+        "Requested final Copilot review before marking PR awaiting final review",
+        tracked_pr_key=record.key,
+        details={"requested_at": attempted_at, "reviewer": request_result["reviewer"]},
+    )
+    return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": refreshed_snapshot, "triggered": False, "request": request_result}
+
+
 def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int | None) -> dict[str, Any]:
     record_event("info", "poll_started", f"Polling PR #{record.pr_number}", tracked_pr_key=record.key, details={"job_id": job_id})
     update_tracked_pr(
@@ -2510,6 +2592,10 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
     cooldown_result = maybe_handle_copilot_review_cooldown(record, snapshot)
     if cooldown_result is not None:
         return cooldown_result
+
+    final_review_result = maybe_request_final_copilot_review(record, snapshot, dry_run=dry_run, force_run=force_run)
+    if final_review_result is not None:
+        return final_review_result
 
     should_run, reason = should_trigger_follow_up(record, snapshot, force_run=force_run)
     if not should_run:

@@ -255,6 +255,17 @@ def is_retryable_copilot_review_error(author_login: str | None, body: str | None
     return all(snippet in normalized_body for snippet in COPILOT_RETRYABLE_ERROR_SNIPPETS)
 
 
+def is_copilot_no_comments_review(activity: dict[str, Any] | None) -> bool:
+    if not activity:
+        return False
+    if activity.get("source") != "review":
+        return False
+    if not is_copilot_login(activity.get("author")):
+        return False
+    normalized_body = " ".join((activity.get("body") or "").casefold().split()).rstrip(".!").strip()
+    return normalized_body == "no comments"
+
+
 def is_merge_conflict_comment(body: str | None) -> bool:
     normalized_body = " ".join((body or "").lower().split())
     if not normalized_body:
@@ -692,6 +703,8 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
     actionable_pr_comments = serialize_actionable_pr_comments(pull_request)
     failing_checks = serialize_failing_checks(pull_request)
     merge_conflicts = serialize_merge_conflicts(pull_request, actionable_pr_comments)
+    latest_copilot_activity = serialize_latest_copilot_activity(pull_request)
+    final_copilot_review = is_copilot_no_comments_review(latest_copilot_activity)
     copilot_review_error = serialize_retryable_copilot_review_error(pull_request)
     latest_comment_at = None
     latest_comment_candidates = [item["latest_comment_at"] or "" for item in unresolved]
@@ -725,6 +738,8 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "failing_checks": failing_checks,
         "pending_copilot_review": pending_copilot_review,
         "copilot_review_error": copilot_review_error,
+        "latest_copilot_activity": latest_copilot_activity,
+        "final_copilot_review": final_copilot_review,
     }
     signature = json.dumps(signature_payload, sort_keys=True)
     return {
@@ -739,6 +754,8 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "latest_comment_at": latest_comment_at,
         "pending_copilot_review": pending_copilot_review,
         "copilot_review_error": copilot_review_error,
+        "latest_copilot_activity": latest_copilot_activity,
+        "final_copilot_review": final_copilot_review,
         "merge_conflicts": merge_conflicts,
         "unresolved_threads": unresolved,
         "actionable_pr_comments": actionable_pr_comments,
