@@ -176,7 +176,7 @@ prc web --host 127.0.0.1 --port 8765
 5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
 6. Follow-up execution runs the configured agent (default: `codex exec resume <thread_id> "<follow-up prompt>"`; with `--provider cursor` it runs the standalone `agent -p "..." --output-format text` in the PR worktree), sending the work back into the same context you started with.
 7. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
-8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If the orchestrator has already run follow-up on that PR, it reports `awaiting_final_review` to make that handoff explicit. If new comments or completed failures appear later, the same thread is resumed again.
+8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If the orchestrator has already run follow-up on that PR and the latest Copilot activity is a `No comments` review, it reports `awaiting_final_review` to make that handoff explicit. If the final no-comments review is missing, polling requests Copilot again and waits. If new comments or completed failures appear later, the same thread is resumed again.
 
 ## Agent Notes
 
@@ -190,7 +190,7 @@ Agents using this tool should follow these rules:
 - If the coordinator reports `busy`, assume another Codex run or manual work is in progress for that worktree and do not force a second run.
 - If the coordinator reports `pending_copilot_review`, do not treat the PR as ready for final testing yet.
 - If the coordinator reports `copilot_review_cooldown`, Copilot returned a transient review error; the coordinator will wait about 15 minutes and then re-request `copilot-pull-request-reviewer` automatically.
-- If the coordinator reports `awaiting_final_review`, the PR is clean and the orchestrator has already completed its follow-up pass; use that as the human handoff point instead of inspecting PR body text.
+- If the coordinator reports `awaiting_final_review`, the PR is clean, the orchestrator has already completed its follow-up pass, and Copilot's latest activity is a `No comments` review; use that as the human handoff point instead of inspecting PR body text.
 - Any unresolved GitHub review thread is treated as actionable follow-up, not only Copilot-authored comments.
 - Top-level PR conversation comments are also actionable follow-up, and low-confidence Copilot/Codex review bodies are surfaced through the same lane. When the agent addresses one, it should reply on the PR with a marker comment so the coordinator can stop treating that feedback as pending.
 - Agent-authored PR replies should begin with the configured prefix from `~/.codex/pr-review-coordinator.json`, which the installer bootstraps to `[jordanBot]` by default.
@@ -325,7 +325,7 @@ Stops tracking a PR record.
 - `needs_ci_fix`: completed failing CI checks or statuses exist and follow-up work may be needed
 - `pending_copilot_review`: no unresolved threads, but Copilot review is still pending/in progress
 - `copilot_review_cooldown`: Copilot returned its transient "unable to review" error; the coordinator is cooling down before re-requesting review automatically
-- `awaiting_final_review`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain after the orchestrator has already run follow-up for this PR
+- `awaiting_final_review`: no unresolved review activity, no pending Copilot review request, no actionable completed CI failure remain after the orchestrator has already run follow-up for this PR, and Copilot's latest activity is a `No comments` review
 - `awaiting_final_test`: no unresolved review activity, no pending Copilot review request, and no actionable completed CI failure remain, but the orchestrator has not yet run follow-up for this PR
 - `busy`: the coordinator intentionally skipped this PR because another run or local work appears to be in progress
 - `running`: a follow-up job is currently active for this PR

@@ -231,6 +231,26 @@ class PullRequestSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["status"], "awaiting_final_test")
         self.assertIsNone(snapshot["copilot_review_error"])
+        self.assertFalse(snapshot["final_copilot_review"])
+
+    def test_no_comments_copilot_review_is_final_review_marker(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "github-copilot[bot]"},
+                        "body": "No comments.",
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T04:00:00Z",
+                        "url": "https://example.com/review-1",
+                    },
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertTrue(snapshot["final_copilot_review"])
+        self.assertEqual(snapshot["latest_copilot_activity"]["id"], "review-1")
 
     def test_clean_green_pr(self):
         snapshot = self.snapshot(make_pull_request())
@@ -1731,6 +1751,7 @@ class QueueBehaviorTests(unittest.TestCase):
         self.original_record_event = pr_review_coordinator.record_event
         self.original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
         self.original_run_follow_up = pr_review_coordinator.run_follow_up
+        self.original_request_copilot_review = pr_review_coordinator.request_copilot_review
         self.original_register_tracking = pr_review_coordinator.register_tracking
         self.original_resolve_selected_thread = pr_review_coordinator.resolve_selected_thread
         self.original_create_codex_thread = pr_review_coordinator.create_codex_thread
@@ -1793,12 +1814,22 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.record_event = self.original_record_event
         pr_review_coordinator.pull_request_snapshot = self.original_pull_request_snapshot
         pr_review_coordinator.run_follow_up = self.original_run_follow_up
+        pr_review_coordinator.request_copilot_review = self.original_request_copilot_review
         pr_review_coordinator.register_tracking = self.original_register_tracking
         pr_review_coordinator.resolve_selected_thread = self.original_resolve_selected_thread
         pr_review_coordinator.create_codex_thread = self.original_create_codex_thread
         self.temp_dir.cleanup()
 
-    def snapshot(self, status="needs_review", signature="sig-1", *, pending_copilot_review=False, copilot_review_error=None):
+    def snapshot(
+        self,
+        status="needs_review",
+        signature="sig-1",
+        *,
+        pending_copilot_review=False,
+        copilot_review_error=None,
+        final_copilot_review=False,
+        latest_copilot_activity=None,
+    ):
         return {
             "status": status,
             "pr": {
@@ -1811,6 +1842,8 @@ class QueueBehaviorTests(unittest.TestCase):
             "latest_comment_at": "2026-03-09T00:00:00Z",
             "pending_copilot_review": pending_copilot_review,
             "copilot_review_error": copilot_review_error,
+            "latest_copilot_activity": latest_copilot_activity,
+            "final_copilot_review": final_copilot_review,
             "unresolved_threads": [{"id": "thread-1"}] if status == "needs_review" else [],
             "actionable_pr_comments": [],
             "failing_checks": [],
@@ -1831,6 +1864,7 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
             status="awaiting_final_test",
             signature="sig-clean",
+            final_copilot_review=True,
         )
         pr_review_coordinator.update_tracked_pr(
             "repo-pr-1",
@@ -1854,6 +1888,7 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
             status="awaiting_final_test",
             signature="sig-clean",
+            final_copilot_review=True,
         )
         pr_review_coordinator.update_tracked_pr(
             "repo-pr-1",
@@ -1871,6 +1906,77 @@ class QueueBehaviorTests(unittest.TestCase):
             [event for event in events if event["event_type"] == "state_transition"],
             [],
         )
+
+    def test_clean_pr_after_agent_run_requests_final_copilot_review_before_final_state(self):
+        snapshots = iter(
+            [
+                self.snapshot(
+                    status="awaiting_final_test",
+                    signature="sig-clean",
+                    final_copilot_review=False,
+                ),
+                self.snapshot(
+                    status="pending_copilot_review",
+                    signature="sig-pending",
+                    pending_copilot_review=True,
+                ),
+            ]
+        )
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: next(snapshots)
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            last_prompted_at=1,
+            last_handled_signature="sig-needs-review",
+            last_run_status="ok",
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        captured: dict[str, object] = {}
+
+        def fake_request(record):
+            captured["pr_number"] = record.pr_number
+            return {"status": "ready", "reviewer": "copilot-pull-request-reviewer"}
+
+        pr_review_coordinator.request_copilot_review = fake_request
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=102)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(captured["pr_number"], 1)
+        self.assertEqual(result["tracked_pr"]["status"], "pending_copilot_review")
+        self.assertEqual(result["tracked_pr"]["last_run_summary"], "Requested final Copilot no-comments review")
+        self.assertEqual(result["request"]["status"], "ready")
+
+    def test_clean_pr_after_recent_final_review_request_waits_without_rerequesting(self):
+        pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
+            status="awaiting_final_test",
+            signature="sig-clean",
+            final_copilot_review=False,
+        )
+        requested_at = pr_review_coordinator.parse_github_timestamp_ms("2026-03-09T00:00:00Z")
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            last_prompted_at=1,
+            last_handled_signature="sig-needs-review",
+            last_run_status="ok",
+            last_copilot_rerequested_at=requested_at,
+        )
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        def fail_request(record):
+            raise AssertionError("Copilot review should not be re-requested during cooldown")
+
+        pr_review_coordinator.request_copilot_review = fail_request
+
+        with mock.patch.object(
+            pr_review_coordinator,
+            "now_ms",
+            return_value=pr_review_coordinator.parse_github_timestamp_ms("2026-03-09T00:10:00Z"),
+        ):
+            result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=102)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["tracked_pr"]["status"], "awaiting_final_test")
+        self.assertIn("Waiting for final Copilot no-comments review", result["tracked_pr"]["last_run_summary"])
 
     def test_clean_pr_without_agent_run_stays_awaiting_final_test(self):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
