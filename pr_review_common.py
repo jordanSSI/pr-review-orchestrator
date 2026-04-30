@@ -263,7 +263,11 @@ def is_copilot_no_comments_review(activity: dict[str, Any] | None) -> bool:
     if not is_copilot_login(activity.get("author")):
         return False
     normalized_body = " ".join((activity.get("body") or "").casefold().split()).rstrip(".!").strip()
-    return normalized_body == "no comments"
+    return (
+        normalized_body == "no comments"
+        or "generated no comments" in normalized_body
+        or "generated 0 comments" in normalized_body
+    )
 
 
 def is_merge_conflict_comment(body: str | None) -> bool:

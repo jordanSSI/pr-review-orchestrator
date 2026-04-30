@@ -252,6 +252,31 @@ class PullRequestSnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot["final_copilot_review"])
         self.assertEqual(snapshot["latest_copilot_activity"]["id"], "review-1")
 
+    def test_copilot_overview_with_generated_no_comments_is_final_review_marker(self):
+        snapshot = self.snapshot(
+            make_pull_request(
+                reviews=[
+                    {
+                        "id": "review-1",
+                        "author": {"login": "copilot-pull-request-reviewer"},
+                        "body": """
+                        ## Pull request overview
+
+                        Reviewed changes
+
+                        Copilot reviewed 31 out of 31 changed files in this pull request and generated no comments.
+                        """,
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-03-09T04:00:00Z",
+                        "url": "https://example.com/review-1",
+                    },
+                ]
+            )
+        )
+        self.assertEqual(snapshot["status"], "awaiting_final_test")
+        self.assertTrue(snapshot["final_copilot_review"])
+        self.assertEqual(snapshot["latest_copilot_activity"]["id"], "review-1")
+
     def test_clean_green_pr(self):
         snapshot = self.snapshot(make_pull_request())
         self.assertEqual(snapshot["status"], "awaiting_final_test")
