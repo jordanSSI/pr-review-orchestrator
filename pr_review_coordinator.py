@@ -1544,6 +1544,37 @@ def remote_branch_sha(repo_root: str, branch: str) -> str | None:
         return None
 
 
+def local_head_sha(worktree_path: str | Path) -> str | None:
+    try:
+        return run(["git", "-C", str(worktree_path), "rev-parse", "HEAD"]).stdout.strip()
+    except ScriptError:
+        return None
+
+
+def should_request_copilot_after_follow_up(
+    *,
+    remote_sha_before: str | None,
+    remote_sha_after: str | None,
+    local_sha_before: str | None,
+    local_sha_after: str | None,
+) -> tuple[bool, str]:
+    if remote_sha_before and remote_sha_after and remote_sha_after != remote_sha_before:
+        return True, "remote branch changed"
+    if (
+        local_sha_before
+        and local_sha_after
+        and local_sha_after != local_sha_before
+        and remote_sha_after
+        and remote_sha_after == local_sha_after
+    ):
+        return True, "local head changed and remote matches local head"
+    if not remote_sha_before:
+        return False, "missing remote branch SHA before run"
+    if not remote_sha_after:
+        return False, "missing remote branch SHA after run"
+    return False, "remote branch unchanged"
+
+
 def tracked_status_for_snapshot(snapshot: dict[str, Any], *, last_prompted_at: int | None = None) -> str:
     if snapshot["status"] == "awaiting_final_test" and last_prompted_at and snapshot_has_final_copilot_review(snapshot):
         return "awaiting_final_review"
@@ -2764,6 +2795,7 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
         )
         record_event("info", "agent_resume", f"Launching {provider} follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run, "provider": provider})
         remote_sha_before = None if dry_run else remote_branch_sha(record.repo_root, record.branch)
+        local_sha_before = None if dry_run else local_head_sha(worktree["worktree"])
         agent_result = run_agent_resume(record, snapshot, dry_run)
         updated = refresh_record_state(
             record,
@@ -2780,7 +2812,14 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
             refreshed_snapshot = snapshot
             if agent_result["status"] == "ok" and not dry_run:
                 remote_sha_after = remote_branch_sha(record.repo_root, record.branch)
-                if remote_sha_before and remote_sha_after and remote_sha_after != remote_sha_before:
+                local_sha_after = local_head_sha(worktree["worktree"])
+                should_request_review, review_reason = should_request_copilot_after_follow_up(
+                    remote_sha_before=remote_sha_before,
+                    remote_sha_after=remote_sha_after,
+                    local_sha_before=local_sha_before,
+                    local_sha_after=local_sha_after,
+                )
+                if should_request_review:
                     requested_at = now_ms()
                     request_result = request_copilot_review(record)
                     refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
@@ -2795,6 +2834,9 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
                         "reviewer": request_result["reviewer"],
                         "before": remote_sha_before,
                         "after": remote_sha_after,
+                        "local_before": local_sha_before,
+                        "local_after": local_sha_after,
+                        "reason": review_reason,
                     }
                     record_event(
                         "info",
@@ -2806,10 +2848,19 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
                 else:
                     review_request_result = {
                         "status": "skipped",
-                        "reason": "remote branch unchanged",
+                        "reason": review_reason,
                         "before": remote_sha_before,
                         "after": remote_sha_after,
+                        "local_before": local_sha_before,
+                        "local_after": local_sha_after,
                     }
+                    record_event(
+                        "info",
+                        "copilot_review_request_skipped",
+                        f"Skipped Copilot review request after follow-up: {review_reason}",
+                        tracked_pr_key=record.key,
+                        details=review_request_result,
+                    )
         else:
             updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None)
             review_request_result = {"status": "skipped", "reason": "agent failed"}

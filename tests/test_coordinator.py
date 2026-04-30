@@ -2465,6 +2465,7 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.original_clear_worktree_to_remote = pr_review_coordinator.clear_worktree_to_remote
         self.original_run_agent_resume = pr_review_coordinator.run_agent_resume
         self.original_remote_branch_sha = pr_review_coordinator.remote_branch_sha
+        self.original_local_head_sha = pr_review_coordinator.local_head_sha
         self.original_request_copilot_review = pr_review_coordinator.request_copilot_review
         pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
         pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
@@ -2488,6 +2489,7 @@ class FollowUpWorktreeTests(unittest.TestCase):
         pr_review_coordinator.clear_worktree_to_remote = self.original_clear_worktree_to_remote
         pr_review_coordinator.run_agent_resume = self.original_run_agent_resume
         pr_review_coordinator.remote_branch_sha = self.original_remote_branch_sha
+        pr_review_coordinator.local_head_sha = self.original_local_head_sha
         pr_review_coordinator.request_copilot_review = self.original_request_copilot_review
         self.temp_dir.cleanup()
 
@@ -2698,6 +2700,7 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.assertEqual(result["review_request"]["status"], "ready")
         self.assertEqual(result["review_request"]["before"], "before-sha")
         self.assertEqual(result["review_request"]["after"], "after-sha")
+        self.assertEqual(result["review_request"]["reason"], "remote branch changed")
         self.assertEqual(result["review"]["status"], "pending_copilot_review")
         self.assertEqual(
             [event["event_type"] for event in captured["events"] if event["event_type"] == "copilot_review_rerequested"],
@@ -2705,8 +2708,114 @@ class FollowUpWorktreeTests(unittest.TestCase):
         )
         self.assertTrue(any("last_copilot_rerequested_at" in update for update in captured["updates"]))
 
+    def test_run_follow_up_rerequests_copilot_when_local_change_reached_remote_after_missing_before_sha(self):
+        captured: dict[str, object] = {"events": [], "updates": []}
+        snapshots = iter(
+            [
+                {
+                    "status": "needs_review",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-next",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": False,
+                    "unresolved_threads": [{"id": "thread-1"}],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 1,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                },
+                {
+                    "status": "pending_copilot_review",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-pending",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": True,
+                    "unresolved_threads": [],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 0,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                },
+            ]
+        )
+        remote_shas = iter([None, "after-sha"])
+        local_shas = iter(["before-sha", "after-sha"])
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda record: None
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: next(snapshots)
+        pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
+        pr_review_coordinator.git_status_is_clean = lambda path: True
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        pr_review_coordinator.update_tracked_pr = lambda key, **changes: captured["updates"].append(changes) or self.make_record(
+            last_prompted_at=changes.get("last_prompted_at", 1),
+            last_copilot_rerequested_at=changes.get("last_copilot_rerequested_at"),
+            pending_copilot_review=changes.get("pending_copilot_review", 0),
+            last_review_signature=changes.get("last_review_signature", "sig-next"),
+            last_review_status=changes.get("last_review_status", "needs_review"),
+            status=changes.get("status", "needs_review"),
+        )
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: captured["events"].append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
+        pr_review_coordinator.ensure_worktree = lambda repo_root, repo_name, pr_number, branch, worktree_root, *, layout: {
+            "status": "ready",
+            "worktree": "/tmp/worktrees/repo-pr-42",
+            "created": False,
+        }
+        pr_review_coordinator.sync_worktree_to_remote = lambda repo_root, branch, worktree: {
+            "status": "ready",
+            "worktree": worktree,
+            "head": "before-sha",
+            "changed": False,
+        }
+        pr_review_coordinator.run_agent_resume = lambda record, snapshot, dry_run: {
+            "status": "ok",
+            "last_message": "pushed fixes",
+        }
+        pr_review_coordinator.remote_branch_sha = lambda repo_root, branch: next(remote_shas)
+        pr_review_coordinator.local_head_sha = lambda worktree: next(local_shas)
+        pr_review_coordinator.request_copilot_review = lambda record: {
+            "status": "ready",
+            "reviewer": "copilot-pull-request-reviewer",
+        }
+
+        result = pr_review_coordinator.run_follow_up(
+            self.make_record(),
+            dry_run=False,
+            force_run=False,
+            job_id=7,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["review_request"]["status"], "ready")
+        self.assertIsNone(result["review_request"]["before"])
+        self.assertEqual(result["review_request"]["after"], "after-sha")
+        self.assertEqual(result["review_request"]["local_before"], "before-sha")
+        self.assertEqual(result["review_request"]["local_after"], "after-sha")
+        self.assertEqual(result["review_request"]["reason"], "local head changed and remote matches local head")
+        self.assertEqual(
+            [event["event_type"] for event in captured["events"] if event["event_type"] == "copilot_review_rerequested"],
+            ["copilot_review_rerequested"],
+        )
+
     def test_run_follow_up_skips_copilot_request_when_remote_branch_unchanged(self):
+        captured: dict[str, object] = {"events": []}
         remote_shas = iter(["same-sha", "same-sha"])
+        local_shas = iter(["same-sha", "same-sha"])
         pr_review_coordinator.acquire_lock = lambda record, job_id: None
         pr_review_coordinator.release_lock = lambda record: None
         pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
@@ -2732,7 +2841,9 @@ class FollowUpWorktreeTests(unittest.TestCase):
         pr_review_coordinator.git_status_is_clean = lambda path: True
         pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
         pr_review_coordinator.update_tracked_pr = lambda key, **changes: self.make_record()
-        pr_review_coordinator.record_event = lambda *args, **kwargs: None
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: captured["events"].append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
         pr_review_coordinator.ensure_worktree = lambda repo_root, repo_name, pr_number, branch, worktree_root, *, layout: {
             "status": "ready",
             "worktree": "/tmp/worktrees/repo-pr-42",
@@ -2749,6 +2860,7 @@ class FollowUpWorktreeTests(unittest.TestCase):
             "last_message": "no changes needed",
         }
         pr_review_coordinator.remote_branch_sha = lambda repo_root, branch: next(remote_shas)
+        pr_review_coordinator.local_head_sha = lambda worktree: next(local_shas)
 
         def fail_request(record):
             raise AssertionError("Copilot review should not be re-requested without a pushed commit")
@@ -2765,6 +2877,86 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["review_request"]["status"], "skipped")
         self.assertEqual(result["review_request"]["reason"], "remote branch unchanged")
+        self.assertEqual(result["review_request"]["before"], "same-sha")
+        self.assertEqual(result["review_request"]["after"], "same-sha")
+        self.assertEqual(
+            [event["event_type"] for event in captured["events"] if event["event_type"] == "copilot_review_request_skipped"],
+            ["copilot_review_request_skipped"],
+        )
+        skipped_event = next(event for event in captured["events"] if event["event_type"] == "copilot_review_request_skipped")
+        self.assertEqual(skipped_event["details"]["before"], "same-sha")
+        self.assertEqual(skipped_event["details"]["after"], "same-sha")
+
+    def test_run_follow_up_logs_skipped_copilot_request_when_remote_sha_after_missing(self):
+        captured: dict[str, object] = {"events": []}
+        remote_shas = iter(["before-sha", None])
+        local_shas = iter(["before-sha", "after-sha"])
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda record: None
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: {
+            "status": "needs_review",
+            "pr": {
+                "number": pr_number,
+                "url": "https://example.com/pr/42",
+                "title": "PR 42",
+                "state": "OPEN",
+            },
+            "signature": "sig-next",
+            "latest_comment_at": None,
+            "pending_copilot_review": False,
+            "unresolved_threads": [{"id": "thread-1"}],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+            "ci_summary": None,
+            "unresolved_thread_count": 1,
+            "actionable_comment_count": 0,
+            "failing_check_count": 0,
+        }
+        pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
+        pr_review_coordinator.git_status_is_clean = lambda path: True
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        pr_review_coordinator.update_tracked_pr = lambda key, **changes: self.make_record()
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: captured["events"].append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
+        pr_review_coordinator.ensure_worktree = lambda repo_root, repo_name, pr_number, branch, worktree_root, *, layout: {
+            "status": "ready",
+            "worktree": "/tmp/worktrees/repo-pr-42",
+            "created": False,
+        }
+        pr_review_coordinator.sync_worktree_to_remote = lambda repo_root, branch, worktree: {
+            "status": "ready",
+            "worktree": worktree,
+            "head": "before-sha",
+            "changed": False,
+        }
+        pr_review_coordinator.run_agent_resume = lambda record, snapshot, dry_run: {
+            "status": "ok",
+            "last_message": "pushed fixes",
+        }
+        pr_review_coordinator.remote_branch_sha = lambda repo_root, branch: next(remote_shas)
+        pr_review_coordinator.local_head_sha = lambda worktree: next(local_shas)
+
+        def fail_request(record):
+            raise AssertionError("Copilot review should not be re-requested when the post-run remote SHA is unavailable")
+
+        pr_review_coordinator.request_copilot_review = fail_request
+
+        result = pr_review_coordinator.run_follow_up(
+            self.make_record(),
+            dry_run=False,
+            force_run=False,
+            job_id=7,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["review_request"]["status"], "skipped")
+        self.assertEqual(result["review_request"]["reason"], "missing remote branch SHA after run")
+        skipped_event = next(event for event in captured["events"] if event["event_type"] == "copilot_review_request_skipped")
+        self.assertEqual(skipped_event["details"]["before"], "before-sha")
+        self.assertIsNone(skipped_event["details"]["after"])
+        self.assertEqual(skipped_event["details"]["local_before"], "before-sha")
+        self.assertEqual(skipped_event["details"]["local_after"], "after-sha")
 
     def test_run_follow_up_can_use_dirty_worktree_anyway_without_sync(self):
         captured: dict[str, object] = {}
