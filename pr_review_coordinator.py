@@ -2156,7 +2156,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         If merge conflicts are reported, bring in the latest base branch in the dedicated PR worktree, resolve the conflicts there, validate the result, and push the updated PR branch.
         Run relevant validation for the touched files, including repo typecheck if available.
         Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
-        Request reviewer `chatgpt-codex-connector` after every push when further review is needed (or `copilot-pull-request-reviewer` if the repository still uses that flow).
+        Request reviewer `{COPILOT_REVIEW_REQUEST_LOGIN}` after every push when further review is needed.
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
         {comment_instruction}
         If you address a top-level PR comment or low-confidence review body, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.

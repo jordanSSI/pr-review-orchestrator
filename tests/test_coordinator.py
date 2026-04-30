@@ -588,6 +588,8 @@ class PromptInstructionTests(unittest.TestCase):
         self.assertIn("must begin with `[jordanBot]`", prompt)
         self.assertIn("handled-comment COMMENT_ID", prompt)
         self.assertIn("low-confidence review body", prompt)
+        self.assertIn("Request reviewer `copilot-pull-request-reviewer` after every push", prompt)
+        self.assertNotIn("Request reviewer `chatgpt-codex-connector`", prompt)
 
     def test_resume_prompt_includes_merge_conflict_guidance(self):
         record = self.make_record(status="merge_conflicts", last_review_status="merge_conflicts")
