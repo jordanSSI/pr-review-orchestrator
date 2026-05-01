@@ -266,6 +266,7 @@ def is_copilot_no_comments_review(activity: dict[str, Any] | None) -> bool:
     return (
         normalized_body == "no comments"
         or "generated no comments" in normalized_body
+        or "generated no new comments" in normalized_body
         or "generated 0 comments" in normalized_body
     )
 
