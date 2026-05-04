@@ -63,7 +63,6 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
 DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
-CODEX_APP_SERVER_START_TIMEOUT_SECONDS = 8
 ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "merge_conflicts": 0,
@@ -2280,9 +2279,14 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
 
 
 class CodexAppServerClient:
-    def __init__(self, codex_bin: str, socket_path: str):
+    def __init__(self, codex_bin: str, socket_path: str | None = None):
+        command = (
+            [codex_bin, "app-server", "proxy", "--sock", socket_path]
+            if socket_path
+            else [codex_bin, "app-server", "--listen", "stdio://"]
+        )
         self.process = subprocess.Popen(
-            [codex_bin, "app-server", "proxy", "--sock", socket_path],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2331,7 +2335,7 @@ class CodexAppServerClient:
             message = self._read_stdout_message()
             if message is None:
                 stderr = "".join(self.stderr_lines).strip()
-                raise ScriptError(f"Codex app-server proxy exited before {method} completed: {stderr}")
+                raise ScriptError(f"Codex app-server exited before {method} completed: {stderr}")
             if message.get("id") == request_id:
                 if "error" in message:
                     raise ScriptError(f"Codex app-server {method} failed: {message['error']}")
@@ -2364,45 +2368,6 @@ def resolve_codex_app_server_socket() -> str | None:
     return None
 
 
-def tail_text(path: Path, *, limit: int = 2000) -> str:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    return text[-limit:]
-
-
-def ensure_codex_app_server_socket() -> str:
-    socket_path = resolve_codex_app_server_socket()
-    if socket_path:
-        return socket_path
-
-    configured = (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip()
-    target = Path(configured) if configured else DEFAULT_CODEX_APP_SERVER_SOCKET
-    target.parent.mkdir(parents=True, exist_ok=True)
-    VAR_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = VAR_DIR / "codex-app-server.log"
-    listen_url = f"unix://{target}" if configured else "unix://"
-    codex_bin = resolve_codex_executable()
-    with log_path.open("a", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            [codex_bin, "app-server", "--listen", listen_url],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-
-    deadline = time.time() + CODEX_APP_SERVER_START_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if target.exists():
-            return str(target)
-        if process.poll() is not None:
-            break
-        time.sleep(0.1)
-    raise ScriptError(f"Codex app-server did not create {target}: {tail_text(log_path)}")
-
-
 def initialize_codex_app_server(client: CodexAppServerClient) -> None:
     client.request(
         "initialize",
@@ -2422,7 +2387,7 @@ def interrupt_codex_app_server_turn(socket_path: str, thread_id: str, turn_id: s
         client.close()
 
 
-def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], prompt: str, socket_path: str) -> dict[str, Any]:
+def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], prompt: str, socket_path: str | None = None) -> dict[str, Any]:
     codex_bin = resolve_codex_executable()
     activity = empty_live_activity(headline="Launching Codex app follow-up")
     stream_state = {"message": "", "plan": "", "reasoning": ""}
@@ -2445,15 +2410,14 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
 
     client = CodexAppServerClient(codex_bin, socket_path)
     try:
-        update_lock_file(
-            record.key,
-            {
-                "agent_pid": client.pid,
-                "agent_pgid": client.pid,
-                "agent_transport": "app-server",
-                "app_server_socket": socket_path,
-            },
-        )
+        lock_updates: dict[str, Any] = {
+            "agent_pid": client.pid,
+            "agent_pgid": client.pid,
+            "agent_transport": "app-server" if socket_path else "app-server-stdio",
+        }
+        if socket_path:
+            lock_updates["app_server_socket"] = socket_path
+        update_lock_file(record.key, lock_updates)
         initialize_codex_app_server(client)
         client.request(
             "thread/resume",
@@ -2486,7 +2450,7 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
         while True:
             message = client.read_message()
             if message is None:
-                raise ScriptError("Codex app-server proxy exited before the turn completed")
+                raise ScriptError("Codex app-server exited before the turn completed")
             stdout_messages.append(json.dumps(message, sort_keys=True))
             event = codex_app_server_notification_to_event(message)
             if event and update_live_activity_from_codex_event(activity, event, stream_state):
@@ -2520,7 +2484,7 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool)
     prompt = resume_prompt(record, snapshot)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
-    return run_codex_app_server_resume(record, snapshot, prompt, ensure_codex_app_server_socket())
+    return run_codex_app_server_resume(record, snapshot, prompt, resolve_codex_app_server_socket())
 
 
 def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:

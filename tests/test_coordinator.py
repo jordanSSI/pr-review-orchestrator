@@ -1757,7 +1757,7 @@ class RefreshRecordStateTests(unittest.TestCase):
             def close(self):
                 pass
 
-        with mock.patch("pr_review_coordinator.ensure_codex_app_server_socket", return_value="/tmp/codex.sock"):
+        with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket", return_value=None):
             with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
                 with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
                     result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
@@ -1766,7 +1766,7 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertEqual(result["last_message"], "Done.")
         self.assertEqual([method for method, _ in instances[0].requests], ["initialize", "thread/resume", "turn/start"])
         lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
-        self.assertEqual(lock["agent_transport"], "app-server")
+        self.assertEqual(lock["agent_transport"], "app-server-stdio")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
 
     def test_stop_active_run_targets_agent_process_group(self):
