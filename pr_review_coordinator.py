@@ -13,7 +13,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
@@ -64,6 +63,7 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
 DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+CODEX_APP_SERVER_START_TIMEOUT_SECONDS = 8
 ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "merge_conflicts": 0,
@@ -2364,6 +2364,45 @@ def resolve_codex_app_server_socket() -> str | None:
     return None
 
 
+def tail_text(path: Path, *, limit: int = 2000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-limit:]
+
+
+def ensure_codex_app_server_socket() -> str:
+    socket_path = resolve_codex_app_server_socket()
+    if socket_path:
+        return socket_path
+
+    configured = (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip()
+    target = Path(configured) if configured else DEFAULT_CODEX_APP_SERVER_SOCKET
+    target.parent.mkdir(parents=True, exist_ok=True)
+    VAR_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = VAR_DIR / "codex-app-server.log"
+    listen_url = f"unix://{target}" if configured else "unix://"
+    codex_bin = resolve_codex_executable()
+    with log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            [codex_bin, "app-server", "--listen", listen_url],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+
+    deadline = time.time() + CODEX_APP_SERVER_START_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if target.exists():
+            return str(target)
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise ScriptError(f"Codex app-server did not create {target}: {tail_text(log_path)}")
+
+
 def initialize_codex_app_server(client: CodexAppServerClient) -> None:
     client.request(
         "initialize",
@@ -2478,90 +2517,10 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
 
 
 def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
-    codex_bin = resolve_codex_executable()
     prompt = resume_prompt(record, snapshot)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
-    socket_path = resolve_codex_app_server_socket()
-    if socket_path:
-        return run_codex_app_server_resume(record, snapshot, prompt, socket_path)
-    with tempfile.NamedTemporaryFile(prefix="codex-pr-followup-", suffix=".txt", delete=False) as output_file:
-        output_path = output_file.name
-    try:
-        stderr_lines: list[str] = []
-        stdout_lines: list[str] = []
-        activity = empty_live_activity(headline="Launching Codex follow-up")
-        stream_state = {"message": "", "plan": "", "reasoning": ""}
-        last_persist_at = 0
-
-        def persist_live_activity(*, force: bool = False) -> None:
-            nonlocal last_persist_at
-            timestamp = now_ms()
-            if not force and timestamp - last_persist_at < 700:
-                return
-            update_tracked_pr(
-                record.key,
-                live_activity_json=json_dumps(activity),
-                live_activity_updated_at=timestamp,
-                last_run_summary=summarize_live_activity(activity),
-            )
-            last_persist_at = timestamp
-
-        def read_stderr(stream: Any) -> None:
-            try:
-                for line in stream:
-                    stderr_lines.append(line)
-            finally:
-                stream.close()
-
-        process = subprocess.Popen(
-            [
-                codex_bin,
-                "exec",
-                "resume",
-                record.thread_id,
-                prompt,
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--json",
-                "--output-last-message",
-                output_path,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-        update_lock_file(record.key, {"agent_pid": process.pid, "agent_pgid": process.pid})
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stderr_thread = threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True)
-        stderr_thread.start()
-        for line in process.stdout:
-            stdout_lines.append(line)
-            stripped = line.strip()
-            if not stripped or not stripped.startswith("{"):
-                continue
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                continue
-            if update_live_activity_from_codex_event(activity, event, stream_state):
-                persist_live_activity()
-        process.stdout.close()
-        return_code = process.wait()
-        stderr_thread.join(timeout=2)
-        persist_live_activity(force=True)
-        last_message = Path(output_path).read_text(encoding="utf-8").strip() if Path(output_path).exists() else ""
-        return {
-            "status": "ok" if return_code == 0 else "error",
-            "exit_code": return_code,
-            "stdout": "".join(stdout_lines).strip(),
-            "stderr": "".join(stderr_lines).strip(),
-            "last_message": last_message,
-        }
-    finally:
-        Path(output_path).unlink(missing_ok=True)
+    return run_codex_app_server_resume(record, snapshot, prompt, ensure_codex_app_server_socket())
 
 
 def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:

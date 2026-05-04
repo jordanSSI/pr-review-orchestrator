@@ -1757,7 +1757,7 @@ class RefreshRecordStateTests(unittest.TestCase):
             def close(self):
                 pass
 
-        with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket", return_value="/tmp/codex.sock"):
+        with mock.patch("pr_review_coordinator.ensure_codex_app_server_socket", return_value="/tmp/codex.sock"):
             with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
                 with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
                     result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
