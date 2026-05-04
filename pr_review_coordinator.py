@@ -46,6 +46,7 @@ from pr_review_common import (
     tracked_worktrees,
     verify_gh_auth,
 )
+from pr_review_dashboard_next import render_dashboard_next_shell
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -671,6 +672,13 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
 
 def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
     data = dict(job) if isinstance(job, dict) else dict(job.__dict__)
+    payload = {}
+    if data.get("payload_json"):
+        try:
+            decoded_payload = json.loads(data["payload_json"])
+            payload = decoded_payload if isinstance(decoded_payload, dict) else {}
+        except json.JSONDecodeError:
+            payload = {}
     return {
         "id": data["id"],
         "action": data["action"],
@@ -685,6 +693,7 @@ def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
         "requested_by": data.get("requested_by"),
         "result_summary": data.get("result_summary"),
         "error": data.get("error"),
+        "payload_message": compact_thread_text(str(payload.get("message") or ""), limit=600, empty=""),
     }
 
 
@@ -1792,24 +1801,25 @@ def get_job(job_id: int) -> Job:
 
 
 def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by: str = "cli", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if action not in {"poll-all", "poll-one", "run-one", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"}:
+    if action not in {"poll-all", "poll-one", "run-one", "steer-message", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"}:
         raise ScriptError(f"unsupported job action: {action}")
-    if action in {"poll-one", "run-one", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
+    if action in {"poll-one", "run-one", "steer-message", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
         raise ScriptError(f"job action {action!r} requires a tracked PR key")
     connection = connect_db()
     try:
-        duplicate = connection.execute(
-            """
-            SELECT * FROM jobs
-            WHERE action = ? AND COALESCE(tracked_pr_key, '') = COALESCE(?, '') AND status IN ('queued', 'running')
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (action, tracked_pr_key),
-        ).fetchone()
-        if duplicate:
-            job = row_to_job(duplicate)
-            return {"status": "ready", "job": job.__dict__, "duplicate": True}
+        if action != "steer-message":
+            duplicate = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE action = ? AND COALESCE(tracked_pr_key, '') = COALESCE(?, '') AND status IN ('queued', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (action, tracked_pr_key),
+            ).fetchone()
+            if duplicate:
+                job = row_to_job(duplicate)
+                return {"status": "ready", "job": job.__dict__, "duplicate": True}
         requested_at = now_ms()
         cursor = connection.execute(
             """
@@ -1837,7 +1847,7 @@ def job_priority(action: str) -> int:
         return 2
     if action in {"poll-one", "poll-all"}:
         return 2
-    if action == "run-one":
+    if action in {"run-one", "steer-message"}:
         return 3
     return 99
 
@@ -1862,6 +1872,7 @@ def claim_next_job() -> Job | None:
                     WHEN 'poll-one' THEN 2
                     WHEN 'poll-all' THEN 2
                     WHEN 'run-one' THEN 3
+                    WHEN 'steer-message' THEN 3
                     ELSE 99
                 END ASC,
                 requested_at ASC,
@@ -2230,9 +2241,13 @@ def summarize_ci_failures(failing_checks: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
+def normalize_steering_message(value: str | None) -> str:
+    return (value or "").strip()[:4000]
+
+
+def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message: str | None = None) -> str:
     comment_instruction = agent_github_comment_instruction()
-    return textwrap.dedent(
+    prompt = textwrap.dedent(
         f"""
         Continue this existing Codex thread for PR follow-up.
 
@@ -2276,6 +2291,15 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
         If no code changes are required after inspection, say so clearly in your final summary.
         """
     ).strip()
+    normalized_steering_message = normalize_steering_message(steering_message)
+    if normalized_steering_message:
+        prompt += "\n\n" + textwrap.dedent(
+            f"""
+            User steering message queued from the dashboard:
+            {normalized_steering_message}
+            """
+        ).strip()
+    return prompt
 
 
 class CodexAppServerClient:
@@ -2480,16 +2504,16 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
         client.close()
 
 
-def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
-    prompt = resume_prompt(record, snapshot)
+def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool, steering_message: str | None = None) -> dict[str, Any]:
+    prompt = resume_prompt(record, snapshot, steering_message=steering_message)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
     return run_codex_app_server_resume(record, snapshot, prompt, resolve_codex_app_server_socket())
 
 
-def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool, steering_message: str | None = None) -> dict[str, Any]:
     agent_bin = resolve_provider_executable("cursor")
-    prompt = resume_prompt(record, snapshot)
+    prompt = resume_prompt(record, snapshot, steering_message=steering_message)
     if dry_run:
         return {"status": "dry_run", "prompt_preview": prompt}
     process = subprocess.Popen(
@@ -2512,11 +2536,11 @@ def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool
     }
 
 
-def run_agent_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+def run_agent_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool, steering_message: str | None = None) -> dict[str, Any]:
     provider = (record.provider or "codex").strip().lower()
     if provider == "cursor":
-        return run_cursor_resume(record, snapshot, dry_run)
-    return run_codex_resume(record, snapshot, dry_run)
+        return run_cursor_resume(record, snapshot, dry_run, steering_message=steering_message)
+    return run_codex_resume(record, snapshot, dry_run, steering_message=steering_message)
 
 
 def priority_key(record: TrackedPR) -> tuple[int, str, int]:
@@ -2985,7 +3009,15 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
     return {"status": "queued", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": True, "job": job}
 
 
-def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_dirty_worktree: bool = False, job_id: int) -> dict[str, Any]:
+def run_follow_up(
+    record: TrackedPR,
+    *,
+    dry_run: bool,
+    force_run: bool,
+    allow_dirty_worktree: bool = False,
+    steering_message: str | None = None,
+    job_id: int,
+) -> dict[str, Any]:
     existing_lock = acquire_lock(record, job_id)
     if existing_lock:
         started_at = format_timestamp(existing_lock.get("started_at"))
@@ -3094,7 +3126,12 @@ def run_follow_up(record: TrackedPR, *, dry_run: bool, force_run: bool, allow_di
         record_event("info", "agent_resume", f"Launching {provider} follow-up", tracked_pr_key=record.key, details={"job_id": job_id, "dry_run": dry_run, "provider": provider})
         remote_sha_before = None if dry_run else remote_branch_sha(record.repo_root, record.branch)
         local_sha_before = None if dry_run else local_head_sha(worktree["worktree"])
-        agent_result = run_agent_resume(record, snapshot, dry_run)
+        normalized_steering_message = normalize_steering_message(steering_message)
+        agent_result = (
+            run_agent_resume(record, snapshot, dry_run, steering_message=normalized_steering_message)
+            if normalized_steering_message
+            else run_agent_resume(record, snapshot, dry_run)
+        )
         updated = refresh_record_state(
             record,
             snapshot,
@@ -3266,6 +3303,15 @@ def process_job(job: Job, *, dry_run: bool = False) -> dict[str, Any]:
                 result = poll_record(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), job_id=job.id)
             elif job.action == "run-one":
                 result = run_follow_up(record, dry_run=dry_run, force_run=bool(payload.get("force_run")), allow_dirty_worktree=bool(payload.get("allow_dirty_worktree")), job_id=job.id)
+            elif job.action == "steer-message":
+                result = run_follow_up(
+                    record,
+                    dry_run=dry_run,
+                    force_run=True,
+                    allow_dirty_worktree=bool(payload.get("allow_dirty_worktree")),
+                    steering_message=normalize_steering_message(str(payload.get("message") or "")),
+                    job_id=job.id,
+                )
             elif job.action == "use-worktree-anyway":
                 result = run_follow_up(record, dry_run=dry_run, force_run=True, allow_dirty_worktree=True, job_id=job.id)
             elif job.action == "clear-worktree":
@@ -3602,9 +3648,32 @@ def queue_retarget_thread_from_request(path: str, params: dict[str, list[str]], 
     }
 
 
+def queue_steer_message_from_request(params: dict[str, list[str]], *, requested_by: str = "web") -> tuple[int, dict[str, Any]]:
+    key = params.get("key", [None])[0]
+    message = normalize_steering_message(params.get("message", [""])[0])
+    if not key:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    if not message:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "Enter a steering message."}
+    get_tracked_pr(key)
+    job = enqueue_job(
+        "steer-message",
+        tracked_pr_key=key,
+        requested_by=requested_by,
+        payload={"message": message},
+    )
+    return HTTPStatus.ACCEPTED, {
+        "ok": True,
+        "message": "Queued steering message.",
+        "job_id": job["job"]["id"],
+        "tracked_pr_key": key,
+    }
+
+
 def render_web_navigation(active: str) -> str:
     items = [
         ("/", "Dashboard"),
+        ("/next", "New UI"),
         ("/import", "Import Open PRs"),
     ]
     links = []
@@ -4139,6 +4208,22 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
     """
 
 
+def render_dashboard_next(scope: str, status_filter: str, sort_key: str) -> str:
+    normalized_scope = normalize_dashboard_scope(scope)
+    normalized_status_filter = normalize_dashboard_status_filter(status_filter)
+    normalized_sort_key = normalize_dashboard_sort_key(sort_key)
+    return render_dashboard_next_shell(
+        scope=normalized_scope,
+        status_filter=normalized_status_filter,
+        sort_key=normalized_sort_key,
+        status_filters=WEB_STATUS_FILTERS,
+        default_refresh_interval_seconds=DEFAULT_REFRESH_INTERVAL_SECONDS,
+        active_refresh_interval_seconds=ACTIVE_REFRESH_INTERVAL_SECONDS,
+        new_thread_sentinel=NEW_CODEX_THREAD_SENTINEL,
+        navigation_html=render_web_navigation("/next"),
+    )
+
+
 def render_import_shell(project_candidates: list[dict[str, Any]]) -> str:
     project_options = "".join(
         f'<option value="{html.escape(item["repo_root"])}">{html.escape(item["repo_name"])} - {html.escape(item["repo_root"])}</option>'
@@ -4562,6 +4647,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             self._send_html(html_page("PR Review Coordinator", body))
             return
+        if parsed.path == "/next":
+            body = render_dashboard_next(
+                params.get("scope", ["active"])[0],
+                params.get("status", ["all"])[0],
+                params.get("sort", ["updated"])[0],
+            )
+            self._send_html(html_page("PR Review Coordinator", body))
+            return
         if parsed.path == "/import":
             body = render_import_shell(list_recent_project_candidates())
             self._send_html(html_page("PR Review Coordinator Import", body))
@@ -4598,6 +4691,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/actions/run-one":
             status, payload = queue_simple_web_action("run-one", key=params.get("key", [None])[0], payload={"force_run": True}, requested_by="web")
+            self._send_json(payload, status=status)
+            return
+        if parsed.path == "/api/actions/steer":
+            status, payload = queue_steer_message_from_request(params, requested_by="web")
             self._send_json(payload, status=status)
             return
         if parsed.path == "/api/actions/use-worktree-anyway":

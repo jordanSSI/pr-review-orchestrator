@@ -654,6 +654,20 @@ class PromptInstructionTests(unittest.TestCase):
         self.assertIn("Current merge conflict signals", prompt)
         self.assertIn("mergeable=CONFLICTING", prompt)
 
+    def test_resume_prompt_includes_dashboard_steering_message(self):
+        record = self.make_record()
+        snapshot = {
+            "merge_conflicts": [],
+            "unresolved_threads": [],
+            "actionable_pr_comments": [],
+            "failing_checks": [],
+        }
+
+        prompt = pr_review_coordinator.resume_prompt(record, snapshot, steering_message="Focus on the failing checkout flow.")
+
+        self.assertIn("User steering message queued from the dashboard", prompt)
+        self.assertIn("Focus on the failing checkout flow.", prompt)
+
 
 class WorktreePathTests(unittest.TestCase):
     def test_resolve_agent_comment_prefix_uses_bootstrapped_config(self):
@@ -974,6 +988,16 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('id="import-browser"', body)
         self.assertNotIn('id="dashboard-filters"', body)
 
+    def test_get_next_renders_new_dashboard_shell(self):
+        status, body = self.request("GET", "/next?scope=all&status=needs_review&sort=pr")
+
+        self.assertEqual(status, 200)
+        self.assertIn('id="next-dashboard-root"', body)
+        self.assertIn('id="pr-tabs"', body)
+        self.assertIn('id="steer-form"', body)
+        self.assertIn('href="/"', body)
+        self.assertNotIn('id="tracked-pr-body"', body)
+
     def test_api_dashboard_returns_filtered_payload(self):
         self.add_record(key="repo-pr-1", pr_number=1, pr_title="Needs review", status="needs_review", active=1, updated_at=10)
         self.add_record(key="repo-pr-2", pr_number=2, pr_title="Archived", status="awaiting_final_test", active=0, updated_at=20)
@@ -1058,6 +1082,33 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(payload["queued"], 1)
         job = pr_review_coordinator.get_job(payload["job_ids"][0])
         self.assertEqual(job.action, "track-existing")
+
+    def test_api_steer_returns_accepted_json(self):
+        self.add_record(key="repo-pr-1", pr_number=1)
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/steer",
+            data={"key": "repo-pr-1", "message": "Focus on the failing checkout flow."},
+        )
+        payload = json.loads(body)
+        job = pr_review_coordinator.get_job(payload["job_id"])
+
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(job.action, "steer-message")
+        self.assertEqual(pr_review_coordinator.decode_job_payload(job)["message"], "Focus on the failing checkout flow.")
+        self.assertEqual(pr_review_coordinator.job_to_dict(job)["payload_message"], "Focus on the failing checkout flow.")
+
+    def test_api_steer_rejects_empty_message(self):
+        self.add_record(key="repo-pr-1", pr_number=1)
+
+        status, body = self.request("POST", "/api/actions/steer", data={"key": "repo-pr-1", "message": "   "})
+        payload = json.loads(body)
+
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("Enter a steering message", payload["message"])
 
     def test_api_track_open_rejects_missing_specific_thread(self):
         status, body = self.request(
@@ -2325,6 +2376,59 @@ class QueueBehaviorTests(unittest.TestCase):
             captured,
             {"record": "repo-pr-1", "dry_run": False, "force_run": True, "allow_dirty_worktree": False, "job_id": claimed.id},
         )
+
+    def test_process_steer_message_uses_execution_path_with_message(self):
+        pr_review_coordinator.enqueue_job(
+            "steer-message",
+            tracked_pr_key="repo-pr-1",
+            requested_by="test",
+            payload={"message": "Focus on the failing checkout flow."},
+        )
+        claimed = pr_review_coordinator.claim_next_job()
+        captured = {}
+
+        def fake_run_follow_up(record, *, dry_run, force_run, allow_dirty_worktree=False, steering_message=None, job_id):
+            captured["record"] = record.key
+            captured["dry_run"] = dry_run
+            captured["force_run"] = force_run
+            captured["allow_dirty_worktree"] = allow_dirty_worktree
+            captured["steering_message"] = steering_message
+            captured["job_id"] = job_id
+            return {"status": "ok"}
+
+        pr_review_coordinator.run_follow_up = fake_run_follow_up
+
+        pr_review_coordinator.process_job(claimed)
+
+        self.assertEqual(
+            captured,
+            {
+                "record": "repo-pr-1",
+                "dry_run": False,
+                "force_run": True,
+                "allow_dirty_worktree": False,
+                "steering_message": "Focus on the failing checkout flow.",
+                "job_id": claimed.id,
+            },
+        )
+
+    def test_steer_messages_are_not_deduplicated(self):
+        first = pr_review_coordinator.enqueue_job(
+            "steer-message",
+            tracked_pr_key="repo-pr-1",
+            requested_by="test",
+            payload={"message": "First"},
+        )
+        second = pr_review_coordinator.enqueue_job(
+            "steer-message",
+            tracked_pr_key="repo-pr-1",
+            requested_by="test",
+            payload={"message": "Second"},
+        )
+
+        self.assertFalse(first["duplicate"])
+        self.assertFalse(second["duplicate"])
+        self.assertEqual([job.action for job in pr_review_coordinator.list_pending_jobs()], ["steer-message", "steer-message"])
 
     def test_process_use_worktree_anyway_uses_dirty_override_path(self):
         pr_review_coordinator.enqueue_job("use-worktree-anyway", tracked_pr_key="repo-pr-1", requested_by="test")
