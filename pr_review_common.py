@@ -344,6 +344,7 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
                 }
               }
               reviews(first: 100) {
+                totalCount
                 nodes {
                   id
                   author {
@@ -356,6 +357,7 @@ def fetch_pull_request_state(repo_root: str | Path, repo_name: str, pr_number: i
                 }
               }
               commits(last: 1) {
+                totalCount
                 nodes {
                   commit {
                     statusCheckRollup {
@@ -704,6 +706,9 @@ def serialize_merge_conflicts(
 
 def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int) -> dict[str, Any]:
     pull_request = fetch_pull_request_state(repo_root, repo_name, pr_number)
+    reviews = pull_request.get("reviews") or {}
+    review_nodes = reviews.get("nodes") or []
+    commits = pull_request.get("commits") or {}
     unresolved = serialize_unresolved_threads(pull_request)
     actionable_pr_comments = serialize_actionable_pr_comments(pull_request)
     failing_checks = serialize_failing_checks(pull_request)
@@ -735,6 +740,11 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         status = "copilot_review_cooldown"
     else:
         status = "awaiting_final_test"
+    copilot_review_count = sum(
+        1
+        for review in review_nodes
+        if is_copilot_login((review.get("author") or {}).get("login"))
+    )
     signature_payload = {
         "status": status,
         "merge_conflicts": merge_conflicts,
@@ -761,6 +771,9 @@ def pull_request_snapshot(repo_root: str | Path, repo_name: str, pr_number: int)
         "copilot_review_error": copilot_review_error,
         "latest_copilot_activity": latest_copilot_activity,
         "final_copilot_review": final_copilot_review,
+        "commit_count": commits.get("totalCount") or len(commits.get("nodes") or []),
+        "review_count": reviews.get("totalCount") or len(review_nodes),
+        "copilot_review_count": copilot_review_count,
         "merge_conflicts": merge_conflicts,
         "unresolved_threads": unresolved,
         "actionable_pr_comments": actionable_pr_comments,

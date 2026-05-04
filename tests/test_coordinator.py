@@ -1389,6 +1389,24 @@ class DashboardRenderingTests(unittest.TestCase):
 
         self.assertTrue(payload["dirty_worktree_busy"])
 
+    def test_serialize_dashboard_record_exposes_stop_for_live_agent_process(self):
+        record = self.make_record(run_state="running", last_run_status="running")
+        with tempfile.TemporaryDirectory() as tmp:
+            original_locks_dir = pr_review_coordinator.LOCKS_DIR
+            pr_review_coordinator.LOCKS_DIR = Path(tmp)
+            try:
+                pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+                pr_review_coordinator.lock_path(record.key).write_text(
+                    json.dumps({"pid": 111, "agent_pid": 222, "agent_pgid": 222}),
+                    encoding="utf-8",
+                )
+                with mock.patch("pr_review_coordinator.pid_is_alive", return_value=True):
+                    payload = pr_review_coordinator.serialize_dashboard_record(record)
+            finally:
+                pr_review_coordinator.LOCKS_DIR = original_locks_dir
+
+        self.assertTrue(payload["stop_available"])
+
 
 class WorktreeCleanlinessTests(unittest.TestCase):
     def test_git_status_is_clean_ignores_root_node_modules_symlink(self):
@@ -1682,6 +1700,24 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertIsNone(updated.current_job_id)
         self.assertEqual(updated.last_run_summary, "Worktree has local changes")
         self.assertIsNone(updated.live_activity_json)
+
+    def test_stop_active_run_targets_agent_process_group(self):
+        record = self.add_record(current_job_id=100, lock_owner_pid=111)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "agent_pid": 222, "agent_pgid": 222}),
+            encoding="utf-8",
+        )
+
+        with mock.patch("pr_review_coordinator.pid_is_alive", return_value=True):
+            with mock.patch("pr_review_coordinator.terminate_process_group") as terminate:
+                result = pr_review_coordinator.stop_active_run(record)
+
+        terminate.assert_called_once_with(222, 222)
+        self.assertTrue(result["ok"])
+        updated = pr_review_coordinator.get_tracked_pr(record.key)
+        self.assertEqual(updated.last_run_status, "stopping")
+        self.assertIn("Stop requested", updated.last_run_summary)
 
 
 class RegisterTrackingTests(unittest.TestCase):
