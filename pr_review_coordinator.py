@@ -63,6 +63,7 @@ PR_CHURN_COMMIT_LIMIT = 10
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
+DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "merge_conflicts": 0,
@@ -311,6 +312,16 @@ def normalize_event_type(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
 
 
+def normalize_item_type(value: str | None) -> str:
+    normalized = normalize_event_type(value)
+    return {
+        "agentmessage": "agent_message",
+        "commandexecution": "command_execution",
+        "filechange": "file_change",
+        "patchapply": "patch_apply",
+    }.get(normalized, normalized)
+
+
 def empty_live_activity(*, headline: str = "") -> dict[str, Any]:
     return {
         "headline": compact_thread_text(headline, limit=280, empty="") if headline else "",
@@ -397,7 +408,7 @@ def summarize_patch_change(path: str, change: Any) -> str:
         "update": "Updated",
         "updated": "Updated",
     }.get(change_type, "Updated")
-    additions, deletions = diff_line_counts(str(change.get("unified_diff") or change.get("unifiedDiff") or ""))
+    additions, deletions = diff_line_counts(str(change.get("unified_diff") or change.get("unifiedDiff") or change.get("diff") or ""))
     stats = f" +{additions} -{deletions}" if additions or deletions else ""
     return f"{verb} {relative_path}{stats}"
 
@@ -416,7 +427,7 @@ def summarize_command_execution(item: dict[str, Any], *, started: bool) -> tuple
     if not command:
         return "", ""
     status = normalize_event_type(str(item.get("status") or ""))
-    exit_code = item.get("exit_code")
+    exit_code = item.get("exit_code", item.get("exitCode"))
     failed = status in {"failed", "error", "cancelled"} or (exit_code not in (None, 0))
     if started or status in {"in_progress", "running", "queued"}:
         return "command", f"Running {command}"
@@ -426,7 +437,7 @@ def summarize_command_execution(item: dict[str, Any], *, started: bool) -> tuple
 
 
 def update_live_activity_from_codex_item(activity: dict[str, Any], item: dict[str, Any], *, started: bool, stream_state: dict[str, str]) -> bool:
-    item_type = normalize_event_type(str(item.get("type") or ""))
+    item_type = normalize_item_type(str(item.get("type") or ""))
     item_id = str(item.get("id") or item_type or "unknown")
     changed = False
     if item_type == "agent_message":
@@ -466,6 +477,28 @@ def update_live_activity_from_codex_item(activity: dict[str, Any], item: dict[st
             if state_key == "plan" or not activity.get("headline"):
                 changed = set_live_activity_headline(activity, text) or changed
     return changed
+
+
+def codex_app_server_notification_to_event(message: dict[str, Any]) -> dict[str, Any] | None:
+    method = str(message.get("method") or "")
+    params = message.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if method == "item/agentMessage/delta":
+        return {"type": "agent_message_delta", "delta": params.get("delta") or ""}
+    if method == "item/plan/delta":
+        return {"type": "plan_delta", "delta": params.get("delta") or ""}
+    if method in {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+        return {"type": "agent_reasoning_delta", "delta": params.get("delta") or ""}
+    if method in {"item/started", "item/completed"}:
+        item = params.get("item")
+        if isinstance(item, dict):
+            return {"type": method.replace("/", "."), "item": item}
+    if method == "error":
+        return {"type": "error", "message": params.get("message") or params.get("error") or "Codex app-server error"}
+    if method == "warning":
+        return {"type": "warning", "message": params.get("message") or "Codex app-server warning"}
+    return None
 
 
 def update_live_activity_from_codex_event(activity: dict[str, Any], event: dict[str, Any], stream_state: dict[str, str]) -> bool:
@@ -2246,11 +2279,212 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any]) -> str:
     ).strip()
 
 
+class CodexAppServerClient:
+    def __init__(self, codex_bin: str, socket_path: str):
+        self.process = subprocess.Popen(
+            [codex_bin, "app-server", "proxy", "--sock", socket_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        assert self.process.stderr is not None
+        self.stdin = self.process.stdin
+        self.stdout = self.process.stdout
+        self.stderr_lines: list[str] = []
+        self.pending: list[dict[str, Any]] = []
+        self.next_request_id = 1
+        self.stderr_thread = threading.Thread(target=self._read_stderr, args=(self.process.stderr,), daemon=True)
+        self.stderr_thread.start()
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def _read_stderr(self, stream: Any) -> None:
+        try:
+            for line in stream:
+                self.stderr_lines.append(line)
+        finally:
+            stream.close()
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+        self.stderr_thread.join(timeout=2)
+
+    def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        self.stdin.write(json.dumps({"id": request_id, "method": method, "params": params}) + "\n")
+        self.stdin.flush()
+        while True:
+            message = self._read_stdout_message()
+            if message is None:
+                stderr = "".join(self.stderr_lines).strip()
+                raise ScriptError(f"Codex app-server proxy exited before {method} completed: {stderr}")
+            if message.get("id") == request_id:
+                if "error" in message:
+                    raise ScriptError(f"Codex app-server {method} failed: {message['error']}")
+                result = message.get("result")
+                return result if isinstance(result, dict) else {}
+            self.pending.append(message)
+
+    def read_message(self) -> dict[str, Any] | None:
+        if self.pending:
+            return self.pending.pop(0)
+        return self._read_stdout_message()
+
+    def _read_stdout_message(self) -> dict[str, Any] | None:
+        line = self.stdout.readline()
+        if not line:
+            return None
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            return {"method": "warning", "params": {"message": line.strip()}}
+        return message if isinstance(message, dict) else None
+
+
+def resolve_codex_app_server_socket() -> str | None:
+    configured = (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip()
+    candidates = [Path(configured)] if configured else [DEFAULT_CODEX_APP_SERVER_SOCKET]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def initialize_codex_app_server(client: CodexAppServerClient) -> None:
+    client.request(
+        "initialize",
+        {
+            "clientInfo": {"name": "pr-review-coordinator", "title": "PR Review Coordinator", "version": "0"},
+            "capabilities": {"experimentalApi": True},
+        },
+    )
+
+
+def interrupt_codex_app_server_turn(socket_path: str, thread_id: str, turn_id: str) -> None:
+    client = CodexAppServerClient(resolve_codex_executable(), socket_path)
+    try:
+        initialize_codex_app_server(client)
+        client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+    finally:
+        client.close()
+
+
+def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], prompt: str, socket_path: str) -> dict[str, Any]:
+    codex_bin = resolve_codex_executable()
+    activity = empty_live_activity(headline="Launching Codex app follow-up")
+    stream_state = {"message": "", "plan": "", "reasoning": ""}
+    last_persist_at = 0
+    completed_turn: dict[str, Any] | None = None
+    stdout_messages: list[str] = []
+
+    def persist_live_activity(*, force: bool = False) -> None:
+        nonlocal last_persist_at
+        timestamp = now_ms()
+        if not force and timestamp - last_persist_at < 700:
+            return
+        update_tracked_pr(
+            record.key,
+            live_activity_json=json_dumps(activity),
+            live_activity_updated_at=timestamp,
+            last_run_summary=summarize_live_activity(activity),
+        )
+        last_persist_at = timestamp
+
+    client = CodexAppServerClient(codex_bin, socket_path)
+    try:
+        update_lock_file(
+            record.key,
+            {
+                "agent_pid": client.pid,
+                "agent_pgid": client.pid,
+                "agent_transport": "app-server",
+                "app_server_socket": socket_path,
+            },
+        )
+        initialize_codex_app_server(client)
+        client.request(
+            "thread/resume",
+            {
+                "threadId": record.thread_id,
+                "cwd": record.worktree_path,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "excludeTurns": True,
+            },
+        )
+        turn_response = client.request(
+            "turn/start",
+            {
+                "threadId": record.thread_id,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "cwd": record.worktree_path,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        )
+        turn = turn_response.get("turn") if isinstance(turn_response, dict) else None
+        turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+        if not turn_id:
+            raise ScriptError("Codex app-server did not return a turn id")
+        update_lock_file(record.key, {"agent_turn_id": turn_id})
+        set_live_activity_headline(activity, "Codex app turn is running")
+        persist_live_activity(force=True)
+
+        while True:
+            message = client.read_message()
+            if message is None:
+                raise ScriptError("Codex app-server proxy exited before the turn completed")
+            stdout_messages.append(json.dumps(message, sort_keys=True))
+            event = codex_app_server_notification_to_event(message)
+            if event and update_live_activity_from_codex_event(activity, event, stream_state):
+                persist_live_activity()
+            if message.get("method") != "turn/completed":
+                continue
+            params = message.get("params")
+            if not isinstance(params, dict) or params.get("threadId") != record.thread_id:
+                continue
+            completed = params.get("turn")
+            if isinstance(completed, dict) and completed.get("id") == turn_id:
+                completed_turn = completed
+                break
+
+        persist_live_activity(force=True)
+        turn_status = str((completed_turn or {}).get("status") or "")
+        status = "ok" if turn_status == "completed" else "error"
+        last_message = stream_state.get("message") or summarize_live_activity(activity)
+        return {
+            "status": status,
+            "exit_code": 0 if status == "ok" else 1,
+            "stdout": "\n".join(stdout_messages),
+            "stderr": "".join(client.stderr_lines).strip(),
+            "last_message": last_message,
+        }
+    finally:
+        client.close()
+
+
 def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     codex_bin = resolve_codex_executable()
     prompt = resume_prompt(record, snapshot)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
+    socket_path = resolve_codex_app_server_socket()
+    if socket_path:
+        return run_codex_app_server_resume(record, snapshot, prompt, socket_path)
     with tempfile.NamedTemporaryFile(prefix="codex-pr-followup-", suffix=".txt", delete=False) as output_file:
         output_path = output_file.name
     try:
@@ -2530,14 +2764,31 @@ def stop_active_run(record: TrackedPR) -> dict[str, Any]:
     lock = read_lock_file(record.key)
     if not lock:
         return {"ok": False, "message": "No active agent run lock was found for this PR."}
+    app_server_interrupted = False
+    if lock.get("agent_transport") == "app-server":
+        socket_path = str(lock.get("app_server_socket") or "")
+        turn_id = str(lock.get("agent_turn_id") or "")
+        if socket_path and turn_id:
+            interrupt_codex_app_server_turn(socket_path, record.thread_id, turn_id)
+            app_server_interrupted = True
     agent_pid = lock.get("agent_pid")
     if not isinstance(agent_pid, int) or not pid_is_alive(agent_pid):
+        if app_server_interrupted:
+            summary = f"Stop requested for active Codex app turn {lock.get('agent_turn_id')}"
+            update_tracked_pr(record.key, last_run_status="stopping", last_run_summary=summary, last_error=None)
+            update_lock_file(record.key, {"stop_requested_at": now_ms()})
+            record_event("info", "stop_requested", summary, tracked_pr_key=record.key, details={"agent_transport": "app-server", "agent_turn_id": lock.get("agent_turn_id")})
+            return {"ok": True, "message": summary, "tracked_pr_key": record.key, "agent_turn_id": lock.get("agent_turn_id")}
         return {"ok": False, "message": "No live agent process was found for this PR."}
     agent_pgid = lock.get("agent_pgid")
     if not isinstance(agent_pgid, int):
         agent_pgid = agent_pid
 
-    summary = f"Stop requested for active agent process {agent_pid}"
+    summary = (
+        f"Stop requested for active Codex app turn {lock.get('agent_turn_id')}"
+        if app_server_interrupted
+        else f"Stop requested for active agent process {agent_pid}"
+    )
     terminate_process_group(agent_pid, agent_pgid)
     owner_pid = lock.get("pid")
     owner_alive = isinstance(owner_pid, int) and pid_is_alive(owner_pid)
@@ -2566,7 +2817,7 @@ def stop_active_run(record: TrackedPR) -> dict[str, Any]:
             last_error=None,
         )
         update_lock_file(record.key, {"stop_requested_at": now_ms()})
-    record_event("info", "stop_requested", summary, tracked_pr_key=record.key, details={"agent_pid": agent_pid, "agent_pgid": agent_pgid})
+    record_event("info", "stop_requested", summary, tracked_pr_key=record.key, details={"agent_pid": agent_pid, "agent_pgid": agent_pgid, "agent_transport": lock.get("agent_transport"), "agent_turn_id": lock.get("agent_turn_id")})
     return {"ok": True, "message": summary, "tracked_pr_key": record.key, "agent_pid": agent_pid}
 
 

@@ -1335,6 +1335,29 @@ class DashboardRenderingTests(unittest.TestCase):
         self.assertEqual(activity["items"][1]["kind"], "file")
         self.assertEqual(activity["items"][1]["text"], "Created /tmp/hello.txt")
 
+    def test_update_live_activity_from_app_server_item_events(self):
+        activity = pr_review_coordinator.empty_live_activity()
+        stream_state = {"message": "", "plan": "", "reasoning": ""}
+
+        event = pr_review_coordinator.codex_app_server_notification_to_event(
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "item_0",
+                        "type": "agentMessage",
+                        "text": "App-server turn is visible in the thread.",
+                    }
+                },
+            }
+        )
+
+        self.assertIsNotNone(event)
+        changed = pr_review_coordinator.update_live_activity_from_codex_event(activity, event, stream_state)
+
+        self.assertTrue(changed)
+        self.assertEqual(activity["headline"], "App-server turn is visible in the thread.")
+
     def test_serialize_dashboard_record_prefers_compact_codex_summary_line(self):
         record = self.make_record(
             run_state="running",
@@ -1701,6 +1724,51 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertEqual(updated.last_run_summary, "Worktree has local changes")
         self.assertIsNone(updated.live_activity_json)
 
+    def test_run_codex_resume_uses_app_server_socket_when_available(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+        instances = []
+
+        class FakeClient:
+            def __init__(self, codex_bin, socket_path):
+                self.pid = 333
+                self.stderr_lines = []
+                self.requests = []
+                self.messages = [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-42", "turnId": "turn-1", "itemId": "item-1", "delta": "Done."},
+                    },
+                    {"method": "turn/completed", "params": {"threadId": "thread-42", "turn": {"id": "turn-1", "status": "completed"}}},
+                ]
+                instances.append(self)
+
+            def request(self, method, params):
+                self.requests.append((method, params))
+                return {"turn": {"id": "turn-1"}} if method == "turn/start" else {}
+
+            def read_message(self):
+                return self.messages.pop(0) if self.messages else None
+
+            def close(self):
+                pass
+
+        with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket", return_value="/tmp/codex.sock"):
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
+                with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
+                    result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Done.")
+        self.assertEqual([method for method, _ in instances[0].requests], ["initialize", "thread/resume", "turn/start"])
+        lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
+        self.assertEqual(lock["agent_transport"], "app-server")
+        self.assertEqual(lock["agent_turn_id"], "turn-1")
+
     def test_stop_active_run_targets_agent_process_group(self):
         record = self.add_record(current_job_id=100, lock_owner_pid=111)
         pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1718,6 +1786,35 @@ class RefreshRecordStateTests(unittest.TestCase):
         updated = pr_review_coordinator.get_tracked_pr(record.key)
         self.assertEqual(updated.last_run_status, "stopping")
         self.assertIn("Stop requested", updated.last_run_summary)
+
+    def test_stop_active_run_interrupts_app_server_turn(self):
+        record = self.add_record(current_job_id=100, lock_owner_pid=111)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps(
+                {
+                    "pid": 111,
+                    "agent_pid": 222,
+                    "agent_pgid": 222,
+                    "agent_transport": "app-server",
+                    "app_server_socket": "/tmp/codex.sock",
+                    "agent_turn_id": "turn-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("pr_review_coordinator.pid_is_alive", return_value=True):
+            with mock.patch("pr_review_coordinator.interrupt_codex_app_server_turn") as interrupt:
+                with mock.patch("pr_review_coordinator.terminate_process_group") as terminate:
+                    result = pr_review_coordinator.stop_active_run(record)
+
+        interrupt.assert_called_once_with("/tmp/codex.sock", "thread-42", "turn-1")
+        terminate.assert_called_once_with(222, 222)
+        self.assertTrue(result["ok"])
+        updated = pr_review_coordinator.get_tracked_pr(record.key)
+        self.assertEqual(updated.last_run_status, "stopping")
+        self.assertIn("Codex app turn turn-1", updated.last_run_summary)
 
 
 class RegisterTrackingTests(unittest.TestCase):
