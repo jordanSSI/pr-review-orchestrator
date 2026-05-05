@@ -58,7 +58,7 @@ DEFAULT_POLL_SECONDS = 300
 DEFAULT_WORKER_COUNT = 4
 NEW_CODEX_THREAD_SENTINEL = "__new_codex_thread__"
 COPILOT_RETRY_COOLDOWN_MS = 15 * 60 * 1000
-PR_CHURN_REVIEW_CYCLE_LIMIT = 3
+DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT = 4
 PR_CHURN_COMMIT_LIMIT = 10
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS tracked_prs (
     live_activity_json TEXT,
     live_activity_updated_at INTEGER,
     last_copilot_rerequested_at INTEGER,
+    review_churn_cycle_limit INTEGER,
     provider TEXT NOT NULL DEFAULT 'codex',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -246,6 +247,7 @@ class TrackedPR:
     live_activity_json: str | None = None
     live_activity_updated_at: int | None = None
     last_copilot_rerequested_at: int | None = None
+    review_churn_cycle_limit: int | None = None
     worktree_root: str | None = None
     worktree_layout: str | None = None
     provider: str = "codex"
@@ -596,6 +598,7 @@ def connect_db() -> sqlite3.Connection:
             "provider": "TEXT NOT NULL DEFAULT 'codex'",
             "live_activity_json": "TEXT",
             "live_activity_updated_at": "INTEGER",
+            "review_churn_cycle_limit": "INTEGER",
         },
     )
     connection.commit()
@@ -664,10 +667,18 @@ def tracked_pr_to_dict(record: TrackedPR) -> dict[str, Any]:
         "live_activity_json": record.live_activity_json,
         "live_activity_updated_at": record.live_activity_updated_at,
         "last_copilot_rerequested_at": record.last_copilot_rerequested_at,
+        "review_churn_cycle_limit": record.review_churn_cycle_limit,
         "provider": record.provider,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
     }
+
+
+def effective_review_churn_cycle_limit(record: TrackedPR) -> int:
+    override = record.review_churn_cycle_limit
+    if override is None:
+        return DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT
+    return max(int(override), DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT)
 
 
 def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
@@ -753,6 +764,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         limit=72,
         empty=record.thread_id,
     )
+    churn_cycle_limit = effective_review_churn_cycle_limit(record)
     return {
         "key": record.key,
         "status": record.status,
@@ -784,6 +796,9 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "actions_disabled": bool(pending_jobs),
         "dirty_worktree_busy": dirty_worktree_busy,
         "stop_available": stop_available,
+        "review_churn_cycle_limit": churn_cycle_limit,
+        "review_churn_cycle_limit_override": record.review_churn_cycle_limit,
+        "default_review_churn_cycle_limit": DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT,
         "thread": {
             "id": record.thread_id,
             "short_id": record.thread_id[:8],
@@ -2247,6 +2262,7 @@ def normalize_steering_message(value: str | None) -> str:
 
 def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message: str | None = None) -> str:
     comment_instruction = agent_github_comment_instruction()
+    review_churn_cycle_limit = effective_review_churn_cycle_limit(record)
     prompt = textwrap.dedent(
         f"""
         Continue this existing Codex thread for PR follow-up.
@@ -2263,7 +2279,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message:
         Preserve the original PR scope. Apply only the smallest LOC change that fixes an in-scope bug or validation gap.
         Do not add defensive code, compatibility shims, "legacy" handling, fallback behavior, retries, broad guards, or extra states unless the user explicitly requested that behavior.
         If feedback would require unrelated modules, broader API contracts, new migration behavior, or a separate design decision, do not implement it. Leave a concise rationale or report that user scope approval is needed.
-        If the PR has entered churn (more than 3 review cycles, more than 10 follow-up commits, or repeated comments moving into new domains), stop and report the remaining feedback instead of pushing another patch.
+        If the PR has entered churn (more than {review_churn_cycle_limit} review cycles, more than {PR_CHURN_COMMIT_LIMIT} follow-up commits, or repeated comments moving into new domains), stop and report the remaining feedback instead of pushing another patch.
         Do not ship or continue a PR you can already see a reasonable reviewer rejecting. Shrink the change or stop for user input.
         Address merge conflicts, completed failing CI checks, and only in-scope review feedback with minimal targeted fixes.
         Pull the latest PR branch state into that worktree before making changes.
@@ -2556,7 +2572,7 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
         return False, "PR is not currently actionable"
     if force_run:
         return True, "Manual run requested"
-    churn_reason = review_churn_reason(snapshot)
+    churn_reason = review_churn_reason(snapshot, review_cycle_limit=effective_review_churn_cycle_limit(record))
     if churn_reason:
         return False, churn_reason
     if (
@@ -2568,11 +2584,11 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
     return True, "Actionable review, merge-conflict, or CI state changed"
 
 
-def review_churn_reason(snapshot: dict[str, Any]) -> str | None:
+def review_churn_reason(snapshot: dict[str, Any], *, review_cycle_limit: int = DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT) -> str | None:
     copilot_review_count = int(snapshot.get("copilot_review_count") or 0)
     commit_count = int(snapshot.get("commit_count") or 0)
     reasons = []
-    if copilot_review_count > PR_CHURN_REVIEW_CYCLE_LIMIT:
+    if copilot_review_count > review_cycle_limit:
         reasons.append(f"{copilot_review_count} Copilot review cycles")
     if commit_count > PR_CHURN_COMMIT_LIMIT:
         reasons.append(f"{commit_count} commits")
@@ -3519,6 +3535,37 @@ def stop_run_from_request(params: dict[str, list[str]]) -> tuple[int, dict[str, 
     return (HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT), result
 
 
+def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    key = params.get("key", [None])[0]
+    if not key:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    raw_limit = (params.get("review_churn_cycle_limit", [""])[0] or "").strip()
+    if not raw_limit:
+        updated = update_tracked_pr(key, review_churn_cycle_limit=None)
+        return HTTPStatus.OK, {
+            "ok": True,
+            "message": f"Reset review churn limit to default ({DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT}).",
+            "tracked_pr_key": key,
+            "review_churn_cycle_limit": effective_review_churn_cycle_limit(updated),
+        }
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "Review churn limit must be a whole number."}
+    if limit < DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT:
+        return HTTPStatus.BAD_REQUEST, {
+            "ok": False,
+            "message": f"Review churn limit must be {DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT} or higher.",
+        }
+    updated = update_tracked_pr(key, review_churn_cycle_limit=limit)
+    return HTTPStatus.OK, {
+        "ok": True,
+        "message": f"Set review churn limit to {effective_review_churn_cycle_limit(updated)}.",
+        "tracked_pr_key": key,
+        "review_churn_cycle_limit": effective_review_churn_cycle_limit(updated),
+    }
+
+
 def queue_track_open_from_request(params: dict[str, list[str]], *, requested_by: str = "web") -> tuple[int, dict[str, Any]]:
     repo_root = (params.get("project_root", [""])[0] or "").strip()
     repo_name = (params.get("repo_name", [""])[0] or "").strip() or None
@@ -4006,6 +4053,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 ? `<button type="button" class="link-button" data-action="toggle-details" data-key="${{escapeHtml(record.key)}}" aria-expanded="${{isExpanded ? 'true' : 'false'}}">${{toggleLabel}}</button>`
                 : '';
               const runMeta = record.run_detail_meta ? `<div class="small">${{escapeHtml(record.run_detail_meta)}}</div>` : '';
+              const churnLimitValue = record.review_churn_cycle_limit_override == null ? '' : record.review_churn_cycle_limit_override;
+              const churnLimitLabel = `Review churn${{record.review_churn_cycle_limit_override == null ? ` (default ${{record.default_review_churn_cycle_limit}})` : ''}}`;
               const mainRow = `
                 <tr data-pr-key="${{escapeHtml(record.key)}}">
                   <td>${{statusBadge(record.status)}}</td>
@@ -4021,6 +4070,13 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                       <button type="button" data-action="poll-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Poll</button>
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="clear-worktree" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Clear worktree</button>` : ''}}
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="use-worktree-anyway" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Use worktree anyway</button>` : ''}}
+                      <div class="churn-limit-control">
+                        <label>${{escapeHtml(churnLimitLabel)}}
+                          <input type="number" data-role="review-churn-limit-input" min="${{escapeHtml(record.default_review_churn_cycle_limit)}}" step="1" value="${{escapeHtml(churnLimitValue)}}" placeholder="${{escapeHtml(record.review_churn_cycle_limit)}}" ${{disabled}}>
+                        </label>
+                        <button type="button" data-action="review-churn-limit" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Set</button>
+                        ${{record.review_churn_cycle_limit_override == null ? '' : `<button type="button" data-action="review-churn-default" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Default</button>`}}
+                      </div>
                       <button type="button" data-action="untrack" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack</button>
                       <button type="button" data-action="untrack-cleanup" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack + Cleanup</button>
                     </div>
@@ -4178,6 +4234,13 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 if (action === 'fresh-thread') {{
                   markRowPending(row, 'fresh thread queued');
                   await postAction(`${{ACTION_API_BASE}}/retarget-thread`, {{ key, thread_id: NEW_THREAD_SENTINEL }});
+                  return;
+                }}
+                if (action === 'review-churn-limit' || action === 'review-churn-default') {{
+                  const input = row.querySelector('[data-role="review-churn-limit-input"]');
+                  const value = action === 'review-churn-default' ? '' : (input ? input.value.trim() : '');
+                  markRowPending(row, action === 'review-churn-default' ? 'review churn limit reset' : 'review churn limit updated');
+                  await postAction(`${{ACTION_API_BASE}}/review-churn-limit`, {{ key, review_churn_cycle_limit: value }});
                   return;
                 }}
                 const pendingLabel = action === 'stop-run' ? 'hard stop requested' : `${{action.replace(/-/g, ' ')}} queued`;
@@ -4709,6 +4772,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status, payload = stop_run_from_request(params)
             self._send_json(payload, status=status)
             return
+        if parsed.path == "/api/actions/review-churn-limit":
+            status, payload = update_review_churn_limit_from_request(params)
+            self._send_json(payload, status=status)
+            return
         if parsed.path == "/api/actions/untrack":
             status, payload = queue_simple_web_action("untrack", key=params.get("key", [None])[0], requested_by="web")
             self._send_json(payload, status=status)
@@ -4755,6 +4822,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/stop-run":
             stop_run_from_request(params)
+            self._redirect("/")
+            return
+        if parsed.path == "/review-churn-limit":
+            update_review_churn_limit_from_request(params)
             self._redirect("/")
             return
         if parsed.path == "/untrack":
@@ -4842,7 +4913,8 @@ def html_page(title: str, body: str) -> bytes:
     button[data-action="stop-run"] {{ background: var(--bad-soft); font-weight: 600; }}
     button[data-action="untrack-cleanup"]:hover:not([disabled]), button[data-action="stop-run"]:hover:not([disabled]) {{ background: var(--bad-soft); border-color: var(--bad); }}
     input[type="text"] {{ min-width: 340px; cursor: text; }}
-    input[type="text"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
+    input[type="number"] {{ width: 72px; cursor: text; }}
+    input[type="text"]:focus, input[type="number"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
     input[type="checkbox"] {{ width: 16px; height: 16px; padding: 0; min-width: 0; cursor: pointer; accent-color: var(--accent); }}
     button[disabled], select[disabled], input[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
     .control-strip {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; padding: 12px 14px; background: rgba(255,252,247,0.7); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }}
@@ -4893,6 +4965,7 @@ def html_page(title: str, body: str) -> bytes:
     .live-activity-file {{ color: var(--accent); }}
     .live-activity-error {{ color: var(--bad); }}
     .button-stack {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: start; }}
+    .churn-limit-control {{ display: flex; gap: 6px; align-items: end; flex-wrap: wrap; margin-top: 2px; }}
     form {{ display: inline; }}
     label {{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }}
     label select, label input {{ font-size: 13px; color: var(--ink); }}

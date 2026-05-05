@@ -1014,6 +1014,58 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertTrue(payload["jobs"])
         self.assertTrue(payload["events"])
 
+    def test_api_dashboard_includes_review_churn_limit(self):
+        self.add_record(review_churn_cycle_limit=7)
+
+        status, body = self.request("GET", "/api/dashboard?scope=all")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["records"][0]["review_churn_cycle_limit"], 7)
+        self.assertEqual(payload["records"][0]["review_churn_cycle_limit_override"], 7)
+        self.assertEqual(payload["records"][0]["default_review_churn_cycle_limit"], 4)
+
+    def test_api_review_churn_limit_updates_and_resets_record(self):
+        self.add_record()
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/review-churn-limit",
+            data={"key": "repo-pr-42", "review_churn_cycle_limit": "8"},
+        )
+        payload = json.loads(body)
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-42")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(updated.review_churn_cycle_limit, 8)
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/review-churn-limit",
+            data={"key": "repo-pr-42", "review_churn_cycle_limit": ""},
+        )
+        payload = json.loads(body)
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-42")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(updated.review_churn_cycle_limit)
+
+    def test_api_review_churn_limit_rejects_lower_than_default(self):
+        self.add_record()
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/review-churn-limit",
+            data={"key": "repo-pr-42", "review_churn_cycle_limit": "3"},
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("4 or higher", payload["message"])
+
     def test_api_import_open_prs_returns_repo_data(self):
         pr_review_coordinator.ensure_repo_name = lambda repo_root, repo_name: ("owner", "repo")
         pr_review_coordinator.run = lambda *args, **kwargs: mock.Mock(
@@ -2093,6 +2145,38 @@ class QueueBehaviorTests(unittest.TestCase):
         pending = pr_review_coordinator.list_pending_jobs()
         self.assertEqual([job.action for job in pending], ["run-one"])
         self.assertEqual(json.loads(pending[0].payload_json)["signature"], "sig-1")
+
+    def test_default_review_churn_limit_allows_four_copilot_cycles(self):
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        snapshot = self.snapshot()
+        snapshot["copilot_review_count"] = 4
+
+        should_run, reason = pr_review_coordinator.should_trigger_follow_up(record, snapshot, force_run=False)
+
+        self.assertTrue(should_run)
+        self.assertEqual(reason, "Actionable review, merge-conflict, or CI state changed")
+
+    def test_review_churn_override_allows_more_copilot_cycles(self):
+        pr_review_coordinator.update_tracked_pr("repo-pr-1", review_churn_cycle_limit=6)
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        snapshot = self.snapshot()
+        snapshot["copilot_review_count"] = 5
+
+        should_run, reason = pr_review_coordinator.should_trigger_follow_up(record, snapshot, force_run=False)
+
+        self.assertTrue(should_run)
+        self.assertEqual(reason, "Actionable review, merge-conflict, or CI state changed")
+
+    def test_review_churn_stops_after_effective_limit(self):
+        pr_review_coordinator.update_tracked_pr("repo-pr-1", review_churn_cycle_limit=6)
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        snapshot = self.snapshot()
+        snapshot["copilot_review_count"] = 7
+
+        should_run, reason = pr_review_coordinator.should_trigger_follow_up(record, snapshot, force_run=False)
+
+        self.assertFalse(should_run)
+        self.assertIn("7 Copilot review cycles", reason)
 
     def test_clean_pr_after_agent_run_becomes_awaiting_final_review(self):
         pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: self.snapshot(
