@@ -681,6 +681,13 @@ def effective_review_churn_cycle_limit(record: TrackedPR) -> int:
     return max(int(override), DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT)
 
 
+def effective_review_churn_commit_limit(record: TrackedPR) -> int:
+    override = record.review_churn_cycle_limit
+    if override is None:
+        return PR_CHURN_COMMIT_LIMIT
+    return max(int(override), PR_CHURN_COMMIT_LIMIT)
+
+
 def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
     data = dict(job) if isinstance(job, dict) else dict(job.__dict__)
     payload = {}
@@ -765,6 +772,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         empty=record.thread_id,
     )
     churn_cycle_limit = effective_review_churn_cycle_limit(record)
+    churn_commit_limit = effective_review_churn_commit_limit(record)
     return {
         "key": record.key,
         "status": record.status,
@@ -797,8 +805,10 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "dirty_worktree_busy": dirty_worktree_busy,
         "stop_available": stop_available,
         "review_churn_cycle_limit": churn_cycle_limit,
+        "review_churn_commit_limit": churn_commit_limit,
         "review_churn_cycle_limit_override": record.review_churn_cycle_limit,
         "default_review_churn_cycle_limit": DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT,
+        "default_review_churn_commit_limit": PR_CHURN_COMMIT_LIMIT,
         "thread": {
             "id": record.thread_id,
             "short_id": record.thread_id[:8],
@@ -2263,6 +2273,7 @@ def normalize_steering_message(value: str | None) -> str:
 def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message: str | None = None) -> str:
     comment_instruction = agent_github_comment_instruction()
     review_churn_cycle_limit = effective_review_churn_cycle_limit(record)
+    review_churn_commit_limit = effective_review_churn_commit_limit(record)
     prompt = textwrap.dedent(
         f"""
         Continue this existing Codex thread for PR follow-up.
@@ -2279,7 +2290,7 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message:
         Preserve the original PR scope. Apply only the smallest LOC change that fixes an in-scope bug or validation gap.
         Do not add defensive code, compatibility shims, "legacy" handling, fallback behavior, retries, broad guards, or extra states unless the user explicitly requested that behavior.
         If feedback would require unrelated modules, broader API contracts, new migration behavior, or a separate design decision, do not implement it. Leave a concise rationale or report that user scope approval is needed.
-        If the PR has entered churn (more than {review_churn_cycle_limit} review cycles, more than {PR_CHURN_COMMIT_LIMIT} follow-up commits, or repeated comments moving into new domains), stop and report the remaining feedback instead of pushing another patch.
+        If the PR has entered churn (more than {review_churn_cycle_limit} review cycles, more than {review_churn_commit_limit} follow-up commits, or repeated comments moving into new domains), stop and report the remaining feedback instead of pushing another patch.
         Do not ship or continue a PR you can already see a reasonable reviewer rejecting. Shrink the change or stop for user input.
         Address merge conflicts, completed failing CI checks, and only in-scope review feedback with minimal targeted fixes.
         Pull the latest PR branch state into that worktree before making changes.
@@ -2572,7 +2583,11 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
         return False, "PR is not currently actionable"
     if force_run:
         return True, "Manual run requested"
-    churn_reason = review_churn_reason(snapshot, review_cycle_limit=effective_review_churn_cycle_limit(record))
+    churn_reason = review_churn_reason(
+        snapshot,
+        review_cycle_limit=effective_review_churn_cycle_limit(record),
+        commit_limit=effective_review_churn_commit_limit(record),
+    )
     if churn_reason:
         return False, churn_reason
     if (
@@ -2584,13 +2599,18 @@ def should_trigger_follow_up(record: TrackedPR, snapshot: dict[str, Any], *, for
     return True, "Actionable review, merge-conflict, or CI state changed"
 
 
-def review_churn_reason(snapshot: dict[str, Any], *, review_cycle_limit: int = DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT) -> str | None:
+def review_churn_reason(
+    snapshot: dict[str, Any],
+    *,
+    review_cycle_limit: int = DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT,
+    commit_limit: int = PR_CHURN_COMMIT_LIMIT,
+) -> str | None:
     copilot_review_count = int(snapshot.get("copilot_review_count") or 0)
     commit_count = int(snapshot.get("commit_count") or 0)
     reasons = []
     if copilot_review_count > review_cycle_limit:
         reasons.append(f"{copilot_review_count} Copilot review cycles")
-    if commit_count > PR_CHURN_COMMIT_LIMIT:
+    if commit_count > commit_limit:
         reasons.append(f"{commit_count} commits")
     if not reasons:
         return None
@@ -3544,9 +3564,10 @@ def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tupl
         updated = update_tracked_pr(key, review_churn_cycle_limit=None)
         return HTTPStatus.OK, {
             "ok": True,
-            "message": f"Reset review churn limit to default ({DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT}).",
+            "message": f"Reset review churn limit to default ({DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT} review cycles / {PR_CHURN_COMMIT_LIMIT} commits).",
             "tracked_pr_key": key,
             "review_churn_cycle_limit": effective_review_churn_cycle_limit(updated),
+            "review_churn_commit_limit": effective_review_churn_commit_limit(updated),
         }
     try:
         limit = int(raw_limit)
@@ -3560,9 +3581,10 @@ def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tupl
     updated = update_tracked_pr(key, review_churn_cycle_limit=limit)
     return HTTPStatus.OK, {
         "ok": True,
-        "message": f"Set review churn limit to {effective_review_churn_cycle_limit(updated)}.",
+        "message": f"Set review churn limit to {effective_review_churn_cycle_limit(updated)} review cycles / {effective_review_churn_commit_limit(updated)} commits.",
         "tracked_pr_key": key,
         "review_churn_cycle_limit": effective_review_churn_cycle_limit(updated),
+        "review_churn_commit_limit": effective_review_churn_commit_limit(updated),
     }
 
 
@@ -4054,7 +4076,9 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 : '';
               const runMeta = record.run_detail_meta ? `<div class="small">${{escapeHtml(record.run_detail_meta)}}</div>` : '';
               const churnLimitValue = record.review_churn_cycle_limit_override == null ? '' : record.review_churn_cycle_limit_override;
-              const churnLimitLabel = `Review churn${{record.review_churn_cycle_limit_override == null ? ` (default ${{record.default_review_churn_cycle_limit}})` : ''}}`;
+              const churnDefaultLabel = `${{record.default_review_churn_cycle_limit}} reviews / ${{record.default_review_churn_commit_limit}} commits`;
+              const churnEffectiveLabel = `${{record.review_churn_cycle_limit}} reviews / ${{record.review_churn_commit_limit}} commits`;
+              const churnLimitLabel = `Review churn${{record.review_churn_cycle_limit_override == null ? ` (default ${{churnDefaultLabel}})` : ` (${{churnEffectiveLabel}})`}}`;
               const mainRow = `
                 <tr data-pr-key="${{escapeHtml(record.key)}}">
                   <td>${{statusBadge(record.status)}}</td>
