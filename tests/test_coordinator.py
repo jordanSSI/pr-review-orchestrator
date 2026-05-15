@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -2063,6 +2064,19 @@ class RefreshRecordStateTests(unittest.TestCase):
         lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
         self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
+
+    def test_desktop_ipc_read_message_accepts_timeout(self):
+        left, right = socket.socketpair()
+        client = object.__new__(pr_review_coordinator.CodexDesktopIpcClient)
+        client.socket_path = "/tmp/codex-ipc-test.sock"
+        client.socket = left
+        client.pending = []
+        client.client_id = "test-client"
+        try:
+            self.assertIsNone(client.read_message(timeout_seconds=0))
+        finally:
+            left.close()
+            right.close()
 
     def test_run_codex_resume_discovers_desktop_ipc_turn_id_from_stream(self):
         record = self.add_record(current_job_id=100)

@@ -2601,9 +2601,13 @@ class CodexDesktopIpcClient:
             result = response.get("result")
             return result if isinstance(result, dict) else {}
 
-    def read_message(self) -> dict[str, Any] | None:
+    def read_message(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
         if self.pending:
             return self.pending.pop(0)
+        if timeout_seconds is not None:
+            readable, _, _ = select.select([self.socket], [], [], timeout_seconds)
+            if not readable:
+                return None
         return self._read_message()
 
     def _write_message(self, message: dict[str, Any]) -> None:
