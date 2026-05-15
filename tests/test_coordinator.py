@@ -589,15 +589,43 @@ class CodexDoctorTests(unittest.TestCase):
                     with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
                         with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
                             with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
-                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": ""}, clear=False):
-                                    result = pr_review_coordinator.codex_doctor()
+                                with mock.patch("pr_review_coordinator.codex_app_server_socket_is_connectable", return_value=False):
+                                    with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket", return_value=None):
+                                        with mock.patch("pr_review_coordinator.codex_desktop_ipc_socket_is_connectable", return_value=False):
+                                            with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": "", "CODEX_DESKTOP_IPC_SOCKET": ""}, clear=False):
+                                                result = pr_review_coordinator.codex_doctor()
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["app_server_transport"]["mode"], "stdio-fallback")
+        self.assertEqual(result["live_transport"]["mode"], "stdio-fallback")
         self.assertFalse(result["codex"]["managed_standalone"]["exists"])
         self.assertIn("Install the managed standalone Codex package", result["advice"][0])
 
-    def test_codex_doctor_reports_shared_socket_when_available(self):
+    def test_codex_doctor_reports_desktop_ipc_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_socket = Path(tmp) / "app-server-control.sock"
+            desktop_socket = Path(tmp) / "ipc.sock"
+            desktop_socket.write_text("", encoding="utf-8")
+            standalone = Path(tmp) / "packages" / "standalone" / "current" / "codex"
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="/usr/local/bin/codex"):
+                with mock.patch("pr_review_coordinator.run_codex_probe", self.fake_probe):
+                    with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
+                        with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
+                            with mock.patch("pr_review_coordinator.DEFAULT_CODEX_DESKTOP_IPC_SOCKET", desktop_socket):
+                                with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
+                                    with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket", return_value=str(desktop_socket)):
+                                        with mock.patch("pr_review_coordinator.codex_desktop_ipc_socket_is_connectable", return_value=True):
+                                            with mock.patch("pr_review_coordinator.codex_desktop_ipc_initialize_responds", return_value=True):
+                                                with mock.patch("pr_review_coordinator.codex_app_server_socket_is_connectable", return_value=False):
+                                                    with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": "", "CODEX_DESKTOP_IPC_SOCKET": ""}, clear=False):
+                                                        result = pr_review_coordinator.codex_doctor()
+
+        self.assertEqual(result["live_transport"]["mode"], "codex-desktop-ipc")
+        self.assertEqual(result["live_transport"]["socket_path"], str(desktop_socket))
+        self.assertEqual(result["desktop_ipc_transport"]["socket_path"], str(desktop_socket))
+        self.assertTrue(result["desktop_ipc_transport"]["initialize_ready"])
+        self.assertIn("visible Codex Desktop thread owner", result["advice"][0])
+
+    def test_codex_doctor_reports_shared_socket_when_available_without_desktop_ipc(self):
         with tempfile.TemporaryDirectory() as tmp:
             default_socket = Path(tmp) / "app-server-control.sock"
             default_socket.write_text("", encoding="utf-8")
@@ -607,12 +635,65 @@ class CodexDoctorTests(unittest.TestCase):
                     with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
                         with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
                             with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
-                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": ""}, clear=False):
-                                    result = pr_review_coordinator.codex_doctor()
+                                with mock.patch("pr_review_coordinator.codex_app_server_socket_is_connectable", return_value=True):
+                                    with mock.patch("pr_review_coordinator.codex_app_server_socket_initialize_responds", return_value=True):
+                                        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket", return_value=None):
+                                            with mock.patch("pr_review_coordinator.codex_desktop_ipc_socket_is_connectable", return_value=False):
+                                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": "", "CODEX_DESKTOP_IPC_SOCKET": ""}, clear=False):
+                                                    result = pr_review_coordinator.codex_doctor()
 
-        self.assertEqual(result["app_server_transport"]["mode"], "desktop-shared-socket")
+        self.assertEqual(result["live_transport"]["mode"], "app-server-shared-socket")
+        self.assertEqual(result["app_server_transport"]["mode"], "app-server-shared-socket")
         self.assertEqual(result["app_server_transport"]["socket_path"], str(default_socket))
-        self.assertIn("shared app-server socket", result["advice"][0])
+        self.assertTrue(result["app_server_transport"]["default_socket_connectable"])
+        self.assertIn("shared app-server socket fallback", result["advice"][0])
+
+    def test_codex_doctor_reports_stale_socket_file_as_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_socket = Path(tmp) / "app-server-control.sock"
+            default_socket.write_text("", encoding="utf-8")
+            standalone = Path(tmp) / "packages" / "standalone" / "current" / "codex"
+            standalone.parent.mkdir(parents=True)
+            standalone.write_text("", encoding="utf-8")
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="/usr/local/bin/codex"):
+                with mock.patch("pr_review_coordinator.run_codex_probe", self.fake_probe):
+                    with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
+                        with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
+                            with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
+                                with mock.patch("pr_review_coordinator.codex_app_server_socket_is_connectable", return_value=False):
+                                    with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket", return_value=None):
+                                        with mock.patch("pr_review_coordinator.codex_desktop_ipc_socket_is_connectable", return_value=False):
+                                            with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": "", "CODEX_DESKTOP_IPC_SOCKET": ""}, clear=False):
+                                                result = pr_review_coordinator.codex_doctor()
+
+        self.assertEqual(result["live_transport"]["mode"], "stdio-fallback")
+        self.assertTrue(result["app_server_transport"]["default_socket_exists"])
+        self.assertFalse(result["app_server_transport"]["default_socket_connectable"])
+        self.assertIn("socket file exists but is not accepting connections", result["advice"][0])
+
+    def test_codex_doctor_reports_websocket_initialize_failure_as_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_socket = Path(tmp) / "app-server-control.sock"
+            default_socket.write_text("", encoding="utf-8")
+            standalone = Path(tmp) / "packages" / "standalone" / "current" / "codex"
+            standalone.parent.mkdir(parents=True)
+            standalone.write_text("", encoding="utf-8")
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="/usr/local/bin/codex"):
+                with mock.patch("pr_review_coordinator.run_codex_probe", self.fake_probe):
+                    with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
+                        with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
+                            with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
+                                with mock.patch("pr_review_coordinator.codex_app_server_socket_is_connectable", return_value=True):
+                                    with mock.patch("pr_review_coordinator.codex_app_server_socket_initialize_responds", return_value=False):
+                                        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket", return_value=None):
+                                            with mock.patch("pr_review_coordinator.codex_desktop_ipc_socket_is_connectable", return_value=False):
+                                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": "", "CODEX_DESKTOP_IPC_SOCKET": ""}, clear=False):
+                                                    result = pr_review_coordinator.codex_doctor()
+
+        self.assertEqual(result["live_transport"]["mode"], "stdio-fallback")
+        self.assertTrue(result["app_server_transport"]["default_socket_connectable"])
+        self.assertFalse(result["app_server_transport"]["websocket_initialize_ready"])
+        self.assertIn("socket websocket transport did not answer initialize", result["advice"][0])
 
 
 class PromptInstructionTests(unittest.TestCase):
@@ -1905,22 +1986,82 @@ class RefreshRecordStateTests(unittest.TestCase):
                 self.requests.append((method, params))
                 return {"turn": {"id": "turn-1"}} if method == "turn/start" else {}
 
+            def notify(self, method, params=None):
+                self.requests.append((method, params))
+
             def read_message(self):
                 return self.messages.pop(0) if self.messages else None
 
             def close(self):
                 pass
 
-        with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket", return_value=None):
-            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
-                with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
-                    result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value=None):
+            with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket_for_live_transport", return_value=None):
+                with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
+                    with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
+                        result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["last_message"], "Done.")
-        self.assertEqual([method for method, _ in instances[0].requests], ["initialize", "thread/resume", "turn/start"])
+        self.assertEqual([method for method, _ in instances[0].requests], ["initialize", "initialized", "thread/resume", "turn/start"])
         lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
         self.assertEqual(lock["agent_transport"], "app-server-stdio")
+        self.assertEqual(lock["agent_turn_id"], "turn-1")
+
+    def test_run_codex_resume_uses_desktop_ipc_when_available(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+        instances = []
+
+        class FakeDesktopClient:
+            def __init__(self, socket_path):
+                self.socket_path = socket_path
+                self.requests = []
+                self.messages = [
+                    {
+                        "type": "broadcast",
+                        "method": "thread-stream-state-changed",
+                        "params": {
+                            "conversationId": "thread-42",
+                            "change": {
+                                "type": "patches",
+                                "patches": [
+                                    {"op": "replace", "path": ["turns", 0, "turnId"], "value": "turn-1"},
+                                    {"op": "replace", "path": ["turns", 0, "items", 1], "value": {"type": "agentMessage", "text": "Live done."}},
+                                    {"op": "replace", "path": ["turns", 0, "status"], "value": "completed"},
+                                ],
+                            },
+                        },
+                    }
+                ]
+                instances.append(self)
+
+            def request(self, method, params):
+                self.requests.append((method, params))
+                return {"turn": {"id": "turn-1", "status": "inProgress"}}
+
+            def read_message(self):
+                return self.messages.pop(0) if self.messages else None
+
+            def close(self):
+                pass
+
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value="/tmp/codex-ipc.sock"):
+            with mock.patch("pr_review_coordinator.CodexDesktopIpcClient", FakeDesktopClient):
+                result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Live done.")
+        self.assertEqual([method for method, _ in instances[0].requests], ["thread-follower-start-turn"])
+        turn_params = instances[0].requests[0][1]["turnStartParams"]
+        self.assertEqual(turn_params["cwd"], record.worktree_path)
+        self.assertEqual(turn_params["approvalPolicy"], "never")
+        lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
+        self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
 
     def test_stop_active_run_targets_agent_process_group(self):

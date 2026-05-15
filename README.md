@@ -34,7 +34,7 @@ You need:
 - `gh`
 - GitHub auth configured for `gh`
 - an agent provider:
-  - **codex** (default): `codex` on PATH, Codex thread state in `~/.codex/state_5.sqlite`, and the Codex app-server daemon socket for live Desktop updates
+  - **codex** (default): `codex` on PATH, Codex thread state in `~/.codex/state_5.sqlite`, and Codex Desktop running for live in-window updates
   - **cursor**: standalone `agent` on PATH (install via https://cursor.com/install); use `--provider cursor` on `handoff` / `track`
 
 Expected runtime environment:
@@ -43,7 +43,7 @@ Expected runtime environment:
 - for Codex: thread metadata is read from `~/.codex/state_5.sqlite`
 - the coordinator can create or reuse git worktrees
 
-For Codex follow-up, PRC uses the shared app-server control socket at `~/.codex/app-server-control/app-server-control.sock` when it exists. That path lets Codex Desktop see PRC's resumed turns live in the attached thread. If the socket is missing, PRC falls back to a private stdio app-server; thread history is still persisted, but an already-open Desktop thread may not render the new messages until later refresh. Run `prc codex-doctor` to inspect the current transport.
+For Codex follow-up, PRC first tries the local Codex Desktop IPC router at the OS temp `codex-ipc/ipc-<uid>.sock` path. When the target thread is open in Codex Desktop, PRC asks that visible thread owner to start the follow-up turn, so messages stream in the same Desktop window. If Desktop IPC is unavailable or no open window owns the thread, PRC falls back to the shared app-server control socket at `~/.codex/app-server-control/app-server-control.sock`, then to a private stdio app-server. Fallback history is still persisted, but an already-open Desktop thread may not render new messages until refresh. Run `prc codex-doctor` to inspect the current transport.
 
 ## Install
 
@@ -295,7 +295,7 @@ The JSON output also includes `orphaned_worktrees` for managed PR worktrees that
 
 ### `codex-doctor`
 
-Inspects the local Codex CLI, managed app-server daemon, Desktop control socket, and remote-control enrollment state that affect live Desktop-visible follow-up.
+Inspects the local Codex CLI, Codex Desktop IPC router, managed app-server daemon, and remote-control enrollment state that affect live Desktop-visible follow-up.
 
 ```bash
 prc codex-doctor
@@ -364,7 +364,8 @@ Operational state lives in:
 
 External state read by the coordinator:
 - `~/.codex/state_5.sqlite`: Codex thread metadata
-- `~/.codex/app-server-control/app-server-control.sock`: Codex app-server daemon socket for live Desktop-visible follow-up when present
+- OS temp `codex-ipc/ipc-<uid>.sock`: Codex Desktop IPC router used for visible in-window follow-up when the target thread is open
+- `~/.codex/app-server-control/app-server-control.sock`: Codex app-server daemon socket fallback when Desktop IPC cannot own the thread
 - git worktrees under `~/.codex/worktrees/pr-review/...` when managed worktrees are used
 
 ## Notes

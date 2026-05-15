@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
+import hashlib
 import html
 import json
 import os
 import re
 import signal
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -64,7 +70,12 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
 DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+DEFAULT_CODEX_DESKTOP_IPC_SOCKET = Path(tempfile.gettempdir()) / "codex-ipc" / (f"ipc-{os.getuid()}.sock" if hasattr(os, "getuid") else "ipc.sock")
 CODEX_MANAGED_STANDALONE = CODEX_HOME / "packages" / "standalone" / "current" / "codex"
+CODEX_DESKTOP_IPC_REQUEST_VERSIONS = {
+    "thread-follower-start-turn": 1,
+    "thread-follower-interrupt-turn": 1,
+}
 ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "merge_conflicts": 0,
@@ -2332,34 +2343,38 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message:
 
 class CodexAppServerClient:
     def __init__(self, codex_bin: str, socket_path: str | None = None):
-        command = (
-            [codex_bin, "app-server", "proxy", "--sock", socket_path]
-            if socket_path
-            else [codex_bin, "app-server", "--listen", "stdio://"]
-        )
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-        assert self.process.stdin is not None
-        assert self.process.stdout is not None
-        assert self.process.stderr is not None
-        self.stdin = self.process.stdin
-        self.stdout = self.process.stdout
+        self.socket_path = socket_path
         self.stderr_lines: list[str] = []
         self.pending: list[dict[str, Any]] = []
         self.next_request_id = 1
-        self.stderr_thread = threading.Thread(target=self._read_stderr, args=(self.process.stderr,), daemon=True)
-        self.stderr_thread.start()
+        self.process: subprocess.Popen[str] | None = None
+        self.stdin: Any | None = None
+        self.stdout: Any | None = None
+        self.stderr_thread: threading.Thread | None = None
+        self.socket: socket.socket | None = None
+        if socket_path:
+            self._connect_unix_socket_websocket(socket_path)
+        else:
+            self.process = subprocess.Popen(
+                [codex_bin, "app-server", "--listen", "stdio://"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            assert self.process.stdin is not None
+            assert self.process.stdout is not None
+            assert self.process.stderr is not None
+            self.stdin = self.process.stdin
+            self.stdout = self.process.stdout
+            self.stderr_thread = threading.Thread(target=self._read_stderr, args=(self.process.stderr,), daemon=True)
+            self.stderr_thread.start()
 
     @property
-    def pid(self) -> int:
-        return self.process.pid
+    def pid(self) -> int | None:
+        return self.process.pid if self.process else None
 
     def _read_stderr(self, stream: Any) -> None:
         try:
@@ -2369,22 +2384,31 @@ class CodexAppServerClient:
             stream.close()
 
     def close(self) -> None:
-        if self.process.poll() is None:
+        if self.socket is not None:
+            try:
+                self._send_websocket_frame(b"", opcode=0x8)
+            except OSError:
+                pass
+            try:
+                self.socket.close()
+            finally:
+                self.socket = None
+        if self.process is not None and self.process.poll() is None:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
-        self.stderr_thread.join(timeout=2)
+        if self.stderr_thread is not None:
+            self.stderr_thread.join(timeout=2)
 
     def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
-        self.stdin.write(json.dumps({"id": request_id, "method": method, "params": params}) + "\n")
-        self.stdin.flush()
+        self._write_message({"id": request_id, "method": method, "params": params})
         while True:
-            message = self._read_stdout_message()
+            message = self._read_message()
             if message is None:
                 stderr = "".join(self.stderr_lines).strip()
                 raise ScriptError(f"Codex app-server exited before {method} completed: {stderr}")
@@ -2395,13 +2419,31 @@ class CodexAppServerClient:
                 return result if isinstance(result, dict) else {}
             self.pending.append(message)
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        payload: dict[str, Any] = {"method": method}
+        if params is not None:
+            payload["params"] = params
+        self._write_message(payload)
+
     def read_message(self) -> dict[str, Any] | None:
         if self.pending:
             return self.pending.pop(0)
-        return self._read_stdout_message()
+        return self._read_message()
 
-    def _read_stdout_message(self) -> dict[str, Any] | None:
-        line = self.stdout.readline()
+    def _write_message(self, message: dict[str, Any]) -> None:
+        if self.socket is not None:
+            self._send_websocket_frame(json.dumps(message).encode("utf-8"), opcode=0x1)
+            return
+        assert self.stdin is not None
+        self.stdin.write(json.dumps(message) + "\n")
+        self.stdin.flush()
+
+    def _read_message(self) -> dict[str, Any] | None:
+        if self.socket is not None:
+            line = self._read_websocket_text_message()
+        else:
+            assert self.stdout is not None
+            line = self.stdout.readline()
         if not line:
             return None
         try:
@@ -2410,13 +2452,268 @@ class CodexAppServerClient:
             return {"method": "warning", "params": {"message": line.strip()}}
         return message if isinstance(message, dict) else None
 
+    def _connect_unix_socket_websocket(self, socket_path: str) -> None:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(socket_path)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        client.sendall(request.encode("ascii"))
+        response = self._read_http_response(client)
+        if " 101 " not in response.split("\r\n", 1)[0]:
+            client.close()
+            raise ScriptError(f"Codex app-server socket did not accept websocket upgrade: {response.splitlines()[0] if response else '<empty response>'}")
+        accept = ""
+        for line in response.split("\r\n"):
+            if line.lower().startswith("sec-websocket-accept:"):
+                accept = line.split(":", 1)[1].strip()
+                break
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if accept != expected:
+            client.close()
+            raise ScriptError("Codex app-server socket returned an invalid websocket accept key")
+        self.socket = client
+
+    def _read_http_response(self, client: socket.socket) -> str:
+        chunks: list[bytes] = []
+        while b"\r\n\r\n" not in b"".join(chunks):
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(len(part) for part in chunks) > 16384:
+                break
+        return b"".join(chunks).decode("iso-8859-1", errors="replace")
+
+    def _send_websocket_frame(self, payload: bytes, *, opcode: int) -> None:
+        assert self.socket is not None
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.extend([0x80 | 126])
+            header.extend(struct.pack("!H", length))
+        else:
+            header.extend([0x80 | 127])
+            header.extend(struct.pack("!Q", length))
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.socket.sendall(bytes(header) + mask + masked)
+
+    def _read_websocket_text_message(self) -> str | None:
+        assert self.socket is not None
+        chunks: list[bytes] = []
+        while True:
+            first = self._recv_exact(1)
+            if not first:
+                return None
+            second = self._recv_exact(1)
+            if not second:
+                return None
+            fin = bool(first[0] & 0x80)
+            opcode = first[0] & 0x0F
+            masked = bool(second[0] & 0x80)
+            length = second[0] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(8))[0]
+            mask = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(length) if length else b""
+            if masked:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            if opcode == 0x8:
+                return None
+            if opcode == 0x9:
+                self._send_websocket_frame(payload, opcode=0xA)
+                continue
+            if opcode in {0x1, 0x0}:
+                chunks.append(payload)
+                if fin:
+                    return b"".join(chunks).decode("utf-8", errors="replace")
+
+    def _recv_exact(self, length: int) -> bytes:
+        assert self.socket is not None
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            chunk = self.socket.recv(remaining)
+            if not chunk:
+                raise OSError("websocket connection closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+
+class CodexDesktopIpcClient:
+    def __init__(self, socket_path: str):
+        self.socket_path = socket_path
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.connect(socket_path)
+        self.pending: list[dict[str, Any]] = []
+        self.client_id = "initializing-client"
+        response = self.request("initialize", {"clientType": "pr-review-coordinator"}, include_version=False)
+        client_id = response.get("clientId") if isinstance(response, dict) else None
+        if not isinstance(client_id, str) or not client_id:
+            raise ScriptError("Codex Desktop IPC initialize did not return a client id")
+        self.client_id = client_id
+
+    def close(self) -> None:
+        try:
+            self.socket.close()
+        finally:
+            self.pending.clear()
+
+    def request(self, method: str, params: dict[str, Any] | None, *, include_version: bool = True) -> dict[str, Any]:
+        request_id = str(uuid.uuid4())
+        message: dict[str, Any] = {
+            "type": "request",
+            "requestId": request_id,
+            "sourceClientId": self.client_id,
+            "method": method,
+            "params": params or {},
+        }
+        if include_version:
+            message["version"] = CODEX_DESKTOP_IPC_REQUEST_VERSIONS.get(method, 0)
+        self._write_message(message)
+        while True:
+            response = self._read_message()
+            if response is None:
+                raise ScriptError(f"Codex Desktop IPC closed before {method} completed")
+            if response.get("type") != "response" or response.get("requestId") != request_id:
+                self.pending.append(response)
+                continue
+            if response.get("resultType") == "error":
+                raise ScriptError(f"Codex Desktop IPC {method} failed: {response.get('error') or 'unknown error'}")
+            result = response.get("result")
+            return result if isinstance(result, dict) else {}
+
+    def read_message(self) -> dict[str, Any] | None:
+        if self.pending:
+            return self.pending.pop(0)
+        return self._read_message()
+
+    def _write_message(self, message: dict[str, Any]) -> None:
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        self.socket.sendall(struct.pack("<I", len(payload)) + payload)
+
+    def _read_message(self) -> dict[str, Any] | None:
+        header = self._recv_exact(4)
+        if not header:
+            return None
+        length = struct.unpack("<I", header)[0]
+        payload = self._recv_exact(length)
+        if not payload:
+            return None
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"type": "warning", "message": payload.decode("utf-8", errors="replace")}
+        return message if isinstance(message, dict) else None
+
+    def _recv_exact(self, length: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            chunk = self.socket.recv(remaining)
+            if not chunk:
+                if not chunks:
+                    return b""
+                raise OSError("Codex Desktop IPC connection closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
 
 def resolve_codex_app_server_socket() -> str | None:
     configured = (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip()
     candidates = [Path(configured)] if configured else [DEFAULT_CODEX_APP_SERVER_SOCKET]
     for candidate in candidates:
-        if candidate.exists():
+        if codex_app_server_socket_is_connectable(candidate):
             return str(candidate)
+    return None
+
+
+def codex_app_server_socket_is_connectable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.2)
+            client.connect(str(path))
+    except OSError:
+        return False
+    return True
+
+
+def codex_app_server_socket_initialize_responds(codex_bin: str, socket_path: str, timeout_seconds: float = 2.0) -> bool:
+    del timeout_seconds
+    client: CodexAppServerClient | None = None
+    try:
+        client = CodexAppServerClient(codex_bin, socket_path)
+        initialize_codex_app_server(client)
+        return True
+    except (OSError, ScriptError):
+        return False
+    finally:
+        if client is not None:
+            client.close()
+
+
+def resolve_codex_app_server_socket_for_live_transport(codex_bin: str) -> str | None:
+    socket_path = resolve_codex_app_server_socket()
+    if not socket_path:
+        return None
+    if codex_app_server_socket_initialize_responds(codex_bin, socket_path):
+        return socket_path
+    return None
+
+
+def resolve_codex_desktop_ipc_socket() -> str | None:
+    configured = (os.environ.get("CODEX_DESKTOP_IPC_SOCKET") or "").strip()
+    candidates = [Path(configured)] if configured else [DEFAULT_CODEX_DESKTOP_IPC_SOCKET]
+    for candidate in candidates:
+        if codex_desktop_ipc_socket_is_connectable(candidate):
+            return str(candidate)
+    return None
+
+
+def codex_desktop_ipc_socket_is_connectable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.2)
+            client.connect(str(path))
+    except OSError:
+        return False
+    return True
+
+
+def codex_desktop_ipc_initialize_responds(socket_path: str) -> bool:
+    client: CodexDesktopIpcClient | None = None
+    try:
+        client = CodexDesktopIpcClient(socket_path)
+        return True
+    except (OSError, ScriptError):
+        return False
+    finally:
+        if client is not None:
+            client.close()
+
+
+def resolve_codex_desktop_ipc_socket_for_live_transport() -> str | None:
+    socket_path = resolve_codex_desktop_ipc_socket()
+    if socket_path and codex_desktop_ipc_initialize_responds(socket_path):
+        return socket_path
     return None
 
 
@@ -2482,16 +2779,29 @@ def codex_doctor() -> dict[str, Any]:
         return {"status": "blocked", "error": str(exc)}
 
     socket_path = resolve_codex_app_server_socket()
+    desktop_ipc_socket_path = resolve_codex_desktop_ipc_socket()
+    desktop_ipc_exists = DEFAULT_CODEX_DESKTOP_IPC_SOCKET.exists()
+    desktop_ipc_connectable = codex_desktop_ipc_socket_is_connectable(DEFAULT_CODEX_DESKTOP_IPC_SOCKET)
+    desktop_ipc_initialize_ready = bool(desktop_ipc_socket_path and codex_desktop_ipc_initialize_responds(desktop_ipc_socket_path))
     default_socket_exists = DEFAULT_CODEX_APP_SERVER_SOCKET.exists()
+    default_socket_connectable = codex_app_server_socket_is_connectable(DEFAULT_CODEX_APP_SERVER_SOCKET)
     daemon_help = run_codex_probe(codex_bin, ["app-server", "daemon", "--help"])
     daemon_version = run_codex_probe(codex_bin, ["app-server", "daemon", "version"]) if daemon_help["ok"] else None
-    shared_socket_ready = socket_path is not None
-    transport_mode = "desktop-shared-socket" if shared_socket_ready else "stdio-fallback"
+    websocket_initialize_ready = bool(socket_path and codex_app_server_socket_initialize_responds(codex_bin, socket_path))
+    shared_socket_ready = socket_path is not None and websocket_initialize_ready
+    live_transport_mode = "codex-desktop-ipc" if desktop_ipc_initialize_ready else "app-server-shared-socket" if shared_socket_ready else "stdio-fallback"
+    app_server_transport_mode = "app-server-shared-socket" if shared_socket_ready else "stdio-fallback"
     advice: list[str] = []
-    if shared_socket_ready:
-        advice.append("PRC will proxy Codex follow-up through the shared app-server socket.")
+    if desktop_ipc_initialize_ready:
+        advice.append("PRC will send Codex follow-up through the visible Codex Desktop thread owner when that thread is open.")
+    elif shared_socket_ready:
+        advice.append("PRC will use the shared app-server socket fallback; open Desktop threads may not render updates live.")
     elif daemon_help["ok"] and not CODEX_MANAGED_STANDALONE.exists():
         advice.append("Install the managed standalone Codex package, then run `codex app-server daemon start`.")
+    elif daemon_help["ok"] and default_socket_exists and not default_socket_connectable:
+        advice.append("Restart the Codex app-server daemon; the socket file exists but is not accepting connections.")
+    elif daemon_help["ok"] and socket_path and not websocket_initialize_ready:
+        advice.append("Using stdio fallback because the Codex app-server socket websocket transport did not answer initialize on the shared socket.")
     elif daemon_help["ok"]:
         advice.append("Run `codex app-server daemon start` so PRC can use the shared app-server socket.")
     else:
@@ -2509,12 +2819,26 @@ def codex_doctor() -> dict[str, Any]:
                 "exists": CODEX_MANAGED_STANDALONE.exists(),
             },
         },
+        "live_transport": {
+            "mode": live_transport_mode,
+            "socket_path": desktop_ipc_socket_path if desktop_ipc_initialize_ready else socket_path,
+        },
         "app_server_transport": {
-            "mode": transport_mode,
+            "mode": app_server_transport_mode,
             "socket_path": socket_path,
             "default_socket_path": str(DEFAULT_CODEX_APP_SERVER_SOCKET),
             "default_socket_exists": default_socket_exists,
+            "default_socket_connectable": default_socket_connectable,
+            "websocket_initialize_ready": websocket_initialize_ready,
             "env_socket": (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip() or None,
+        },
+        "desktop_ipc_transport": {
+            "socket_path": desktop_ipc_socket_path,
+            "default_socket_path": str(DEFAULT_CODEX_DESKTOP_IPC_SOCKET),
+            "default_socket_exists": desktop_ipc_exists,
+            "default_socket_connectable": desktop_ipc_connectable,
+            "initialize_ready": desktop_ipc_initialize_ready,
+            "env_socket": (os.environ.get("CODEX_DESKTOP_IPC_SOCKET") or "").strip() or None,
         },
         "remote_control_enrollments": list_codex_remote_control_enrollments(),
         "advice": advice,
@@ -2529,6 +2853,7 @@ def initialize_codex_app_server(client: CodexAppServerClient) -> None:
             "capabilities": {"experimentalApi": True},
         },
     )
+    client.notify("initialized")
 
 
 def interrupt_codex_app_server_turn(socket_path: str, thread_id: str, turn_id: str) -> None:
@@ -2536,6 +2861,164 @@ def interrupt_codex_app_server_turn(socket_path: str, thread_id: str, turn_id: s
     try:
         initialize_codex_app_server(client)
         client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+    finally:
+        client.close()
+
+
+def interrupt_codex_desktop_ipc_turn(socket_path: str, thread_id: str) -> None:
+    client = CodexDesktopIpcClient(socket_path)
+    try:
+        client.request("thread-follower-interrupt-turn", {"conversationId": thread_id})
+    finally:
+        client.close()
+
+
+def apply_desktop_ipc_conversation_message(
+    activity: dict[str, Any],
+    stream_state: dict[str, Any],
+    desktop_state: dict[str, Any],
+    message: dict[str, Any],
+    *,
+    thread_id: str,
+    turn_id: str,
+) -> str | None:
+    if message.get("type") != "broadcast" or message.get("method") != "thread-stream-state-changed":
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict) or params.get("conversationId") != thread_id:
+        return None
+    change = params.get("change")
+    if not isinstance(change, dict):
+        return None
+    if change.get("type") == "snapshot":
+        conversation = change.get("conversationState")
+        if not isinstance(conversation, dict):
+            return None
+        for index, turn in enumerate(conversation.get("turns") or []):
+            if not isinstance(turn, dict):
+                continue
+            current_turn_id = str(turn.get("turnId") or "")
+            if current_turn_id:
+                desktop_state.setdefault("turn_ids", {})[str(index)] = current_turn_id
+            if current_turn_id != turn_id:
+                continue
+            status = str(turn.get("status") or "")
+            for item in turn.get("items") or []:
+                if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
+                    stream_state["message"] = item["text"]
+                    set_live_activity_headline(activity, item["text"])
+            return status if status else None
+        return None
+    if change.get("type") != "patches":
+        return None
+    completed_status: str | None = None
+    for patch in change.get("patches") or []:
+        if not isinstance(patch, dict):
+            continue
+        path = patch.get("path")
+        value = patch.get("value")
+        if isinstance(value, dict) and value.get("type") == "agentMessage" and isinstance(value.get("text"), str):
+            stream_state["message"] = value["text"]
+            set_live_activity_headline(activity, value["text"])
+        if not isinstance(path, list) or len(path) < 2 or path[0] != "turns":
+            continue
+        turn_index = str(path[1])
+        if path[-1] == "turnId" and isinstance(value, str):
+            desktop_state.setdefault("turn_ids", {})[turn_index] = value
+            existing_status = desktop_state.setdefault("turn_statuses", {}).get(turn_index)
+            if value == turn_id and isinstance(existing_status, str):
+                completed_status = existing_status
+        if path[-1] == "status" and isinstance(value, str):
+            desktop_state.setdefault("turn_statuses", {})[turn_index] = value
+            if desktop_state.setdefault("turn_ids", {}).get(turn_index) == turn_id:
+                completed_status = value
+        if isinstance(value, dict):
+            current_turn_id = str(value.get("turnId") or "")
+            status = str(value.get("status") or "")
+            if current_turn_id:
+                desktop_state.setdefault("turn_ids", {})[turn_index] = current_turn_id
+            if current_turn_id == turn_id and status:
+                completed_status = status
+    return completed_status
+
+
+def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], prompt: str, socket_path: str) -> dict[str, Any]:
+    activity = empty_live_activity(headline="Launching Codex Desktop follow-up")
+    stream_state = {"message": "", "plan": "", "reasoning": ""}
+    desktop_state: dict[str, Any] = {"turn_ids": {}, "turn_statuses": {}}
+    stdout_messages: list[str] = []
+    last_persist_at = 0
+
+    def persist_live_activity(*, force: bool = False) -> None:
+        nonlocal last_persist_at
+        timestamp = now_ms()
+        if not force and timestamp - last_persist_at < 700:
+            return
+        update_tracked_pr(
+            record.key,
+            live_activity_json=json_dumps(activity),
+            live_activity_updated_at=timestamp,
+            last_run_summary=summarize_live_activity(activity),
+        )
+        last_persist_at = timestamp
+
+    client = CodexDesktopIpcClient(socket_path)
+    try:
+        update_lock_file(
+            record.key,
+            {
+                "agent_transport": "codex-desktop-ipc",
+                "desktop_ipc_socket": socket_path,
+            },
+        )
+        response = client.request(
+            "thread-follower-start-turn",
+            {
+                "conversationId": record.thread_id,
+                "turnStartParams": {
+                    "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                    "cwd": record.worktree_path,
+                    "approvalPolicy": "never",
+                    "approvalsReviewer": "user",
+                    "sandboxPolicy": {"type": "dangerFullAccess"},
+                },
+            },
+        )
+        turn = response.get("turn") if isinstance(response, dict) else None
+        turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+        if not turn_id:
+            raise ScriptError("Codex Desktop IPC did not return a turn id")
+        update_lock_file(record.key, {"agent_turn_id": turn_id})
+        set_live_activity_headline(activity, "Codex Desktop turn is running")
+        persist_live_activity(force=True)
+
+        turn_status = str(turn.get("status") or "")
+        while turn_status not in {"completed", "failed", "cancelled"}:
+            message = client.read_message()
+            if message is None:
+                raise ScriptError("Codex Desktop IPC closed before the turn completed")
+            stdout_messages.append(json.dumps(message, sort_keys=True))
+            status_update = apply_desktop_ipc_conversation_message(
+                activity,
+                stream_state,
+                desktop_state,
+                message,
+                thread_id=record.thread_id,
+                turn_id=turn_id,
+            )
+            if status_update:
+                turn_status = status_update
+            persist_live_activity()
+
+        persist_live_activity(force=True)
+        status = "ok" if turn_status == "completed" else "error"
+        return {
+            "status": status,
+            "exit_code": 0 if status == "ok" else 1,
+            "stdout": "\n".join(stdout_messages),
+            "stderr": "",
+            "last_message": stream_state.get("message") or summarize_live_activity(activity),
+        }
     finally:
         client.close()
 
@@ -2637,7 +3120,15 @@ def run_codex_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool,
     prompt = resume_prompt(record, snapshot, steering_message=steering_message)
     if dry_run:
         return {"status": "dry_run", "thread_id": record.thread_id, "prompt_preview": prompt}
-    return run_codex_app_server_resume(record, snapshot, prompt, resolve_codex_app_server_socket())
+    desktop_ipc_socket = resolve_codex_desktop_ipc_socket_for_live_transport()
+    if desktop_ipc_socket:
+        try:
+            return run_codex_desktop_ipc_resume(record, snapshot, prompt, desktop_ipc_socket)
+        except ScriptError as exc:
+            if "no-client-found" not in str(exc) and "client-cannot-handle-request" not in str(exc):
+                raise
+    codex_bin = resolve_codex_executable()
+    return run_codex_app_server_resume(record, snapshot, prompt, resolve_codex_app_server_socket_for_live_transport(codex_bin))
 
 
 def run_cursor_resume(record: TrackedPR, snapshot: dict[str, Any], dry_run: bool, steering_message: str | None = None) -> dict[str, Any]:
@@ -2856,13 +3347,18 @@ def stop_active_run(record: TrackedPR) -> dict[str, Any]:
         if socket_path and turn_id:
             interrupt_codex_app_server_turn(socket_path, record.thread_id, turn_id)
             app_server_interrupted = True
+    if lock.get("agent_transport") == "codex-desktop-ipc":
+        socket_path = str(lock.get("desktop_ipc_socket") or "")
+        if socket_path:
+            interrupt_codex_desktop_ipc_turn(socket_path, record.thread_id)
+            app_server_interrupted = True
     agent_pid = lock.get("agent_pid")
     if not isinstance(agent_pid, int) or not pid_is_alive(agent_pid):
         if app_server_interrupted:
             summary = f"Stop requested for active Codex app turn {lock.get('agent_turn_id')}"
             update_tracked_pr(record.key, last_run_status="stopping", last_run_summary=summary, last_error=None)
             update_lock_file(record.key, {"stop_requested_at": now_ms()})
-            record_event("info", "stop_requested", summary, tracked_pr_key=record.key, details={"agent_transport": "app-server", "agent_turn_id": lock.get("agent_turn_id")})
+            record_event("info", "stop_requested", summary, tracked_pr_key=record.key, details={"agent_transport": lock.get("agent_transport"), "agent_turn_id": lock.get("agent_turn_id")})
             return {"ok": True, "message": summary, "tracked_pr_key": record.key, "agent_turn_id": lock.get("agent_turn_id")}
         return {"ok": False, "message": "No live agent process was found for this PR."}
     agent_pgid = lock.get("agent_pgid")
