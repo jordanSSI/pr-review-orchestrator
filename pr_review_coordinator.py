@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import select
 import signal
 import socket
 import sqlite3
@@ -1015,7 +1016,7 @@ def lookup_thread(thread_id: str) -> dict[str, Any] | None:
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
-            "SELECT id, cwd, title, archived, git_branch, git_origin_url FROM threads WHERE id = ?",
+            "SELECT id, rollout_path, cwd, title, archived, git_branch, git_origin_url FROM threads WHERE id = ?",
             (thread_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -2425,9 +2426,13 @@ class CodexAppServerClient:
             payload["params"] = params
         self._write_message(payload)
 
-    def read_message(self) -> dict[str, Any] | None:
+    def read_message(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
         if self.pending:
             return self.pending.pop(0)
+        if timeout_seconds is not None:
+            readable, _, _ = select.select([self.socket], [], [], timeout_seconds)
+            if not readable:
+                return None
         return self._read_message()
 
     def _write_message(self, message: dict[str, Any]) -> None:
@@ -2873,6 +2878,40 @@ def interrupt_codex_desktop_ipc_turn(socket_path: str, thread_id: str) -> None:
         client.close()
 
 
+def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[str, str] | None:
+    thread = lookup_thread(thread_id)
+    rollout_path = str((thread or {}).get("rollout_path") or "")
+    if not rollout_path:
+        return None
+    path = Path(rollout_path)
+    if not path.exists():
+        return None
+    completion: dict[str, str] | None = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+                    continue
+                completed_turn_id = str(payload.get("turn_id") or "")
+                if turn_id and completed_turn_id != turn_id:
+                    continue
+                completion = {
+                    "turn_id": completed_turn_id,
+                    "status": "completed",
+                    "message": str(payload.get("last_agent_message") or ""),
+                }
+    except OSError:
+        return None
+    return completion
+
+
 def apply_desktop_ipc_conversation_message(
     activity: dict[str, Any],
     stream_state: dict[str, Any],
@@ -3025,9 +3064,21 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
 
         turn_status = str(turn.get("status") or "") if isinstance(turn, dict) else ""
         while turn_status not in {"completed", "failed", "cancelled"}:
-            message = client.read_message()
+            message = client.read_message(timeout_seconds=1.0)
             if message is None:
-                raise ScriptError("Codex Desktop IPC closed before the turn completed")
+                completion = codex_rollout_task_completion(record.thread_id, turn_id or None)
+                if completion:
+                    discovered_turn_id = completion.get("turn_id") or ""
+                    if not turn_id and discovered_turn_id:
+                        turn_id = discovered_turn_id
+                        update_lock_file(record.key, {"agent_turn_id": turn_id})
+                    message_text = completion.get("message") or ""
+                    if message_text:
+                        stream_state["message"] = message_text
+                        set_live_activity_headline(activity, message_text)
+                    turn_status = completion.get("status") or "completed"
+                persist_live_activity()
+                continue
             stdout_messages.append(json.dumps(message, sort_keys=True))
             status_update = apply_desktop_ipc_conversation_message(
                 activity,
