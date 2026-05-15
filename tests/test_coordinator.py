@@ -570,6 +570,51 @@ class CodexBinaryResolutionTests(unittest.TestCase):
         self.assertTrue(resolved.endswith("codex"))
 
 
+class CodexDoctorTests(unittest.TestCase):
+    def fake_probe(self, codex_bin, args):
+        if args == ["--version"]:
+            return {"ok": True, "returncode": 0, "stdout": "codex-cli 0.131.0-alpha.9", "stderr": ""}
+        if args == ["app-server", "daemon", "--help"]:
+            return {"ok": True, "returncode": 0, "stdout": "Manage the local app-server daemon", "stderr": ""}
+        if args == ["app-server", "daemon", "version"]:
+            return {"ok": False, "returncode": 1, "stdout": "", "stderr": "daemon is not running"}
+        return {"ok": False, "returncode": 2, "stdout": "", "stderr": "unexpected probe"}
+
+    def test_codex_doctor_reports_stdio_fallback_without_control_socket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_socket = Path(tmp) / "app-server-control.sock"
+            standalone = Path(tmp) / "packages" / "standalone" / "current" / "codex"
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="/usr/local/bin/codex"):
+                with mock.patch("pr_review_coordinator.run_codex_probe", self.fake_probe):
+                    with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
+                        with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
+                            with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
+                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": ""}, clear=False):
+                                    result = pr_review_coordinator.codex_doctor()
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["app_server_transport"]["mode"], "stdio-fallback")
+        self.assertFalse(result["codex"]["managed_standalone"]["exists"])
+        self.assertIn("Install the managed standalone Codex package", result["advice"][0])
+
+    def test_codex_doctor_reports_shared_socket_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_socket = Path(tmp) / "app-server-control.sock"
+            default_socket.write_text("", encoding="utf-8")
+            standalone = Path(tmp) / "packages" / "standalone" / "current" / "codex"
+            with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="/usr/local/bin/codex"):
+                with mock.patch("pr_review_coordinator.run_codex_probe", self.fake_probe):
+                    with mock.patch("pr_review_coordinator.list_codex_remote_control_enrollments", return_value=[]):
+                        with mock.patch("pr_review_coordinator.DEFAULT_CODEX_APP_SERVER_SOCKET", default_socket):
+                            with mock.patch("pr_review_coordinator.CODEX_MANAGED_STANDALONE", standalone):
+                                with mock.patch.dict(os.environ, {"CODEX_APP_SERVER_SOCKET": ""}, clear=False):
+                                    result = pr_review_coordinator.codex_doctor()
+
+        self.assertEqual(result["app_server_transport"]["mode"], "desktop-shared-socket")
+        self.assertEqual(result["app_server_transport"]["socket_path"], str(default_socket))
+        self.assertIn("shared app-server socket", result["advice"][0])
+
+
 class PromptInstructionTests(unittest.TestCase):
     def make_record(self, **overrides):
         payload = {

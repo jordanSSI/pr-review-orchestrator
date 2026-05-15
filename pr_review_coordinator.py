@@ -64,6 +64,7 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
 DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+CODEX_MANAGED_STANDALONE = CODEX_HOME / "packages" / "standalone" / "current" / "codex"
 ACTIVE_STATUSES = {"merge_conflicts", "needs_review", "needs_ci_fix"}
 PRIORITY_ORDER = {
     "merge_conflicts": 0,
@@ -2417,6 +2418,107 @@ def resolve_codex_app_server_socket() -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def run_codex_probe(codex_bin: str, args: list[str]) -> dict[str, Any]:
+    result = run([codex_bin, *args], check=False)
+    return {
+        "ok": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def list_codex_remote_control_enrollments() -> list[dict[str, Any]]:
+    if not CODEX_STATE_DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{CODEX_STATE_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'remote_control_enrollments'"
+        ).fetchone()
+        if not has_table:
+            return []
+        rows = conn.execute(
+            """
+            SELECT websocket_url, account_id, app_server_client_name, server_id, environment_id, server_name, updated_at
+            FROM remote_control_enrollments
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    enrollments = []
+    for websocket_url, account_id, client_name, server_id, environment_id, server_name, updated_at in rows:
+        updated_at_iso = None
+        if isinstance(updated_at, int) and updated_at > 0:
+            updated_at_iso = datetime.fromtimestamp(updated_at, tz=timezone.utc).isoformat()
+        enrollments.append(
+            {
+                "websocket_url": websocket_url,
+                "account_id": account_id,
+                "app_server_client_name": client_name,
+                "server_id": server_id,
+                "environment_id": environment_id,
+                "server_name": server_name,
+                "updated_at": updated_at,
+                "updated_at_utc": updated_at_iso,
+            }
+        )
+    return enrollments
+
+
+def codex_doctor() -> dict[str, Any]:
+    try:
+        codex_bin = resolve_codex_executable()
+    except ScriptError as exc:
+        return {"status": "blocked", "error": str(exc)}
+
+    socket_path = resolve_codex_app_server_socket()
+    default_socket_exists = DEFAULT_CODEX_APP_SERVER_SOCKET.exists()
+    daemon_help = run_codex_probe(codex_bin, ["app-server", "daemon", "--help"])
+    daemon_version = run_codex_probe(codex_bin, ["app-server", "daemon", "version"]) if daemon_help["ok"] else None
+    shared_socket_ready = socket_path is not None
+    transport_mode = "desktop-shared-socket" if shared_socket_ready else "stdio-fallback"
+    advice: list[str] = []
+    if shared_socket_ready:
+        advice.append("PRC will proxy Codex follow-up through the shared app-server socket.")
+    elif daemon_help["ok"] and not CODEX_MANAGED_STANDALONE.exists():
+        advice.append("Install the managed standalone Codex package, then run `codex app-server daemon start`.")
+    elif daemon_help["ok"]:
+        advice.append("Run `codex app-server daemon start` so PRC can use the shared app-server socket.")
+    else:
+        advice.append("Upgrade Codex CLI to a build with `codex app-server daemon` support.")
+
+    return {
+        "status": "ready",
+        "codex": {
+            "path": codex_bin,
+            "version": run_codex_probe(codex_bin, ["--version"]),
+            "daemon_supported": daemon_help["ok"],
+            "daemon_version": daemon_version,
+            "managed_standalone": {
+                "path": str(CODEX_MANAGED_STANDALONE),
+                "exists": CODEX_MANAGED_STANDALONE.exists(),
+            },
+        },
+        "app_server_transport": {
+            "mode": transport_mode,
+            "socket_path": socket_path,
+            "default_socket_path": str(DEFAULT_CODEX_APP_SERVER_SOCKET),
+            "default_socket_exists": default_socket_exists,
+            "env_socket": (os.environ.get("CODEX_APP_SERVER_SOCKET") or "").strip() or None,
+        },
+        "remote_control_enrollments": list_codex_remote_control_enrollments(),
+        "advice": advice,
+    }
 
 
 def initialize_codex_app_server(client: CodexAppServerClient) -> None:
@@ -5210,6 +5312,9 @@ def parse_args() -> argparse.ArgumentParser:
     untrack.add_argument("--cleanup-worktree", action="store_true")
     untrack.add_argument("--format", choices=("json", "text"), default="json")
 
+    codex_doctor_parser = subparsers.add_parser("codex-doctor", help="Inspect Codex app-server transport readiness.")
+    codex_doctor_parser.add_argument("--format", choices=("json", "text"), default="json")
+
     daemon = subparsers.add_parser("daemon", help="Run the polling and execution daemon.")
     daemon.add_argument("--host", default="127.0.0.1")
     daemon.add_argument("--port", type=int, default=8765)
@@ -5319,6 +5424,10 @@ def main() -> None:
 
     if args.command == "untrack":
         emit(handle_untrack(get_tracked_pr(args.key), cleanup_worktree=args.cleanup_worktree), args.format)
+        return
+
+    if args.command == "codex-doctor":
+        emit(codex_doctor(), args.format)
         return
 
     if args.command == "daemon":

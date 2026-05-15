@@ -34,7 +34,7 @@ You need:
 - `gh`
 - GitHub auth configured for `gh`
 - an agent provider:
-  - **codex** (default): `codex` on PATH and Codex thread state in `~/.codex/state_5.sqlite`
+  - **codex** (default): `codex` on PATH, Codex thread state in `~/.codex/state_5.sqlite`, and the Codex app-server daemon socket for live Desktop updates
   - **cursor**: standalone `agent` on PATH (install via https://cursor.com/install); use `--provider cursor` on `handoff` / `track`
 
 Expected runtime environment:
@@ -42,6 +42,8 @@ Expected runtime environment:
 - tracked repos are local git clones
 - for Codex: thread metadata is read from `~/.codex/state_5.sqlite`
 - the coordinator can create or reuse git worktrees
+
+For Codex follow-up, PRC uses the shared app-server control socket at `~/.codex/app-server-control/app-server-control.sock` when it exists. That path lets Codex Desktop see PRC's resumed turns live in the attached thread. If the socket is missing, PRC falls back to a private stdio app-server; thread history is still persisted, but an already-open Desktop thread may not render the new messages until later refresh. Run `prc codex-doctor` to inspect the current transport.
 
 ## Install
 
@@ -174,7 +176,7 @@ prc web --host 127.0.0.1 --port 8765
 3. The handoff command captures `CODEX_THREAD_ID`, creates or reuses the PR, creates the dedicated PR worktree, and registers `repo + PR + branch + worktree + thread_id`.
 4. The daemon queues lightweight per-PR poll jobs that fetch unresolved review feedback, Copilot review state, and completed failing CI.
 5. Poll jobs update tracked state and queue follow-up execution only when actionable state changes.
-6. Follow-up execution runs the configured agent (default: `codex exec resume <thread_id> "<follow-up prompt>"`; with `--provider cursor` it runs the standalone `agent -p "..." --output-format text` in the PR worktree), sending the work back into the same context you started with.
+6. Follow-up execution runs the configured agent. With Codex it resumes the thread through the Codex app-server, using the shared daemon socket when available and a private stdio app-server otherwise; with `--provider cursor` it runs the standalone `agent -p "..." --output-format text` in the PR worktree. The follow-up is sent back into the same context you started with.
 7. The resumed thread is instructed to do code changes only in the dedicated PR worktree.
 8. When review is clean and completed CI failures are gone, the PR stays tracked but idle so it is back with you for final testing. If the orchestrator has already run follow-up on that PR and the latest Copilot activity is a `No comments` review, it reports `awaiting_final_review` to make that handoff explicit. If the final no-comments review is missing, polling requests Copilot again and waits. If new comments or completed failures appear later, the same thread is resumed again.
 
@@ -291,6 +293,14 @@ prc status --all
 
 The JSON output also includes `orphaned_worktrees` for managed PR worktrees that still exist on disk but are no longer tracked in the coordinator database.
 
+### `codex-doctor`
+
+Inspects the local Codex CLI, managed app-server daemon, Desktop control socket, and remote-control enrollment state that affect live Desktop-visible follow-up.
+
+```bash
+prc codex-doctor
+```
+
 ### `serve`
 
 Runs the daemon and web UI together for compatibility.
@@ -354,6 +364,7 @@ Operational state lives in:
 
 External state read by the coordinator:
 - `~/.codex/state_5.sqlite`: Codex thread metadata
+- `~/.codex/app-server-control/app-server-control.sock`: Codex app-server daemon socket for live Desktop-visible follow-up when present
 - git worktrees under `~/.codex/worktrees/pr-review/...` when managed worktrees are used
 
 ## Notes
