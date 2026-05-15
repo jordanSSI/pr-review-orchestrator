@@ -2064,6 +2064,76 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
 
+    def test_run_codex_resume_discovers_desktop_ipc_turn_id_from_stream(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+
+        class FakeDesktopClient:
+            def __init__(self, socket_path):
+                self.messages = [
+                    {
+                        "type": "broadcast",
+                        "method": "thread-stream-state-changed",
+                        "params": {
+                            "conversationId": "thread-42",
+                            "change": {
+                                "type": "snapshot",
+                                "conversationState": {
+                                    "turns": [
+                                        {"turnId": "old-turn", "status": "completed", "items": []},
+                                        {
+                                            "turnId": "stream-turn",
+                                            "status": "inProgress",
+                                            "items": [{"type": "agentMessage", "text": "Started live."}],
+                                        },
+                                    ]
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "type": "broadcast",
+                        "method": "thread-stream-state-changed",
+                        "params": {
+                            "conversationId": "thread-42",
+                            "change": {
+                                "type": "patches",
+                                "patches": [
+                                    {
+                                        "op": "replace",
+                                        "path": ["turns", 1, "items", 1],
+                                        "value": {"type": "agentMessage", "text": "Finished live."},
+                                    },
+                                    {"op": "replace", "path": ["turns", 1, "status"], "value": "completed"},
+                                ],
+                            },
+                        },
+                    },
+                ]
+
+            def request(self, method, params):
+                return {}
+
+            def read_message(self):
+                return self.messages.pop(0) if self.messages else None
+
+            def close(self):
+                pass
+
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value="/tmp/codex-ipc.sock"):
+            with mock.patch("pr_review_coordinator.CodexDesktopIpcClient", FakeDesktopClient):
+                result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Finished live.")
+        lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
+        self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
+        self.assertEqual(lock["agent_turn_id"], "stream-turn")
+
     def test_stop_active_run_targets_agent_process_group(self):
         record = self.add_record(current_job_id=100, lock_owner_pid=111)
         pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)

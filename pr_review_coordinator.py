@@ -2880,8 +2880,24 @@ def apply_desktop_ipc_conversation_message(
     message: dict[str, Any],
     *,
     thread_id: str,
-    turn_id: str,
+    turn_id: str | None,
 ) -> str | None:
+    terminal_statuses = {"completed", "failed", "cancelled"}
+
+    def remember_turn_candidate(turn_index: str, current_turn_id: str, status: str) -> None:
+        if turn_id or not current_turn_id:
+            return
+        if status in terminal_statuses:
+            return
+        desktop_state["target_turn_id"] = current_turn_id
+        desktop_state["target_turn_index"] = turn_index
+
+    def is_target_turn(turn_index: str, current_turn_id: str = "") -> bool:
+        target_turn_id = turn_id or desktop_state.get("target_turn_id")
+        if target_turn_id:
+            return current_turn_id == target_turn_id or desktop_state.setdefault("turn_ids", {}).get(turn_index) == target_turn_id
+        return desktop_state.get("target_turn_index") == turn_index
+
     if message.get("type") != "broadcast" or message.get("method") != "thread-stream-state-changed":
         return None
     params = message.get("params")
@@ -2897,12 +2913,16 @@ def apply_desktop_ipc_conversation_message(
         for index, turn in enumerate(conversation.get("turns") or []):
             if not isinstance(turn, dict):
                 continue
+            turn_index = str(index)
             current_turn_id = str(turn.get("turnId") or "")
             if current_turn_id:
-                desktop_state.setdefault("turn_ids", {})[str(index)] = current_turn_id
-            if current_turn_id != turn_id:
-                continue
+                desktop_state.setdefault("turn_ids", {})[turn_index] = current_turn_id
             status = str(turn.get("status") or "")
+            if status:
+                desktop_state.setdefault("turn_statuses", {})[turn_index] = status
+            remember_turn_candidate(turn_index, current_turn_id, status)
+            if not is_target_turn(turn_index, current_turn_id):
+                continue
             for item in turn.get("items") or []:
                 if isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                     stream_state["message"] = item["text"]
@@ -2917,27 +2937,39 @@ def apply_desktop_ipc_conversation_message(
             continue
         path = patch.get("path")
         value = patch.get("value")
-        if isinstance(value, dict) and value.get("type") == "agentMessage" and isinstance(value.get("text"), str):
-            stream_state["message"] = value["text"]
-            set_live_activity_headline(activity, value["text"])
         if not isinstance(path, list) or len(path) < 2 or path[0] != "turns":
             continue
         turn_index = str(path[1])
+        if isinstance(value, dict) and value.get("type") == "agentMessage" and isinstance(value.get("text"), str) and is_target_turn(turn_index):
+            stream_state["message"] = value["text"]
+            set_live_activity_headline(activity, value["text"])
         if path[-1] == "turnId" and isinstance(value, str):
             desktop_state.setdefault("turn_ids", {})[turn_index] = value
             existing_status = desktop_state.setdefault("turn_statuses", {}).get(turn_index)
+            remember_turn_candidate(turn_index, value, existing_status if isinstance(existing_status, str) else "")
             if value == turn_id and isinstance(existing_status, str):
+                completed_status = existing_status
+            if desktop_state.get("target_turn_id") == value and isinstance(existing_status, str):
                 completed_status = existing_status
         if path[-1] == "status" and isinstance(value, str):
             desktop_state.setdefault("turn_statuses", {})[turn_index] = value
+            current_turn_id = str(desktop_state.setdefault("turn_ids", {}).get(turn_index) or "")
+            remember_turn_candidate(turn_index, current_turn_id, value)
             if desktop_state.setdefault("turn_ids", {}).get(turn_index) == turn_id:
+                completed_status = value
+            if desktop_state.get("target_turn_id") == current_turn_id and current_turn_id:
                 completed_status = value
         if isinstance(value, dict):
             current_turn_id = str(value.get("turnId") or "")
             status = str(value.get("status") or "")
             if current_turn_id:
                 desktop_state.setdefault("turn_ids", {})[turn_index] = current_turn_id
+            if status:
+                desktop_state.setdefault("turn_statuses", {})[turn_index] = status
+            remember_turn_candidate(turn_index, current_turn_id, status)
             if current_turn_id == turn_id and status:
+                completed_status = status
+            if desktop_state.get("target_turn_id") == current_turn_id and status:
                 completed_status = status
     return completed_status
 
@@ -2986,13 +3018,12 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
         )
         turn = response.get("turn") if isinstance(response, dict) else None
         turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
-        if not turn_id:
-            raise ScriptError("Codex Desktop IPC did not return a turn id")
-        update_lock_file(record.key, {"agent_turn_id": turn_id})
-        set_live_activity_headline(activity, "Codex Desktop turn is running")
+        if turn_id:
+            update_lock_file(record.key, {"agent_turn_id": turn_id})
+        set_live_activity_headline(activity, "Codex Desktop turn is running" if turn_id else "Waiting for Codex Desktop turn stream")
         persist_live_activity(force=True)
 
-        turn_status = str(turn.get("status") or "")
+        turn_status = str(turn.get("status") or "") if isinstance(turn, dict) else ""
         while turn_status not in {"completed", "failed", "cancelled"}:
             message = client.read_message()
             if message is None:
@@ -3004,8 +3035,14 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
                 desktop_state,
                 message,
                 thread_id=record.thread_id,
-                turn_id=turn_id,
+                turn_id=turn_id or None,
             )
+            if not turn_id:
+                discovered_turn_id = str(desktop_state.get("target_turn_id") or "")
+                if discovered_turn_id:
+                    turn_id = discovered_turn_id
+                    update_lock_file(record.key, {"agent_turn_id": turn_id})
+                    set_live_activity_headline(activity, "Codex Desktop turn is running")
             if status_update:
                 turn_status = status_update
             persist_live_activity()
