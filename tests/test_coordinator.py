@@ -1368,6 +1368,36 @@ class DashboardHttpTests(unittest.TestCase):
 
 
 class ThreadSelectionTests(unittest.TestCase):
+    def write_thread_state(self, tmp: str, rollout_path: str) -> Path:
+        state_db = Path(tmp) / "state.sqlite"
+        pr_review_coordinator.CODEX_STATE_DB = state_db
+        connection = sqlite3.connect(state_db)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    git_branch TEXT,
+                    git_origin_url TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO threads (id, rollout_path, cwd, title, archived)
+                VALUES (?, ?, ?, ?, 0)
+                """,
+                ("thread-latest", rollout_path, "/tmp/repo", "Latest repo thread"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return state_db
+
     def test_new_thread_sentinel_creates_fresh_codex_thread(self):
         original_create_codex_thread = pr_review_coordinator.create_codex_thread
         try:
@@ -1438,6 +1468,32 @@ class ThreadSelectionTests(unittest.TestCase):
 
                 self.assertEqual(result["id"], "thread-explicit")
                 self.assertIsNone(result["title"])
+        finally:
+            pr_review_coordinator.CODEX_STATE_DB = original_state_db
+
+    def test_codex_rollout_active_task_reads_unfinished_turn(self):
+        original_state_db = pr_review_coordinator.CODEX_STATE_DB
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rollout = Path(tmp) / "rollout.jsonl"
+                rollout.write_text(
+                    "\n".join(
+                        [
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-aborted", "started_at": 9}}),
+                            json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "turn-aborted", "completed_at": 10}}),
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-done", "started_at": 10}}),
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-done", "completed_at": 11}}),
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-active", "started_at": 12}}),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                self.write_thread_state(tmp, str(rollout))
+
+                active = pr_review_coordinator.codex_rollout_active_task("thread-latest")
+
+                self.assertEqual(active["turn_id"], "turn-active")
+                self.assertEqual(active["started_at_ms"], 12000)
         finally:
             pr_review_coordinator.CODEX_STATE_DB = original_state_db
 
@@ -1665,6 +1721,24 @@ class DashboardRenderingTests(unittest.TestCase):
                 pr_review_coordinator.LOCKS_DIR = original_locks_dir
 
         self.assertTrue(payload["stop_available"])
+
+    def test_serialize_dashboard_record_exposes_reset_for_orphaned_lock(self):
+        record = self.make_record(run_state=None, last_run_status="busy")
+        with tempfile.TemporaryDirectory() as tmp:
+            original_locks_dir = pr_review_coordinator.LOCKS_DIR
+            pr_review_coordinator.LOCKS_DIR = Path(tmp)
+            try:
+                pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+                pr_review_coordinator.lock_path(record.key).write_text(
+                    json.dumps({"pid": 111, "thread_id": record.thread_id}),
+                    encoding="utf-8",
+                )
+                payload = pr_review_coordinator.serialize_dashboard_record(record)
+            finally:
+                pr_review_coordinator.LOCKS_DIR = original_locks_dir
+
+        self.assertTrue(payload["reset_available"])
+        self.assertFalse(payload["stop_available"])
 
 
 class WorktreeCleanlinessTests(unittest.TestCase):
@@ -2350,6 +2424,7 @@ class QueueBehaviorTests(unittest.TestCase):
         self.original_register_tracking = pr_review_coordinator.register_tracking
         self.original_resolve_selected_thread = pr_review_coordinator.resolve_selected_thread
         self.original_create_codex_thread = pr_review_coordinator.create_codex_thread
+        self.original_active_codex_thread_run = pr_review_coordinator.active_codex_thread_run
         pr_review_coordinator.VAR_DIR = Path(self.temp_dir.name)
         pr_review_coordinator.LOCKS_DIR = pr_review_coordinator.VAR_DIR / "locks"
         pr_review_coordinator.COORDINATOR_DB = pr_review_coordinator.VAR_DIR / "test.db"
@@ -2413,6 +2488,7 @@ class QueueBehaviorTests(unittest.TestCase):
         pr_review_coordinator.register_tracking = self.original_register_tracking
         pr_review_coordinator.resolve_selected_thread = self.original_resolve_selected_thread
         pr_review_coordinator.create_codex_thread = self.original_create_codex_thread
+        pr_review_coordinator.active_codex_thread_run = self.original_active_codex_thread_run
         self.temp_dir.cleanup()
 
     def snapshot(
@@ -2454,6 +2530,92 @@ class QueueBehaviorTests(unittest.TestCase):
         pending = pr_review_coordinator.list_pending_jobs()
         self.assertEqual([job.action for job in pending], ["run-one"])
         self.assertEqual(json.loads(pending[0].payload_json)["signature"], "sig-1")
+
+    def test_poll_record_treats_active_codex_thread_as_busy_without_polling(self):
+        pr_review_coordinator.active_codex_thread_run = lambda record: {"turn_id": "turn-live", "started_at_ms": 123000}
+
+        def fail_snapshot(*args, **kwargs):
+            raise AssertionError("poll should not fetch GitHub while the Codex thread is active")
+
+        pr_review_coordinator.pull_request_snapshot = fail_snapshot
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=101)
+
+        self.assertEqual(result["status"], "busy")
+        self.assertIn("active turn turn-liv", result["tracked_pr"]["last_run_summary"])
+        self.assertEqual(pr_review_coordinator.list_pending_jobs(), [])
+
+    def test_run_follow_up_treats_active_codex_thread_as_busy_without_launching(self):
+        pr_review_coordinator.active_codex_thread_run = lambda record: {"turn_id": "turn-live", "started_at_ms": 123000}
+
+        def fail_snapshot(*args, **kwargs):
+            raise AssertionError("run should not fetch GitHub while the Codex thread is active")
+
+        pr_review_coordinator.pull_request_snapshot = fail_snapshot
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        result = pr_review_coordinator.run_follow_up(record, dry_run=False, force_run=True, job_id=101)
+
+        self.assertEqual(result["status"], "busy")
+        self.assertIn("active turn turn-liv", result["tracked_pr"]["last_run_summary"])
+        self.assertFalse(pr_review_coordinator.lock_path(record.key).exists())
+
+    def test_refresh_stale_codex_thread_busy_record_clears_finished_turn(self):
+        stale_summary = f"{pr_review_coordinator.CODEX_THREAD_BUSY_SUMMARY_PREFIX} turn-old; not starting another follow-up"
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            last_run_status="busy",
+            last_run_summary=stale_summary,
+            last_error="stale",
+            live_activity_json=json.dumps({"headline": stale_summary, "items": []}),
+            live_activity_updated_at=123,
+        )
+        pr_review_coordinator.active_codex_thread_run = lambda record: None
+        record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+
+        updated = pr_review_coordinator.refresh_stale_codex_thread_busy_record(record)
+
+        self.assertEqual(updated.last_run_status, "idle")
+        self.assertEqual(updated.last_run_summary, "Codex thread is idle; awaiting next poll")
+        self.assertIsNone(updated.last_error)
+        self.assertIsNone(updated.live_activity_json)
+
+    def test_reset_tracked_run_state_clears_lock_activity_and_pending_jobs(self):
+        job = pr_review_coordinator.enqueue_job("run-one", tracked_pr_key="repo-pr-1", requested_by="test")["job"]
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path("repo-pr-1").write_text(
+            json.dumps({"pid": 111, "thread_id": "thread-1"}),
+            encoding="utf-8",
+        )
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            run_state="running",
+            current_job_id=job["id"],
+            lock_started_at=123,
+            lock_owner_pid=111,
+            last_run_status="running",
+            last_run_summary="Running",
+            last_error="old error",
+            live_activity_json=json.dumps({"headline": "Running", "items": []}),
+            live_activity_updated_at=123,
+        )
+
+        result = pr_review_coordinator.reset_tracked_run_state(pr_review_coordinator.get_tracked_pr("repo-pr-1"), requested_by="test")
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-1")
+        cancelled_job = pr_review_coordinator.get_job(job["id"])
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(pr_review_coordinator.lock_path("repo-pr-1").exists())
+        self.assertIsNone(updated.run_state)
+        self.assertIsNone(updated.current_job_id)
+        self.assertIsNone(updated.lock_started_at)
+        self.assertIsNone(updated.lock_owner_pid)
+        self.assertEqual(updated.last_run_status, "idle")
+        self.assertEqual(updated.last_run_summary, "Run state reset from test")
+        self.assertIsNone(updated.last_error)
+        self.assertIsNone(updated.live_activity_json)
+        self.assertEqual(cancelled_job.status, "failed")
 
     def test_default_review_churn_limit_allows_four_copilot_cycles(self):
         record = pr_review_coordinator.get_tracked_pr("repo-pr-1")

@@ -109,6 +109,7 @@ WEB_STATUS_FILTERS = [
 WEB_SORT_KEYS = {"updated", "status", "pr", "last_poll"}
 WEB_SCOPE_VALUES = {"active", "archived", "all"}
 DIRTY_WORKTREE_SUMMARY_PREFIX = "Worktree has local changes; treating this PR as busy:"
+CODEX_THREAD_BUSY_SUMMARY_PREFIX = "Codex thread already has an active turn"
 ALLOWED_HANDOFF_BRANCH_PREFIXES = (
     "feat",
     "bugfix",
@@ -779,6 +780,15 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         details.append(f"pending: {pending_text}")
     dirty_worktree_busy = (record.last_run_status == "busy") and (record.last_run_summary or "").startswith(DIRTY_WORKTREE_SUMMARY_PREFIX)
     stop_available = record.run_state == "running" and lock_agent_pid(record.key) is not None
+    reset_available = bool(
+        read_lock_file(record.key)
+        or record.run_state
+        or record.current_job_id
+        or record.lock_started_at
+        or record.lock_owner_pid
+        or record.live_activity_json
+        or (record.last_run_status or "") in {"busy", "queued", "running", "stopping"}
+    )
     thread_summary = compact_thread_text(
         record.thread_title,
         limit=72,
@@ -817,6 +827,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "actions_disabled": bool(pending_jobs),
         "dirty_worktree_busy": dirty_worktree_busy,
         "stop_available": stop_available,
+        "reset_available": reset_available,
         "review_churn_cycle_limit": churn_cycle_limit,
         "review_churn_commit_limit": churn_commit_limit,
         "review_churn_cycle_limit_override": record.review_churn_cycle_limit,
@@ -2916,6 +2927,105 @@ def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[s
     return completion
 
 
+def normalize_codex_timestamp_ms(value: Any) -> int | None:
+    if not isinstance(value, int):
+        return None
+    if value <= 0:
+        return None
+    return value * 1000 if value < 10_000_000_000 else value
+
+
+def codex_rollout_active_task(thread_id: str) -> dict[str, Any] | None:
+    thread = lookup_thread(thread_id)
+    rollout_path = str((thread or {}).get("rollout_path") or "")
+    if not rollout_path:
+        return None
+    path = Path(rollout_path)
+    if not path.exists():
+        return None
+
+    active: dict[str, dict[str, Any]] = {}
+    terminal_events = {
+        "task_complete",
+        "task_failed",
+        "task_cancelled",
+        "task_canceled",
+        "task_error",
+        "turn_completed",
+        "turn_failed",
+        "turn_cancelled",
+        "turn_canceled",
+        "turn_aborted",
+        "turn_error",
+    }
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                event_type = str(payload.get("type") or "")
+                turn_id = str(payload.get("turn_id") or "")
+                if not turn_id:
+                    continue
+                if event_type == "task_started":
+                    active[turn_id] = {
+                        "turn_id": turn_id,
+                        "started_at_ms": normalize_codex_timestamp_ms(payload.get("started_at")),
+                    }
+                elif event_type in terminal_events:
+                    active.pop(turn_id, None)
+    except OSError:
+        return None
+    if not active:
+        return None
+    return max(active.values(), key=lambda item: item.get("started_at_ms") or 0)
+
+
+def existing_codex_thread_run_summary(active_task: dict[str, Any]) -> str:
+    turn_id = str(active_task.get("turn_id") or "")
+    short_turn_id = turn_id[:8] if turn_id else "unknown"
+    started = format_timestamp(active_task.get("started_at_ms"))
+    suffix = f" since {started}" if started else ""
+    return f"{CODEX_THREAD_BUSY_SUMMARY_PREFIX} {short_turn_id}{suffix}; not starting another follow-up"
+
+
+def active_codex_thread_run(record: TrackedPR) -> dict[str, Any] | None:
+    if (record.provider or "codex").strip().lower() != "codex":
+        return None
+    return codex_rollout_active_task(record.thread_id)
+
+
+def is_codex_thread_busy_summary(summary: str | None) -> bool:
+    return (summary or "").startswith(CODEX_THREAD_BUSY_SUMMARY_PREFIX)
+
+
+def refresh_stale_codex_thread_busy_record(record: TrackedPR) -> TrackedPR:
+    if record.run_state:
+        return record
+    if record.last_run_status != "busy":
+        return record
+    if not is_codex_thread_busy_summary(record.last_run_summary):
+        return record
+    if active_codex_thread_run(record):
+        return record
+    return update_tracked_pr(
+        record.key,
+        last_run_status="idle",
+        last_run_summary="Codex thread is idle; awaiting next poll",
+        last_error=None,
+        last_run_finished_at=now_ms(),
+        live_activity_json=None,
+        live_activity_updated_at=None,
+    )
+
+
 def apply_desktop_ipc_conversation_message(
     activity: dict[str, Any],
     stream_state: dict[str, Any],
@@ -3494,6 +3604,47 @@ def stop_active_run(record: TrackedPR) -> dict[str, Any]:
     return {"ok": True, "message": summary, "tracked_pr_key": record.key, "agent_pid": agent_pid}
 
 
+def reset_tracked_run_state(record: TrackedPR, *, requested_by: str = "web") -> dict[str, Any]:
+    summary = f"Run state reset from {requested_by}"
+    lock_path(record.key).unlink(missing_ok=True)
+    connection = connect_db()
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'failed', finished_at = ?, result_summary = ?, error = ?
+            WHERE tracked_pr_key = ? AND status IN ('queued', 'running')
+            """,
+            (now_ms(), summary, "Reset from dashboard", record.key),
+        )
+        connection.commit()
+        cancelled_jobs = cursor.rowcount
+    finally:
+        connection.close()
+    updated = update_tracked_pr(
+        record.key,
+        run_state=None,
+        run_reason=None,
+        current_job_id=None,
+        lock_started_at=None,
+        lock_owner_pid=None,
+        last_run_finished_at=now_ms(),
+        last_run_status="idle",
+        last_run_summary=summary,
+        last_error=None,
+        live_activity_json=None,
+        live_activity_updated_at=None,
+    )
+    record_event("info", "run_state_reset", summary, tracked_pr_key=record.key, details={"cancelled_jobs": cancelled_jobs})
+    return {
+        "ok": True,
+        "message": summary,
+        "tracked_pr_key": record.key,
+        "cancelled_jobs": cancelled_jobs,
+        "tracked_pr": tracked_pr_to_dict(updated),
+    }
+
+
 def cleanup_external_worktree(record: TrackedPR) -> dict[str, Any]:
     if record.pr_state == "OPEN":
         return {"status": "skipped", "removed": False, "reason": "external worktrees are only removed after the PR is merged or closed"}
@@ -3636,6 +3787,18 @@ def maybe_request_final_copilot_review(record: TrackedPR, snapshot: dict[str, An
 
 def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: int | None) -> dict[str, Any]:
     record_event("info", "poll_started", f"Polling PR #{record.pr_number}", tracked_pr_key=record.key, details={"job_id": job_id})
+    active_task = active_codex_thread_run(record)
+    if active_task:
+        summary = existing_codex_thread_run_summary(active_task)
+        updated = update_tracked_pr(
+            record.key,
+            last_run_finished_at=now_ms(),
+            last_run_status="busy",
+            last_run_summary=summary,
+            last_error=None,
+        )
+        record_event("info", "thread_busy", summary, tracked_pr_key=record.key, details={"turn_id": active_task.get("turn_id")})
+        return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "triggered": False}
     update_tracked_pr(
         record.key,
         last_run_status="running",
@@ -3744,6 +3907,20 @@ def run_follow_up(
     steering_message: str | None = None,
     job_id: int,
 ) -> dict[str, Any]:
+    active_task = active_codex_thread_run(record)
+    if active_task:
+        summary = existing_codex_thread_run_summary(active_task)
+        updated = update_tracked_pr(
+            record.key,
+            current_job_id=None,
+            last_run_finished_at=now_ms(),
+            last_run_status="busy",
+            last_run_summary=summary,
+            last_error=None,
+        )
+        record_event("info", "thread_busy", summary, tracked_pr_key=record.key, details={"job_id": job_id, "turn_id": active_task.get("turn_id")})
+        return {"status": "busy", "tracked_pr": tracked_pr_to_dict(updated), "triggered": False}
+
     existing_lock = acquire_lock(record, job_id)
     if existing_lock:
         started_at = format_timestamp(existing_lock.get("started_at"))
@@ -4164,6 +4341,7 @@ def build_dashboard_payload(scope: str, status_filter: str, sort_key: str) -> di
         records = [record for record in records if not record.active]
     if normalized_status_filter != "all":
         records = [record for record in records if record.status == normalized_status_filter]
+    records = [refresh_stale_codex_thread_busy_record(record) for record in records]
     pending_jobs = pending_jobs_by_pr()
     thread_candidates_by_repo = {
         repo_root: list_recent_threads_for_repo(repo_root)
@@ -4243,6 +4421,13 @@ def stop_run_from_request(params: dict[str, list[str]]) -> tuple[int, dict[str, 
         return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
     result = stop_active_run(get_tracked_pr(key))
     return (HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT), result
+
+
+def reset_run_from_request(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    key = params.get("key", [None])[0]
+    if not key:
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    return HTTPStatus.OK, reset_tracked_run_state(get_tracked_pr(key))
 
 
 def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
@@ -4781,6 +4966,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   <td>
                     <div class="button-stack">
                       ${{record.stop_available ? `<button type="button" data-action="stop-run" data-key="${{escapeHtml(record.key)}}">Hard stop</button>` : ''}}
+                      ${{record.reset_available ? `<button type="button" data-action="reset-run" data-key="${{escapeHtml(record.key)}}">Reset run</button>` : ''}}
                       <button type="button" data-action="poll-one" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Poll</button>
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="clear-worktree" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Clear worktree</button>` : ''}}
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="use-worktree-anyway" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Use worktree anyway</button>` : ''}}
@@ -4957,7 +5143,7 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   await postAction(`${{ACTION_API_BASE}}/review-churn-limit`, {{ key, review_churn_cycle_limit: value }});
                   return;
                 }}
-                const pendingLabel = action === 'stop-run' ? 'hard stop requested' : `${{action.replace(/-/g, ' ')}} queued`;
+                const pendingLabel = action === 'stop-run' ? 'hard stop requested' : (action === 'reset-run' ? 'run state reset' : `${{action.replace(/-/g, ' ')}} queued`);
                 markRowPending(row, pendingLabel);
                 await postAction(`${{ACTION_API_BASE}}/${{action}}`, {{ key }});
               }} catch (error) {{
@@ -5486,6 +5672,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status, payload = stop_run_from_request(params)
             self._send_json(payload, status=status)
             return
+        if parsed.path == "/api/actions/reset-run":
+            status, payload = reset_run_from_request(params)
+            self._send_json(payload, status=status)
+            return
         if parsed.path == "/api/actions/review-churn-limit":
             status, payload = update_review_churn_limit_from_request(params)
             self._send_json(payload, status=status)
@@ -5536,6 +5726,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/stop-run":
             stop_run_from_request(params)
+            self._redirect("/")
+            return
+        if parsed.path == "/reset-run":
+            reset_run_from_request(params)
             self._redirect("/")
             return
         if parsed.path == "/review-churn-limit":
@@ -5623,9 +5817,9 @@ def html_page(title: str, body: str) -> bytes:
     button:focus-visible, select:focus-visible, input:focus-visible {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
     button.primary, button[data-action="poll-all"], #queue-selected-prs {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }}
     button.primary:hover:not([disabled]), button[data-action="poll-all"]:hover:not([disabled]), #queue-selected-prs:hover:not([disabled]) {{ background: var(--accent-hover); border-color: var(--accent-hover); }}
-    button[data-action="untrack-cleanup"], button[data-action="stop-run"] {{ color: var(--bad); border-color: rgba(220,38,38,0.25); }}
+    button[data-action="untrack-cleanup"], button[data-action="stop-run"], button[data-action="reset-run"] {{ color: var(--bad); border-color: rgba(220,38,38,0.25); }}
     button[data-action="stop-run"] {{ background: var(--bad-soft); font-weight: 600; }}
-    button[data-action="untrack-cleanup"]:hover:not([disabled]), button[data-action="stop-run"]:hover:not([disabled]) {{ background: var(--bad-soft); border-color: var(--bad); }}
+    button[data-action="untrack-cleanup"]:hover:not([disabled]), button[data-action="stop-run"]:hover:not([disabled]), button[data-action="reset-run"]:hover:not([disabled]) {{ background: var(--bad-soft); border-color: var(--bad); }}
     input[type="text"] {{ min-width: 340px; cursor: text; }}
     input[type="number"] {{ width: 72px; cursor: text; }}
     input[type="text"]:focus, input[type="number"]:focus {{ outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }}
