@@ -4058,31 +4058,59 @@ def run_follow_up(
                     local_sha_after=local_sha_after,
                 )
                 if should_request_review:
-                    requested_at = now_ms()
-                    request_result = request_copilot_review(record)
                     refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
-                    updated = update_tracked_pr(
-                        record.key,
-                        last_copilot_rerequested_at=requested_at,
-                        **state_payload(refreshed_snapshot, last_prompted_at=updated.last_prompted_at),
-                    )
-                    review_request_result = {
-                        "status": "ready",
-                        "requested_at": requested_at,
-                        "reviewer": request_result["reviewer"],
-                        "before": remote_sha_before,
-                        "after": remote_sha_after,
-                        "local_before": local_sha_before,
-                        "local_after": local_sha_after,
-                        "reason": review_reason,
-                    }
-                    record_event(
-                        "info",
-                        "copilot_review_rerequested",
-                        "Re-requested Copilot review after pushed follow-up changes",
-                        tracked_pr_key=record.key,
-                        details=review_request_result,
-                    )
+                    skip_reason = None
+                    if snapshot_has_final_copilot_review(refreshed_snapshot):
+                        skip_reason = "Copilot already returned a final no-comments review"
+                    elif refreshed_snapshot.get("pending_copilot_review"):
+                        skip_reason = "Copilot review already pending"
+
+                    if skip_reason:
+                        updated = update_tracked_pr(
+                            record.key,
+                            **state_payload(refreshed_snapshot, last_prompted_at=updated.last_prompted_at),
+                        )
+                        review_request_result = {
+                            "status": "skipped",
+                            "reason": skip_reason,
+                            "before": remote_sha_before,
+                            "after": remote_sha_after,
+                            "local_before": local_sha_before,
+                            "local_after": local_sha_after,
+                        }
+                        record_event(
+                            "info",
+                            "copilot_review_request_skipped",
+                            f"Skipped Copilot review request after follow-up: {review_request_result['reason']}",
+                            tracked_pr_key=record.key,
+                            details=review_request_result,
+                        )
+                    else:
+                        requested_at = now_ms()
+                        request_result = request_copilot_review(record)
+                        refreshed_snapshot = pull_request_snapshot(record.repo_root, record.repo_name, record.pr_number)
+                        updated = update_tracked_pr(
+                            record.key,
+                            last_copilot_rerequested_at=requested_at,
+                            **state_payload(refreshed_snapshot, last_prompted_at=updated.last_prompted_at),
+                        )
+                        review_request_result = {
+                            "status": "ready",
+                            "requested_at": requested_at,
+                            "reviewer": request_result["reviewer"],
+                            "before": remote_sha_before,
+                            "after": remote_sha_after,
+                            "local_before": local_sha_before,
+                            "local_after": local_sha_after,
+                            "reason": review_reason,
+                        }
+                        record_event(
+                            "info",
+                            "copilot_review_rerequested",
+                            "Re-requested Copilot review after pushed follow-up changes",
+                            tracked_pr_key=record.key,
+                            details=review_request_result,
+                        )
                 else:
                     review_request_result = {
                         "status": "skipped",

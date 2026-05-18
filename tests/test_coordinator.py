@@ -3487,6 +3487,25 @@ class FollowUpWorktreeTests(unittest.TestCase):
                     "failing_check_count": 0,
                 },
                 {
+                    "status": "awaiting_final_test",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-clean",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": False,
+                    "unresolved_threads": [],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 0,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                },
+                {
                     "status": "pending_copilot_review",
                     "pr": {
                         "number": 42,
@@ -3570,6 +3589,113 @@ class FollowUpWorktreeTests(unittest.TestCase):
         )
         self.assertTrue(any("last_copilot_rerequested_at" in update for update in captured["updates"]))
 
+    def test_run_follow_up_skips_copilot_request_when_final_review_already_arrived(self):
+        captured: dict[str, object] = {"events": [], "updates": []}
+        snapshots = iter(
+            [
+                {
+                    "status": "needs_review",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-next",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": False,
+                    "unresolved_threads": [{"id": "thread-1"}],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 1,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                    "final_copilot_review": False,
+                },
+                {
+                    "status": "awaiting_final_test",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-final",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": False,
+                    "unresolved_threads": [],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 0,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                    "final_copilot_review": True,
+                    "latest_copilot_activity": {
+                        "source": "review",
+                        "author": "copilot-pull-request-reviewer",
+                        "body": "Copilot reviewed 2 out of 2 changed files and generated no new comments.",
+                    },
+                },
+            ]
+        )
+        remote_shas = iter(["before-sha", "after-sha"])
+        pr_review_coordinator.acquire_lock = lambda record, job_id: None
+        pr_review_coordinator.release_lock = lambda record: None
+        pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: next(snapshots)
+        pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
+        pr_review_coordinator.git_status_is_clean = lambda path: True
+        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        pr_review_coordinator.update_tracked_pr = lambda key, **changes: captured["updates"].append(changes) or self.make_record(
+            last_review_signature=changes.get("last_review_signature", "sig-final"),
+            last_review_status=changes.get("last_review_status", "awaiting_final_test"),
+            status=changes.get("status", "awaiting_final_test"),
+        )
+        pr_review_coordinator.record_event = lambda level, event_type, message, **kwargs: captured["events"].append(
+            {"level": level, "event_type": event_type, "message": message, "details": kwargs.get("details")}
+        )
+        pr_review_coordinator.ensure_worktree = lambda repo_root, repo_name, pr_number, branch, worktree_root, *, layout: {
+            "status": "ready",
+            "worktree": "/tmp/worktrees/repo-pr-42",
+            "created": False,
+        }
+        pr_review_coordinator.sync_worktree_to_remote = lambda repo_root, branch, worktree: {
+            "status": "ready",
+            "worktree": worktree,
+            "head": "before-sha",
+            "changed": False,
+        }
+        pr_review_coordinator.run_agent_resume = lambda record, snapshot, dry_run: {
+            "status": "ok",
+            "last_message": "Copilot already reviewed the pushed fixes.",
+        }
+        pr_review_coordinator.remote_branch_sha = lambda repo_root, branch: next(remote_shas)
+
+        def fail_request(record):
+            raise AssertionError("Copilot review should not be re-requested after a final no-comments review")
+
+        pr_review_coordinator.request_copilot_review = fail_request
+
+        result = pr_review_coordinator.run_follow_up(
+            self.make_record(),
+            dry_run=False,
+            force_run=False,
+            job_id=7,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["review_request"]["status"], "skipped")
+        self.assertEqual(result["review_request"]["reason"], "Copilot already returned a final no-comments review")
+        self.assertEqual(result["review"]["signature"], "sig-final")
+        self.assertEqual(
+            [event["event_type"] for event in captured["events"] if event["event_type"] == "copilot_review_request_skipped"],
+            ["copilot_review_request_skipped"],
+        )
+        skipped_event = next(event for event in captured["events"] if event["event_type"] == "copilot_review_request_skipped")
+        self.assertEqual(skipped_event["details"]["after"], "after-sha")
+        self.assertFalse(any("last_copilot_rerequested_at" in update for update in captured["updates"]))
+
     def test_run_follow_up_rerequests_copilot_when_local_change_reached_remote_after_missing_before_sha(self):
         captured: dict[str, object] = {"events": [], "updates": []}
         snapshots = iter(
@@ -3590,6 +3716,25 @@ class FollowUpWorktreeTests(unittest.TestCase):
                     "failing_checks": [],
                     "ci_summary": None,
                     "unresolved_thread_count": 1,
+                    "actionable_comment_count": 0,
+                    "failing_check_count": 0,
+                },
+                {
+                    "status": "awaiting_final_test",
+                    "pr": {
+                        "number": 42,
+                        "url": "https://example.com/pr/42",
+                        "title": "PR 42",
+                        "state": "OPEN",
+                    },
+                    "signature": "sig-clean",
+                    "latest_comment_at": None,
+                    "pending_copilot_review": False,
+                    "unresolved_threads": [],
+                    "actionable_pr_comments": [],
+                    "failing_checks": [],
+                    "ci_summary": None,
+                    "unresolved_thread_count": 0,
                     "actionable_comment_count": 0,
                     "failing_check_count": 0,
                 },
