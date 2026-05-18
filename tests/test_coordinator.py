@@ -2168,6 +2168,58 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertEqual(lock["agent_transport"], "app-server-stdio")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
 
+    def test_run_codex_resume_uses_rollout_completion_when_app_server_goes_quiet(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+        instances = []
+
+        class FakeClient:
+            def __init__(self, codex_bin, socket_path):
+                self.pid = 333
+                self.process = None
+                self.stderr_lines = []
+                self.requests = []
+                self.timeouts = []
+                instances.append(self)
+
+            def request(self, method, params):
+                self.requests.append((method, params))
+                return {"turn": {"id": "turn-1"}} if method == "turn/start" else {}
+
+            def notify(self, method, params=None):
+                self.requests.append((method, params))
+
+            def read_message(self, timeout_seconds=None):
+                self.timeouts.append(timeout_seconds)
+                return None
+
+            def close(self):
+                pass
+
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value=None):
+            with mock.patch("pr_review_coordinator.resolve_codex_app_server_socket_for_live_transport", return_value=None):
+                with mock.patch("pr_review_coordinator.resolve_codex_executable", return_value="codex"):
+                    with mock.patch("pr_review_coordinator.CodexAppServerClient", FakeClient):
+                        with mock.patch(
+                            "pr_review_coordinator.codex_rollout_task_completion",
+                            return_value={"turn_id": "turn-1", "status": "completed", "message": "Finished from rollout."},
+                        ) as completion:
+                            result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        completion.assert_called_once()
+        self.assertEqual(completion.call_args.args, ("thread-42", "turn-1"))
+        self.assertIsInstance(completion.call_args.kwargs["started_after_ms"], int)
+        self.assertEqual(instances[0].timeouts, [1.0])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Finished from rollout.")
+        lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
+        self.assertEqual(lock["agent_transport"], "app-server-stdio")
+        self.assertEqual(lock["agent_turn_id"], "turn-1")
+
     def test_run_codex_resume_uses_desktop_ipc_when_available(self):
         record = self.add_record(current_job_id=100)
         pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)

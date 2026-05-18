@@ -3302,6 +3302,7 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
                 "excludeTurns": True,
             },
         )
+        turn_started_after_ms = now_ms()
         turn_response = client.request(
             "turn/start",
             {
@@ -3321,9 +3322,28 @@ def run_codex_app_server_resume(record: TrackedPR, snapshot: dict[str, Any], pro
         persist_live_activity(force=True)
 
         while True:
-            message = client.read_message()
+            message = client.read_message(timeout_seconds=1.0)
             if message is None:
-                raise ScriptError("Codex app-server exited before the turn completed")
+                completion = codex_rollout_task_completion(
+                    record.thread_id,
+                    turn_id or None,
+                    started_after_ms=turn_started_after_ms,
+                )
+                if completion:
+                    discovered_turn_id = completion.get("turn_id") or ""
+                    if discovered_turn_id and discovered_turn_id != turn_id:
+                        turn_id = discovered_turn_id
+                        update_lock_file(record.key, {"agent_turn_id": turn_id})
+                    message_text = completion.get("message") or ""
+                    if message_text:
+                        stream_state["message"] = message_text
+                        set_live_activity_headline(activity, message_text)
+                    completed_turn = {"id": turn_id, "status": completion.get("status") or "completed"}
+                    break
+                if client.process is not None and client.process.poll() is not None:
+                    raise ScriptError("Codex app-server exited before the turn completed")
+                persist_live_activity()
+                continue
             stdout_messages.append(json.dumps(message, sort_keys=True))
             event = codex_app_server_notification_to_event(message)
             if event and update_live_activity_from_codex_event(activity, event, stream_state):
