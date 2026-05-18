@@ -2893,7 +2893,12 @@ def interrupt_codex_desktop_ipc_turn(socket_path: str, thread_id: str) -> None:
         client.close()
 
 
-def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[str, str] | None:
+def codex_rollout_task_completion(
+    thread_id: str,
+    turn_id: str | None,
+    *,
+    started_after_ms: int | None = None,
+) -> dict[str, str] | None:
     thread = lookup_thread(thread_id)
     rollout_path = str((thread or {}).get("rollout_path") or "")
     if not rollout_path:
@@ -2901,6 +2906,8 @@ def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[s
     path = Path(rollout_path)
     if not path.exists():
         return None
+    started_turns: dict[str, int | None] = {}
+    exact_completion: dict[str, str] | None = None
     completion: dict[str, str] | None = None
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -2912,10 +2919,33 @@ def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[s
                 if event.get("type") != "event_msg":
                     continue
                 payload = event.get("payload")
-                if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+                if not isinstance(payload, dict):
+                    continue
+                event_type = str(payload.get("type") or "")
+                event_turn_id = str(payload.get("turn_id") or "")
+                if event_type == "task_started" and event_turn_id:
+                    started_turns[event_turn_id] = normalize_codex_timestamp_ms(payload.get("started_at"))
+                    continue
+                if event_type != "task_complete":
                     continue
                 completed_turn_id = str(payload.get("turn_id") or "")
-                if turn_id and completed_turn_id != turn_id:
+                started_at_ms = started_turns.get(completed_turn_id)
+                completed_at_ms = normalize_codex_timestamp_ms(payload.get("completed_at"))
+                if started_after_ms is not None:
+                    if started_at_ms is None and completed_at_ms is None:
+                        continue
+                    if started_at_ms is not None and started_at_ms < started_after_ms:
+                        continue
+                    if started_at_ms is None and completed_at_ms is not None and completed_at_ms < started_after_ms:
+                        continue
+                if turn_id and completed_turn_id == turn_id:
+                    exact_completion = {
+                        "turn_id": completed_turn_id,
+                        "status": "completed",
+                        "message": str(payload.get("last_agent_message") or ""),
+                    }
+                    continue
+                if turn_id and started_after_ms is None:
                     continue
                 completion = {
                     "turn_id": completed_turn_id,
@@ -2924,7 +2954,7 @@ def codex_rollout_task_completion(thread_id: str, turn_id: str | None) -> dict[s
                 }
     except OSError:
         return None
-    return completion
+    return exact_completion or completion
 
 
 def normalize_codex_timestamp_ms(value: Any) -> int | None:
@@ -3156,6 +3186,7 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
                 "desktop_ipc_socket": socket_path,
             },
         )
+        turn_started_after_ms = now_ms()
         response = client.request(
             "thread-follower-start-turn",
             {
@@ -3180,10 +3211,14 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
         while turn_status not in {"completed", "failed", "cancelled"}:
             message = client.read_message(timeout_seconds=1.0)
             if message is None:
-                completion = codex_rollout_task_completion(record.thread_id, turn_id or None)
+                completion = codex_rollout_task_completion(
+                    record.thread_id,
+                    turn_id or None,
+                    started_after_ms=turn_started_after_ms,
+                )
                 if completion:
                     discovered_turn_id = completion.get("turn_id") or ""
-                    if not turn_id and discovered_turn_id:
+                    if discovered_turn_id and discovered_turn_id != turn_id:
                         turn_id = discovered_turn_id
                         update_lock_file(record.key, {"agent_turn_id": turn_id})
                     message_text = completion.get("message") or ""

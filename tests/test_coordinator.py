@@ -1497,6 +1497,91 @@ class ThreadSelectionTests(unittest.TestCase):
         finally:
             pr_review_coordinator.CODEX_STATE_DB = original_state_db
 
+    def test_codex_rollout_task_completion_accepts_recent_completion_when_turn_id_is_stale(self):
+        original_state_db = pr_review_coordinator.CODEX_STATE_DB
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rollout = Path(tmp) / "rollout.jsonl"
+                rollout.write_text(
+                    "\n".join(
+                        [
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "stale-turn", "started_at": 10}}),
+                            json.dumps(
+                                {
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "task_complete",
+                                        "turn_id": "stale-turn",
+                                        "completed_at": 20,
+                                        "last_agent_message": "Old completion.",
+                                    },
+                                }
+                            ),
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "new-turn", "started_at": 60}}),
+                            json.dumps(
+                                {
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "task_complete",
+                                        "turn_id": "new-turn",
+                                        "completed_at": 70,
+                                        "last_agent_message": "New completion.",
+                                    },
+                                }
+                            ),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                self.write_thread_state(tmp, str(rollout))
+
+                completion = pr_review_coordinator.codex_rollout_task_completion(
+                    "thread-latest",
+                    "stale-turn",
+                    started_after_ms=50_000,
+                )
+
+                self.assertEqual(completion["turn_id"], "new-turn")
+                self.assertEqual(completion["message"], "New completion.")
+        finally:
+            pr_review_coordinator.CODEX_STATE_DB = original_state_db
+
+    def test_codex_rollout_task_completion_does_not_accept_old_completion_for_stale_turn_id(self):
+        original_state_db = pr_review_coordinator.CODEX_STATE_DB
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rollout = Path(tmp) / "rollout.jsonl"
+                rollout.write_text(
+                    "\n".join(
+                        [
+                            json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "old-turn", "started_at": 10}}),
+                            json.dumps(
+                                {
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "task_complete",
+                                        "turn_id": "old-turn",
+                                        "completed_at": 20,
+                                        "last_agent_message": "Old completion.",
+                                    },
+                                }
+                            ),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                self.write_thread_state(tmp, str(rollout))
+
+                completion = pr_review_coordinator.codex_rollout_task_completion(
+                    "thread-latest",
+                    "stale-turn",
+                    started_after_ms=50_000,
+                )
+
+                self.assertIsNone(completion)
+        finally:
+            pr_review_coordinator.CODEX_STATE_DB = original_state_db
+
 
 class DashboardRenderingTests(unittest.TestCase):
     def make_record(self, **overrides):
@@ -2248,12 +2333,45 @@ class RefreshRecordStateTests(unittest.TestCase):
                 ) as completion:
                     result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
 
-        completion.assert_called_with("thread-42", "turn-1")
+        completion.assert_called_once()
+        self.assertEqual(completion.call_args.args, ("thread-42", "turn-1"))
+        self.assertIsInstance(completion.call_args.kwargs["started_after_ms"], int)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["last_message"], "Finished from rollout.")
         lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
         self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
+
+    def test_run_codex_resume_replaces_stale_desktop_ipc_turn_id_from_rollout_completion(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+
+        class FakeDesktopClient:
+            def request(self, method, params):
+                return {"turn": {"id": "stale-turn", "status": "inProgress"}}
+
+            def read_message(self, timeout_seconds=None):
+                return None
+
+            def close(self):
+                pass
+
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value="/tmp/codex-ipc.sock"):
+            with mock.patch("pr_review_coordinator.CodexDesktopIpcClient", return_value=FakeDesktopClient()):
+                with mock.patch(
+                    "pr_review_coordinator.codex_rollout_task_completion",
+                    return_value={"turn_id": "real-turn", "status": "completed", "message": "Finished under real turn."},
+                ):
+                    result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Finished under real turn.")
+        lock = json.loads(pr_review_coordinator.lock_path(record.key).read_text(encoding="utf-8"))
+        self.assertEqual(lock["agent_turn_id"], "real-turn")
 
     def test_stop_active_run_targets_agent_process_group(self):
         record = self.add_record(current_job_id=100, lock_owner_pid=111)
