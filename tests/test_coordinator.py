@@ -764,6 +764,8 @@ class PromptInstructionTests(unittest.TestCase):
         self.assertIn("handled-comment COMMENT_ID", prompt)
         self.assertIn("low-confidence review body", prompt)
         self.assertIn("Request reviewer `copilot-pull-request-reviewer` after every push", prompt)
+        self.assertIn("Do not keep the worker open waiting for pending CI checks or pending Copilot review", prompt)
+        self.assertIn("When review feedback is clear and no completed CI failure remains", prompt)
         self.assertNotIn("Request reviewer `chatgpt-codex-connector`", prompt)
 
     def test_resume_prompt_includes_merge_conflict_guidance(self):
@@ -2394,6 +2396,52 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertEqual(lock["agent_transport"], "codex-desktop-ipc")
         self.assertEqual(lock["agent_turn_id"], "turn-1")
 
+    def test_run_codex_resume_uses_rollout_completion_while_desktop_ipc_is_busy(self):
+        record = self.add_record(current_job_id=100)
+        pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        pr_review_coordinator.lock_path(record.key).write_text(
+            json.dumps({"pid": 111, "thread_id": record.thread_id}),
+            encoding="utf-8",
+        )
+
+        class FakeDesktopClient:
+            def __init__(self):
+                self.read_count = 0
+
+            def request(self, method, params):
+                return {"turn": {"id": "turn-1", "status": "inProgress"}}
+
+            def read_message(self, timeout_seconds=None):
+                self.read_count += 1
+                return {
+                    "type": "broadcast",
+                    "method": "thread-stream-state-changed",
+                    "params": {
+                        "conversationId": "another-thread",
+                        "change": {"type": "patches", "patches": []},
+                    },
+                }
+
+            def close(self):
+                pass
+
+        client = FakeDesktopClient()
+        with mock.patch("pr_review_coordinator.resolve_codex_desktop_ipc_socket_for_live_transport", return_value="/tmp/codex-ipc.sock"):
+            with mock.patch("pr_review_coordinator.CodexDesktopIpcClient", return_value=client):
+                with mock.patch(
+                    "pr_review_coordinator.codex_rollout_task_completion",
+                    side_effect=[
+                        None,
+                        {"turn_id": "turn-1", "status": "completed", "message": "Finished despite noisy IPC."},
+                    ],
+                ) as completion:
+                    result = pr_review_coordinator.run_codex_resume(record, self.snapshot(), dry_run=False)
+
+        self.assertEqual(completion.call_count, 2)
+        self.assertEqual(client.read_count, 1)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["last_message"], "Finished despite noisy IPC.")
+
     def test_run_codex_resume_replaces_stale_desktop_ipc_turn_id_from_rollout_completion(self):
         record = self.add_record(current_job_id=100)
         pr_review_coordinator.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3634,7 +3682,7 @@ class FollowUpWorktreeTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
 
     def test_run_follow_up_rerequests_copilot_after_pushed_agent_changes(self):
-        captured: dict[str, object] = {"events": [], "updates": []}
+        captured: dict[str, object] = {"events": [], "updates": [], "refreshes": []}
         snapshots = iter(
             [
                 {
@@ -3702,7 +3750,11 @@ class FollowUpWorktreeTests(unittest.TestCase):
         pr_review_coordinator.pull_request_snapshot = lambda repo_root, repo_name, pr_number: next(snapshots)
         pr_review_coordinator.should_trigger_follow_up = lambda record, snapshot, force_run=False: (True, "needs review")
         pr_review_coordinator.git_status_is_clean = lambda path: True
-        pr_review_coordinator.refresh_record_state = lambda *args, **kwargs: args[0]
+        def fake_refresh_record_state(*args, **kwargs):
+            captured["refreshes"].append(kwargs)
+            return args[0]
+
+        pr_review_coordinator.refresh_record_state = fake_refresh_record_state
         pr_review_coordinator.update_tracked_pr = lambda key, **changes: captured["updates"].append(changes) or self.make_record(
             last_prompted_at=changes.get("last_prompted_at", 1),
             last_copilot_rerequested_at=changes.get("last_copilot_rerequested_at"),
@@ -3758,6 +3810,14 @@ class FollowUpWorktreeTests(unittest.TestCase):
             ["copilot_review_rerequested"],
         )
         self.assertTrue(any("last_copilot_rerequested_at" in update for update in captured["updates"]))
+        self.assertTrue(
+            any(
+                refresh.get("finished") is True
+                and refresh.get("job_id") == 7
+                and refresh.get("run_status") == "ok"
+                for refresh in captured["refreshes"]
+            )
+        )
 
     def test_run_follow_up_skips_copilot_request_when_final_review_already_arrived(self):
         captured: dict[str, object] = {"events": [], "updates": []}

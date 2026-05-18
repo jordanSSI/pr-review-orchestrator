@@ -2323,9 +2323,10 @@ def resume_prompt(record: TrackedPR, snapshot: dict[str, Any], steering_message:
         Commit and push scoped follow-up changes when needed. You must commit and push any code changes before finishing; do not leave the worktree with uncommitted changes.
         Request reviewer `{COPILOT_REVIEW_REQUEST_LOGIN}` after every push when further review is needed.
         Resolve review threads only after fixes are pushed, or leave a clear rationale when no code change is needed.
+        Do not keep the worker open waiting for pending CI checks or pending Copilot review. If no completed failing CI remains after your final inspection, report any pending checks/review and finish so the coordinator can poll later.
         {comment_instruction}
         If you address a top-level PR comment or low-confidence review body, reply on the PR after the push and include `<!-- pr-review-coordinator:handled-comment COMMENT_ID -->` for each handled comment ID so the coordinator can treat it as addressed.
-        When review feedback is clear and CI is green, return to idle tracking for final testing.
+        When review feedback is clear and no completed CI failure remains, return to idle tracking for final testing.
 
         Current merge conflict signals:
         {summarize_merge_conflicts(snapshot.get("merge_conflicts", []), base_branch=record.base_branch)}
@@ -3207,25 +3208,33 @@ def run_codex_desktop_ipc_resume(record: TrackedPR, snapshot: dict[str, Any], pr
         set_live_activity_headline(activity, "Codex Desktop turn is running" if turn_id else "Waiting for Codex Desktop turn stream")
         persist_live_activity(force=True)
 
+        def apply_rollout_completion() -> bool:
+            nonlocal turn_id, turn_status
+            completion = codex_rollout_task_completion(
+                record.thread_id,
+                turn_id or None,
+                started_after_ms=turn_started_after_ms,
+            )
+            if not completion:
+                return False
+            discovered_turn_id = completion.get("turn_id") or ""
+            if discovered_turn_id and discovered_turn_id != turn_id:
+                turn_id = discovered_turn_id
+                update_lock_file(record.key, {"agent_turn_id": turn_id})
+            message_text = completion.get("message") or ""
+            if message_text:
+                stream_state["message"] = message_text
+                set_live_activity_headline(activity, message_text)
+            turn_status = completion.get("status") or "completed"
+            return True
+
         turn_status = str(turn.get("status") or "") if isinstance(turn, dict) else ""
         while turn_status not in {"completed", "failed", "cancelled"}:
+            if apply_rollout_completion():
+                persist_live_activity(force=True)
+                break
             message = client.read_message(timeout_seconds=1.0)
             if message is None:
-                completion = codex_rollout_task_completion(
-                    record.thread_id,
-                    turn_id or None,
-                    started_after_ms=turn_started_after_ms,
-                )
-                if completion:
-                    discovered_turn_id = completion.get("turn_id") or ""
-                    if discovered_turn_id and discovered_turn_id != turn_id:
-                        turn_id = discovered_turn_id
-                        update_lock_file(record.key, {"agent_turn_id": turn_id})
-                    message_text = completion.get("message") or ""
-                    if message_text:
-                        stream_state["message"] = message_text
-                        set_live_activity_headline(activity, message_text)
-                    turn_status = completion.get("status") or "completed"
                 persist_live_activity()
                 continue
             stdout_messages.append(json.dumps(message, sort_keys=True))
@@ -4098,6 +4107,7 @@ def run_follow_up(
             error=None if agent_result["status"] in {"ok", "dry_run"} else (agent_result.get("stderr") or "agent resume failed"),
             run_reason=None,
             finished=True,
+            job_id=job_id,
         )
         if agent_result["status"] in {"ok", "dry_run"}:
             updated = update_tracked_pr(record.key, live_activity_json=None, live_activity_updated_at=None, **execution_payload(snapshot))
