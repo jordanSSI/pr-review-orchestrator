@@ -2835,6 +2835,35 @@ class QueueBehaviorTests(unittest.TestCase):
         self.assertIsNone(updated.live_activity_json)
         self.assertEqual(cancelled_job.status, "failed")
 
+    def test_enqueue_run_one_recovers_orphaned_running_duplicate(self):
+        pr_review_coordinator.update_tracked_pr(
+            "repo-pr-1",
+            run_state=None,
+            current_job_id=None,
+            lock_started_at=None,
+            lock_owner_pid=None,
+            last_run_status="queued",
+            last_run_summary="Follow-up run already queued",
+        )
+        stale_job = pr_review_coordinator.enqueue_job("run-one", tracked_pr_key="repo-pr-1", requested_by="test")["job"]
+        connection = pr_review_coordinator.connect_db()
+        try:
+            connection.execute(
+                "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
+                (pr_review_coordinator.now_ms() - pr_review_coordinator.ORPHANED_RUNNING_JOB_GRACE_MS - 1, stale_job["id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = pr_review_coordinator.enqueue_job("run-one", tracked_pr_key="repo-pr-1", requested_by="poller")
+
+        self.assertFalse(result["duplicate"])
+        self.assertEqual(result["job"]["status"], "queued")
+        recovered = pr_review_coordinator.get_job(stale_job["id"])
+        self.assertEqual(recovered.status, "failed")
+        self.assertIn("Orphaned running job", recovered.result_summary)
+
     def test_default_review_churn_limit_allows_four_copilot_cycles(self):
         record = pr_review_coordinator.get_tracked_pr("repo-pr-1")
         snapshot = self.snapshot()

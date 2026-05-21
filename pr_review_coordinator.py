@@ -70,6 +70,7 @@ PR_CHURN_COMMIT_LIMIT = 10
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
 MAX_LIVE_ACTIVITY_ITEMS = 6
+ORPHANED_RUNNING_JOB_GRACE_MS = 10 * 60 * 1000
 DEFAULT_CODEX_APP_SERVER_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 DEFAULT_CODEX_DESKTOP_IPC_SOCKET = Path(tempfile.gettempdir()) / "codex-ipc" / (f"ipc-{os.getuid()}.sock" if hasattr(os, "getuid") else "ipc.sock")
 CODEX_MANAGED_STANDALONE = CODEX_HOME / "packages" / "standalone" / "current" / "codex"
@@ -1854,6 +1855,8 @@ def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by:
         raise ScriptError(f"unsupported job action: {action}")
     if action in {"poll-one", "run-one", "steer-message", "use-worktree-anyway", "clear-worktree", "track-existing", "retarget-thread", "untrack", "untrack-cleanup"} and not tracked_pr_key:
         raise ScriptError(f"job action {action!r} requires a tracked PR key")
+    if action in {"run-one", "steer-message", "use-worktree-anyway"}:
+        cleanup_orphaned_running_jobs()
     connection = connect_db()
     try:
         if action != "steer-message":
@@ -1883,6 +1886,49 @@ def enqueue_job(action: str, *, tracked_pr_key: str | None = None, requested_by:
         return {"status": "ready", "job": job.__dict__, "duplicate": False}
     finally:
         connection.close()
+
+
+def cleanup_orphaned_running_jobs(*, grace_ms: int = ORPHANED_RUNNING_JOB_GRACE_MS) -> int:
+    stale_before = now_ms() - grace_ms
+    connection = connect_db()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status = 'running'
+              AND action IN ('run-one', 'steer-message', 'use-worktree-anyway')
+              AND COALESCE(started_at, requested_at, 0) <= ?
+            """,
+            (stale_before,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    cleaned = 0
+    for row in rows:
+        job = row_to_job(row)
+        try:
+            record = get_tracked_pr(job.tracked_pr_key) if job.tracked_pr_key else None
+        except ScriptError:
+            record = None
+        lock = read_lock(job.tracked_pr_key) if job.tracked_pr_key else None
+        if lock and lock.get("job_id") == job.id:
+            continue
+        if record and record.current_job_id == job.id and record.lock_owner_pid and pid_is_alive(record.lock_owner_pid):
+            continue
+
+        summary = "Orphaned running job had no live lock; marking failed so it can be requeued"
+        finish_job(job.id, "failed", summary, error=summary)
+        record_event(
+            "error",
+            "orphaned_job_recovered",
+            summary,
+            tracked_pr_key=job.tracked_pr_key,
+            details={"job_id": job.id, "action": job.action},
+        )
+        cleaned += 1
+    return cleaned
 
 
 def job_priority(action: str) -> int:
