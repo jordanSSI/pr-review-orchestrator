@@ -66,6 +66,7 @@ DEFAULT_WORKER_COUNT = 4
 NEW_CODEX_THREAD_SENTINEL = "__new_codex_thread__"
 COPILOT_RETRY_COOLDOWN_MS = 15 * 60 * 1000
 DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT = 4
+REVIEW_CHURN_LIMIT_INCREMENT = 4
 PR_CHURN_COMMIT_LIMIT = 10
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5
 ACTIVE_REFRESH_INTERVAL_SECONDS = 2
@@ -703,6 +704,34 @@ def effective_review_churn_commit_limit(record: TrackedPR) -> int:
     return max(int(override), PR_CHURN_COMMIT_LIMIT)
 
 
+def clear_orphaned_runtime_payload(record: TrackedPR) -> dict[str, Any]:
+    current = get_tracked_pr(record.key)
+    if read_lock(current.key):
+        return {}
+    if current.lock_owner_pid and pid_is_alive(current.lock_owner_pid):
+        return {}
+    if not any(
+        [
+            current.run_state,
+            current.current_job_id,
+            current.lock_started_at,
+            current.lock_owner_pid,
+            current.live_activity_json,
+            current.live_activity_updated_at,
+        ]
+    ):
+        return {}
+    return {
+        "run_state": None,
+        "run_reason": None,
+        "current_job_id": None,
+        "lock_started_at": None,
+        "lock_owner_pid": None,
+        "live_activity_json": None,
+        "live_activity_updated_at": None,
+    }
+
+
 def job_to_dict(job: Job | dict[str, Any]) -> dict[str, Any]:
     data = dict(job) if isinstance(job, dict) else dict(job.__dict__)
     payload = {}
@@ -834,6 +863,7 @@ def serialize_dashboard_record(record: TrackedPR, pending_jobs: list[Job] | None
         "review_churn_cycle_limit_override": record.review_churn_cycle_limit,
         "default_review_churn_cycle_limit": DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT,
         "default_review_churn_commit_limit": PR_CHURN_COMMIT_LIMIT,
+        "review_churn_limit_increment": REVIEW_CHURN_LIMIT_INCREMENT,
         "thread": {
             "id": record.thread_id,
             "short_id": record.thread_id[:8],
@@ -3958,6 +3988,7 @@ def poll_record(record: TrackedPR, *, dry_run: bool, force_run: bool, job_id: in
             last_run_summary=reason,
             last_error=None,
             **state_payload(snapshot, last_prompted_at=record.last_prompted_at),
+            **clear_orphaned_runtime_payload(record),
         )
         record_event("info", "poll_idle", reason, tracked_pr_key=record.key)
         return {"status": "idle", "tracked_pr": tracked_pr_to_dict(updated), "review": snapshot, "triggered": False}
@@ -4573,6 +4604,7 @@ def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tupl
     key = params.get("key", [None])[0]
     if not key:
         return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "No PR selected."}
+    record = get_tracked_pr(key)
     raw_limit = (params.get("review_churn_cycle_limit", [""])[0] or "").strip()
     if not raw_limit:
         updated = update_tracked_pr(key, review_churn_cycle_limit=None)
@@ -4584,9 +4616,15 @@ def update_review_churn_limit_from_request(params: dict[str, list[str]]) -> tupl
             "review_churn_commit_limit": effective_review_churn_commit_limit(updated),
         }
     try:
-        limit = int(raw_limit)
+        if raw_limit.startswith("+"):
+            increment = int(raw_limit[1:])
+            if increment <= 0:
+                raise ValueError
+            limit = effective_review_churn_cycle_limit(record) + increment
+        else:
+            limit = int(raw_limit)
     except ValueError:
-        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "Review churn limit must be a whole number."}
+        return HTTPStatus.BAD_REQUEST, {"ok": False, "message": "Review churn limit must be a whole number or +N increment."}
     if limit < DEFAULT_PR_CHURN_REVIEW_CYCLE_LIMIT:
         return HTTPStatus.BAD_REQUEST, {
             "ok": False,
@@ -5089,10 +5127,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                 ? `<button type="button" class="link-button" data-action="toggle-details" data-key="${{escapeHtml(record.key)}}" aria-expanded="${{isExpanded ? 'true' : 'false'}}">${{toggleLabel}}</button>`
                 : '';
               const runMeta = record.run_detail_meta ? `<div class="small">${{escapeHtml(record.run_detail_meta)}}</div>` : '';
-              const churnLimitValue = record.review_churn_cycle_limit_override == null ? '' : record.review_churn_cycle_limit_override;
-              const churnDefaultLabel = `${{record.default_review_churn_cycle_limit}} reviews / ${{record.default_review_churn_commit_limit}} commits`;
               const churnEffectiveLabel = `${{record.review_churn_cycle_limit}} reviews / ${{record.review_churn_commit_limit}} commits`;
-              const churnLimitLabel = `Review churn${{record.review_churn_cycle_limit_override == null ? ` (default ${{churnDefaultLabel}})` : ` (${{churnEffectiveLabel}})`}}`;
+              const churnIncrementLabel = `+${{record.review_churn_limit_increment}}`;
               const mainRow = `
                 <tr data-pr-key="${{escapeHtml(record.key)}}">
                   <td>${{statusBadge(record.status)}}</td>
@@ -5110,11 +5146,8 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="clear-worktree" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Clear worktree</button>` : ''}}
                       ${{record.dirty_worktree_busy ? `<button type="button" data-action="use-worktree-anyway" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Use worktree anyway</button>` : ''}}
                       <div class="churn-limit-control">
-                        <label>${{escapeHtml(churnLimitLabel)}}
-                          <input type="number" data-role="review-churn-limit-input" min="${{escapeHtml(record.default_review_churn_cycle_limit)}}" step="1" value="${{escapeHtml(churnLimitValue)}}" placeholder="${{escapeHtml(record.review_churn_cycle_limit)}}" ${{disabled}}>
-                        </label>
-                        <button type="button" data-action="review-churn-limit" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Set</button>
-                        ${{record.review_churn_cycle_limit_override == null ? '' : `<button type="button" data-action="review-churn-default" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Default</button>`}}
+                        <span class="small">Review churn ${{escapeHtml(churnEffectiveLabel)}}</span>
+                        <button type="button" data-action="review-churn-limit" data-key="${{escapeHtml(record.key)}}" data-increment="${{escapeHtml(churnIncrementLabel)}}" ${{disabled}}>${{escapeHtml(churnIncrementLabel)}}</button>
                       </div>
                       <button type="button" data-action="untrack" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack</button>
                       <button type="button" data-action="untrack-cleanup" data-key="${{escapeHtml(record.key)}}" ${{disabled}}>Untrack + Cleanup</button>
@@ -5275,10 +5308,9 @@ def render_dashboard_shell(scope: str, status_filter: str, sort_key: str) -> str
                   await postAction(`${{ACTION_API_BASE}}/retarget-thread`, {{ key, thread_id: NEW_THREAD_SENTINEL }});
                   return;
                 }}
-                if (action === 'review-churn-limit' || action === 'review-churn-default') {{
-                  const input = row.querySelector('[data-role="review-churn-limit-input"]');
-                  const value = action === 'review-churn-default' ? '' : (input ? input.value.trim() : '');
-                  markRowPending(row, action === 'review-churn-default' ? 'review churn limit reset' : 'review churn limit updated');
+                if (action === 'review-churn-limit') {{
+                  const value = button.dataset.increment || '+4';
+                  markRowPending(row, 'review churn limit updated');
                   await postAction(`${{ACTION_API_BASE}}/review-churn-limit`, {{ key, review_churn_cycle_limit: value }});
                   return;
                 }}

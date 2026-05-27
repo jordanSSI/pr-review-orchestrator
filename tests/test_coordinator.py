@@ -1155,6 +1155,7 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(payload["records"][0]["review_churn_cycle_limit_override"], 7)
         self.assertEqual(payload["records"][0]["default_review_churn_cycle_limit"], 4)
         self.assertEqual(payload["records"][0]["default_review_churn_commit_limit"], 10)
+        self.assertEqual(payload["records"][0]["review_churn_limit_increment"], 4)
 
     def test_api_review_churn_limit_updates_and_resets_record(self):
         self.add_record()
@@ -1162,7 +1163,7 @@ class DashboardHttpTests(unittest.TestCase):
         status, body = self.request(
             "POST",
             "/api/actions/review-churn-limit",
-            data={"key": "repo-pr-42", "review_churn_cycle_limit": "8"},
+            data={"key": "repo-pr-42", "review_churn_cycle_limit": "+4"},
         )
         payload = json.loads(body)
         updated = pr_review_coordinator.get_tracked_pr("repo-pr-42")
@@ -1172,6 +1173,20 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(updated.review_churn_cycle_limit, 8)
         self.assertEqual(payload["review_churn_cycle_limit"], 8)
         self.assertEqual(payload["review_churn_commit_limit"], 10)
+
+        status, body = self.request(
+            "POST",
+            "/api/actions/review-churn-limit",
+            data={"key": "repo-pr-42", "review_churn_cycle_limit": "+4"},
+        )
+        payload = json.loads(body)
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-42")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(updated.review_churn_cycle_limit, 12)
+        self.assertEqual(payload["review_churn_cycle_limit"], 12)
+        self.assertEqual(payload["review_churn_commit_limit"], 12)
 
         status, body = self.request(
             "POST",
@@ -2120,6 +2135,38 @@ class RefreshRecordStateTests(unittest.TestCase):
         self.assertIsNone(updated.current_job_id)
         self.assertEqual(updated.last_run_summary, "Worktree has local changes")
         self.assertIsNone(updated.live_activity_json)
+
+    def test_poll_churn_clears_orphaned_running_state(self):
+        record = self.add_record(
+            run_state="running",
+            current_job_id=100,
+            lock_started_at=111,
+            lock_owner_pid=222,
+            live_activity_json=json.dumps({"headline": "Launching codex follow-up", "items": []}),
+            live_activity_updated_at=111,
+        )
+        snapshot = self.snapshot()
+        snapshot["copilot_review_count"] = 5
+        original_pull_request_snapshot = pr_review_coordinator.pull_request_snapshot
+        original_active_codex_thread_run = pr_review_coordinator.active_codex_thread_run
+        try:
+            pr_review_coordinator.pull_request_snapshot = lambda *args, **kwargs: snapshot
+            pr_review_coordinator.active_codex_thread_run = lambda record: None
+            with mock.patch("pr_review_coordinator.pid_is_alive", return_value=False):
+                result = pr_review_coordinator.poll_record(record, dry_run=False, force_run=False, job_id=200)
+        finally:
+            pr_review_coordinator.pull_request_snapshot = original_pull_request_snapshot
+            pr_review_coordinator.active_codex_thread_run = original_active_codex_thread_run
+
+        updated = pr_review_coordinator.get_tracked_pr("repo-pr-42")
+        self.assertEqual(result["status"], "idle")
+        self.assertIsNone(updated.run_state)
+        self.assertIsNone(updated.current_job_id)
+        self.assertIsNone(updated.lock_started_at)
+        self.assertIsNone(updated.lock_owner_pid)
+        self.assertIsNone(updated.live_activity_json)
+        self.assertEqual(updated.last_run_status, "idle")
+        self.assertIn("review churn", updated.last_run_summary)
 
     def test_run_codex_resume_uses_app_server_socket_when_available(self):
         record = self.add_record(current_job_id=100)
